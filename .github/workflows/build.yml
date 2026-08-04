@@ -1,0 +1,47 @@
+name: Build Example TAPPs
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: build
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y imagemagick clang lld llvm
+
+    - name: Check dependencies
+      run: make check
+
+    - name: Build examples
+      run: |
+        mkdir -p out
+        for src in examples/simple_app.c examples/my_app.c examples/chopper.c \
+                   examples/tuner.c examples/groovebox.c; do
+          name=$(basename "$src" .c)
+          echo "::group::$name"
+          ./tapp-build "$src" "out/$name.tapp"
+          echo "::endgroup::"
+        done
+        # folder-style app with assets
+        echo "::group::demo"
+        ./tapp-build examples/demo out/demo.tapp
+        echo "::endgroup::"
+
+    - name: Verify TAPPs
+      run: ./tools/verify-tapp.sh out/*.tapp
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: tapps
+        path: out/*.tapp

@@ -1,0 +1,630 @@
+#!/bin/bash
+# TAPP Build Tool - Dead Simple Build for Tape Applications
+#
+# Usage: tapp-build [source.c]
+#
+# Automatically:
+# - Finds and converts any images in assets/ folder (with dithering)
+# - Compiles sources with correct flags
+# - Creates relocatable TAPP file
+# - No linker script needed!
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Find SDK path
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SDK_PATH="$(cd "$SCRIPT_DIR" && pwd)"
+# The SDK lives at <firmware>/lib/tapp/builder/sdk, so the firmware root is four levels up — three
+# only reached lib/, which silently disabled the nanopb lookup below. Resolves to a nonexistent path
+# when the SDK is used standalone (packaged by package-sdk.sh); every use of it is guarded.
+FIRMWARE_PATH="$(cd "$SCRIPT_DIR/../../../../" 2>/dev/null && pwd || echo "")"
+API_TABLE="$FIRMWARE_PATH/lib/tapp/api/tapp_api_table.c"
+
+error() {
+    echo -e "${RED}ERROR:${NC} $1" >&2
+    exit 1
+}
+
+info() {
+    echo -e "${BLUE}==>${NC} $1"
+}
+
+success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+# Toolchain: clang + ld.lld only.
+#
+# The arm-none-eabi-gcc path was removed. It skipped nearly every guard this script applies to the
+# clang build — no minimal-libc isolation, no discard.ld, no -mno-movt, no -Werror=double-promotion,
+# and `ld -r --unresolved-symbols=ignore-in-object-files` — so it could produce a .tapp that built
+# cleanly and then misbehaved on device. One toolchain, one set of guarantees.
+# TAPP_CLANG / TAPP_LD / TAPP_READELF override individual tools.
+
+# Homebrew kegs are not symlinked into PATH, so probe them explicitly as a last resort.
+# Apple's /usr/bin/clang cannot build for ARM bare metal and ships no ld.lld, so a keg that has the
+# full set must win over a PATH clang that is missing its linker.
+LLVM_KEGS="/opt/homebrew/opt/llvm@18/bin /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm@18/bin /usr/local/opt/llvm/bin"
+
+CC="${TAPP_CLANG:-}" ; LD="${TAPP_LD:-}" ; READELF="${TAPP_READELF:-}"
+
+# Find a directory that has clang AND ld.lld together; a split toolchain is the common way this
+# fails (stock macOS: Xcode clang in PATH, lld only inside the keg).
+if [ -z "$CC" ] || [ -z "$LD" ]; then
+    for d in $LLVM_KEGS; do
+        if [ -x "$d/clang" ] && [ -x "$d/ld.lld" ]; then LLVM_DIR="$d"; break; fi
+    done
+    # A PATH pair beats a keg only if BOTH tools are there.
+    if command -v clang &> /dev/null && command -v ld.lld &> /dev/null; then
+        LLVM_DIR="${LLVM_DIR:-}"
+        [ -n "$LLVM_DIR" ] || LLVM_DIR="$(dirname "$(command -v clang)")"
+    fi
+fi
+
+[ -n "$CC" ] || { [ -n "${LLVM_DIR:-}" ] && CC="$LLVM_DIR/clang" || CC=clang; }
+command -v "$CC" &> /dev/null || \
+    error "clang not found. macOS: 'brew install llvm'  Debian/Ubuntu: 'apt install clang lld llvm'"
+
+# ld.lld / llvm-readelf normally sit next to the clang we picked. Note `command -v` on an
+# absolute path echoes it back, so this is safe for both PATH names and absolute paths — but it
+# prints nothing for a nonexistent path, which would make dirname yield ".".
+CC_RESOLVED="$(command -v "$CC" 2>/dev/null || true)"
+[ -n "$CC_RESOLVED" ] || error "clang not found at: $CC"
+CC_BIN_DIR="$(dirname "$CC_RESOLVED")"
+
+[ -n "$LD" ] || { [ -x "$CC_BIN_DIR/ld.lld" ] && LD="$CC_BIN_DIR/ld.lld" || LD=ld.lld; }
+command -v "$LD" &> /dev/null || \
+    error "ld.lld not found (looked next to $CC and on PATH). macOS: 'brew install llvm'  Debian/Ubuntu: 'apt install lld'"
+
+[ -n "$READELF" ] || { [ -x "$CC_BIN_DIR/llvm-readelf" ] && READELF="$CC_BIN_DIR/llvm-readelf" || READELF=llvm-readelf; }
+
+command -v "$READELF" &> /dev/null || error "$READELF not found (needed for the section report)."
+
+# Parse arguments
+if [ "$#" -eq 0 ]; then
+    error "Usage: tapp-build <directory|source.c|source1.c source2.c...> [output.tapp]"
+fi
+
+SOURCE_FILE="$1"
+
+# Check if first argument is a directory
+if [ -d "$SOURCE_FILE" ]; then
+    SOURCE_DIR="$SOURCE_FILE"
+    # Find all .c files except old/complete versions
+    SOURCE_FILES=($(find "$SOURCE_DIR" -maxdepth 1 -name "*.c"))
+    if [ ${#SOURCE_FILES[@]} -eq 0 ]; then
+        error "No source files found in directory: $SOURCE_DIR"
+    fi
+    # Use directory name as app name
+    APP_NAME=$(basename "$SOURCE_DIR")
+    OUTPUT_FILE="${2:-${APP_NAME}.tapp}"
+    info "Building multi-file TAPP: $APP_NAME (${#SOURCE_FILES[@]} files)"
+else
+    # Collect all source files from command line until we hit a .tapp file or run out
+    SOURCE_FILES=()
+    OUTPUT_FILE=""
+    for arg in "$@"; do
+        if [[ "$arg" == *.tapp ]]; then
+            OUTPUT_FILE="$arg"
+            break
+        elif [[ "$arg" == *.c ]]; then
+            if [ ! -f "$arg" ]; then
+                error "Source file not found: $arg"
+            fi
+            SOURCE_FILES+=("$arg")
+        else
+            error "Invalid argument: $arg (expected .c or .tapp file)"
+        fi
+    done
+
+    if [ ${#SOURCE_FILES[@]} -eq 0 ]; then
+        error "No source files provided"
+    fi
+
+    # Use first source file name as app name
+    APP_NAME=$(basename "${SOURCE_FILES[0]}" .c)
+
+    # Set default output if not specified
+    if [ -z "$OUTPUT_FILE" ]; then
+        OUTPUT_FILE="${APP_NAME}.tapp"
+    fi
+
+    if [ ${#SOURCE_FILES[@]} -eq 1 ]; then
+        info "Building TAPP: $APP_NAME"
+    else
+        info "Building multi-file TAPP: $APP_NAME (${#SOURCE_FILES[@]} files)"
+    fi
+fi
+
+# Compiler flags (must match firmware ABI)
+CFLAGS=(
+    -mcpu=cortex-m7
+    -mthumb
+    -mfloat-abi=hard
+    -mfpu=fpv5-d16
+    -O3
+    -ffunction-sections
+    -fdata-sections
+    -std=gnu2x
+    -fshort-enums
+    -ffast-math
+    -freciprocal-math
+    -fassociative-math
+    -funsafe-math-optimizations
+    -fno-signed-zeros
+    -I"$SDK_PATH"
+)
+
+CFLAGS=(
+    # Triple matters: -eabi/-eabihf make clang emit __aeabi_memcpy/__aeabi_memclr4, which the
+    # firmware API table excludes (it drops every "__" prefix) -> unresolvable at load time.
+    # -none-elf emits plain memcpy/memset, which ARE exported. The triple warning is cosmetic.
+    --target=thumbv7em-none-elf
+    -Wno-invalid-command-line-argument
+    # The desktop emulator's relocation set has no MOVW/MOVT, unlike the
+    # firmware loader. Without this clang emits them and the tapp loads on device but not
+    # in the emu. Keeps one artifact runnable in both.
+    -mno-movt
+    # Tentative definitions merged across TUs are a footgun under `ld -r`.
+    -fno-common
+    # Without this a bare `1.1` drags the whole expression into hardware double:
+    # `g*1.1 + sqrtf(n)*3.14159` measured 5 .f64 ops — real throughput loss on the audio hot
+    # path. An error rather than a warning: writing `1.1f` is a one-character fix.
+    -Werror=double-promotion
+    # An undeclared libc function must fail here, not at load time on the device.
+    -Werror=implicit-function-declaration
+    # Self-contained header set: clang builtins + the SDK's minimal libc (see libc/README).
+    -nostdlibinc
+    -isystem "$SDK_PATH/libc"
+    "${CFLAGS[@]}"
+)
+
+# Add source directory to include path for multi-file builds
+if [ ${#SOURCE_FILES[@]} -gt 1 ] && [ -n "$SOURCE_DIR" ]; then
+    CFLAGS+=(-I"$SOURCE_DIR")
+    # Also check for inc/ subdirectory
+    if [ -d "$SOURCE_DIR/inc" ]; then
+        CFLAGS+=(-I"$SOURCE_DIR/inc")
+    fi
+fi
+
+# Temporary build directory
+BUILD_DIR=$(mktemp -d)
+trap "rm -rf $BUILD_DIR" EXIT
+
+# Determine assets directory (check both current dir and source file directory)
+if [ ${#SOURCE_FILES[@]} -eq 1 ]; then
+    SRC_BASE_DIR=$(dirname "${SOURCE_FILES[0]}")
+else
+    SRC_BASE_DIR="$SOURCE_DIR"
+fi
+ASSETS_DIR=""
+if [ -d "assets" ]; then
+    ASSETS_DIR="assets"
+elif [ -d "$SRC_BASE_DIR/assets" ]; then
+    ASSETS_DIR="$SRC_BASE_DIR/assets"
+fi
+
+# Process assets if folder exists
+if [ -n "$ASSETS_DIR" ]; then
+    info "Processing assets from: $ASSETS_DIR"
+
+    # ImageMagick 7 renamed the tools: `magick` and `magick identify` replace v6's `convert` and
+    # `identify`. Homebrew installs v7, every current Debian/Ubuntu ships v6, so hardcoding either
+    # one breaks half the world — CI installed a perfectly good ImageMagick 6 and this script could
+    # not drive it. Every operation used below exists in both; only the command names differ.
+    if [ -n "$IM_CONVERT" ] && [ -n "$IM_IDENTIFY" ]; then
+        :   # caller pinned a specific ImageMagick, e.g. IM_CONVERT=convert IM_IDENTIFY=identify
+    elif command -v magick &> /dev/null; then
+        IM_CONVERT="magick"; IM_IDENTIFY="magick identify"
+    elif command -v convert &> /dev/null && command -v identify &> /dev/null; then
+        IM_CONVERT="convert"; IM_IDENTIFY="identify"
+    else
+        error "ImageMagick is required to convert $ASSETS_DIR
+   Install: brew install imagemagick        (macOS)
+   Install: sudo apt-get install imagemagick (Debian/Ubuntu)
+   Install: pacman -S mingw-w64-x86_64-imagemagick (MSYS2)"
+    fi
+
+    # Create assets header
+    ASSETS_H="$BUILD_DIR/${APP_NAME}_assets.h"
+    ASSETS_C="$BUILD_DIR/${APP_NAME}_assets.c"
+
+    echo "#pragma once" > "$ASSETS_H"
+    echo "#include \"tapp_api.h\"" >> "$ASSETS_H"
+    echo "" >> "$ASSETS_H"
+
+    echo "#include \"${APP_NAME}_assets.h\"" > "$ASSETS_C"
+    echo "" >> "$ASSETS_C"
+
+    # Convert each PNG and GIF image
+    IMAGE_COUNT=0
+    for img in "$ASSETS_DIR"/*.png "$ASSETS_DIR"/*.gif; do
+        [ -e "$img" ] || continue
+
+        # Get file extension and base name
+        ext="${img##*.}"
+        filename=$(basename "$img" ".$ext")
+        var_name="asset_$(echo "$filename" | tr '-' '_' | tr '[:upper:]' '[:lower:]')"
+
+        info "  Converting: $filename"
+
+        # Detect frame count automatically using ImageMagick
+        frame_count=$($IM_IDENTIFY "$img" | wc -l | tr -d ' ')
+
+        # Detect color count - if > 2 colors, we need to apply dithering
+        # For multi-frame GIFs, just check first frame
+        color_count=$($IM_IDENTIFY -format "%k\n" "$img" | head -1)
+
+        # Both probes feed integer tests below. A non-numeric value means ImageMagick failed to
+        # read the file, and `[ "" -gt 2 ]` reports that as "integer expression expected" fifteen
+        # lines from the real cause — say what actually happened instead.
+        case "$frame_count" in ''|*[!0-9]*) error "ImageMagick could not read $img (frame count: '$frame_count')";; esac
+        case "$color_count" in ''|*[!0-9]*) error "ImageMagick could not read $img (color count: '$color_count')";; esac
+
+        # Convert to XBM - apply dithering if needed
+        # For GIFs, coalesce first to expand optimized frames to full size
+        if [ "$ext" = "gif" ]; then
+            if [ "$color_count" -gt 2 ]; then
+                # Multi-color GIF - coalesce, then convert with dithering
+                info "    → Applying Floyd-Steinberg dithering ($color_count colors → 2)"
+                xbm_data=$($IM_CONVERT "$img" -coalesce -colorspace Gray -dither FloydSteinberg -colors 2 -negate xbm:-)
+            else
+                # Monochrome GIF - just coalesce
+                xbm_data=$($IM_CONVERT "$img" -coalesce -negate xbm:-)
+            fi
+        else
+            # PNG - no coalesce needed
+            if [ "$color_count" -gt 2 ]; then
+                info "    → Applying Floyd-Steinberg dithering ($color_count colors → 2)"
+                xbm_data=$($IM_CONVERT "$img" -colorspace Gray -dither FloydSteinberg -colors 2 xbm:-)
+            else
+                xbm_data=$($IM_CONVERT "$img" xbm:-)
+            fi
+        fi
+
+        # Parse XBM for dimensions (first two lines)
+        # Use here-string to avoid broken pipe errors with large multi-frame data
+        width=$(head -1 <<< "$xbm_data" | grep -o "[0-9]*$")
+        height=$(head -2 <<< "$xbm_data" | tail -1 | grep -o "[0-9]*$")
+
+        # Validate we got dimensions
+        if [ -z "$width" ] || [ -z "$height" ] || [ -z "$frame_count" ]; then
+            error "Failed to parse image metadata for $filename"
+        fi
+
+        if [ "$frame_count" -eq 1 ]; then
+            # Single frame image
+            # Strip the braces, do NOT delete whole lines. ImageMagick puts the final data bytes on
+            # the SAME line as the closing "};", so the old `sed '1d;$d'` deleted a whole row of
+            # pixels with it: a 64x64 icon came out 504 bytes instead of 512 while the header still
+            # said height=64, so gfx_draw_xbm read 8 bytes past the end of the array on the device.
+            hex_data=$(echo "$xbm_data" | sed -n '/static.*bits\[\]/,/};/p' | \
+                       sed '1s/.*{//' | sed 's/};.*//' | tr -d '\n' | tr -d ' ' | sed 's/,$//')
+
+            cat >> "$ASSETS_C" <<EOF
+// $filename - ${width}x${height}
+const uint8_t ${var_name}_data[] = {
+    ${hex_data:-0x00}
+};
+
+const uint8_t* ${var_name}_frames[] = {
+    ${var_name}_data
+};
+
+const gfx_img_t $var_name = {
+    .width = ${width}U,
+    .height = ${height}U,
+    .frame_count = 1U,
+    .frame_rate = 0U,
+    .frames = ${var_name}_frames
+};
+
+EOF
+        else
+            # Multi-frame animation - extract each frame's data
+            # Each frame has format: "static char ..._bits[] = { data };"
+            # We need to extract just the data between { and }; for each frame
+
+            # Use awk to extract all data between { and };
+            frame_idx=0
+            echo "$xbm_data" | awk '
+                /static.*bits\[\].*{/ {
+                    in_frame = 1
+                    # Extract data after {
+                    sub(/.*{/, "")
+                    if ($0 ~ /};/) {
+                        sub(/};.*/, "")
+                        print $0
+                        print "FRAME_END"
+                        in_frame = 0
+                    } else if (length($0) > 0) {
+                        printf "%s", $0
+                    }
+                    next
+                }
+                in_frame {
+                    if (/};/) {
+                        sub(/};.*/, "")
+                        if (length($0) > 0) {
+                            printf "%s", $0
+                        }
+                        print ""
+                        print "FRAME_END"
+                        in_frame = 0
+                    } else {
+                        printf "%s", $0
+                    }
+                }
+            ' | while IFS= read -r line; do
+                if [ "$line" = "FRAME_END" ]; then
+                    # Process accumulated frame data
+                    if [ -n "$frame_data" ]; then
+                        # Clean up: remove trailing comma and extra spaces
+                        frame_hex=$(echo "$frame_data" | sed 's/,$//' | sed 's/  */ /g')
+
+                        # Write frame data
+                        cat >> "$ASSETS_C" <<EOF
+const uint8_t ${var_name}_${frame_idx}[] = {
+    ${frame_hex}
+};
+EOF
+                        frame_idx=$((frame_idx + 1))
+                    fi
+                    frame_data=""
+                else
+                    frame_data="${frame_data}${line}"
+                fi
+            done
+
+            # Build comma-separated list of frame names
+            frame_list=""
+            for ((i=0; i<frame_count; i++)); do
+                frame_list="${frame_list}${var_name}_${i}, "
+            done
+            frame_list=${frame_list%, }
+
+            # Write frames array and gfx_img_t
+            cat >> "$ASSETS_C" <<EOF
+
+const uint8_t* ${var_name}_frames[] = {
+    ${frame_list}
+};
+
+const gfx_img_t $var_name = {
+    .width = ${width}U,
+    .height = ${height}U,
+    .frame_count = ${frame_count}U,
+    .frame_rate = 0U,
+    .frames = ${var_name}_frames
+};
+
+EOF
+        fi
+
+        echo "" >> "$ASSETS_C"
+
+        # Write header declaration
+        echo "extern const gfx_img_t $var_name;" >> "$ASSETS_H"
+
+        IMAGE_COUNT=$((IMAGE_COUNT + 1))
+    done
+
+    if [ $IMAGE_COUNT -gt 0 ]; then
+        success "Processed $IMAGE_COUNT image(s)"
+        HAS_ASSETS=1
+        CFLAGS+=(-I"$BUILD_DIR")
+        # Auto-include assets header in all source files (no manual #include needed!)
+        CFLAGS+=(-include "${APP_NAME}_assets.h")
+    else
+        info "No images found in $ASSETS_DIR"
+        HAS_ASSETS=0
+    fi
+else
+    # No assets folder found, but still create empty header if referenced in code
+    for src in "${SOURCE_FILES[@]}"; do
+        if grep -q "#include.*_assets\.h" "$src" 2>/dev/null; then
+            info "Assets header referenced but no assets/ folder found, creating empty header"
+            ASSETS_H="$BUILD_DIR/${APP_NAME}_assets.h"
+            echo "#pragma once" > "$ASSETS_H"
+            echo "// No assets - assets/ folder not found" >> "$ASSETS_H"
+            CFLAGS+=(-I"$BUILD_DIR")
+            break
+        fi
+    done
+    if [ -z "$ASSETS_H" ]; then
+        info "No assets folder"
+    fi
+    HAS_ASSETS=0
+fi
+
+# Process proto files if any exist
+PROTO_DIR=""
+if [ -d "$SRC_BASE_DIR" ]; then
+    PROTO_FILES=($(find "$SRC_BASE_DIR" -maxdepth 1 -name "*.proto" 2>/dev/null))
+else
+    PROTO_FILES=()
+fi
+
+HAS_PROTO=0
+if [ ${#PROTO_FILES[@]} -gt 0 ]; then
+    info "Processing proto files..."
+
+    # Check for nanopb
+    NANOPB_DIR="$FIRMWARE_PATH/lib/nanopb"
+    if [ ! -d "$NANOPB_DIR" ]; then
+        error "nanopb not found at $NANOPB_DIR. Proto compilation requires nanopb."
+    fi
+
+    # Check for protoc (try nanopb's wrapper first)
+    PROTOC="$NANOPB_DIR/generator/protoc"
+    if [ ! -f "$PROTOC" ]; then
+        if command -v protoc &> /dev/null; then
+            PROTOC="protoc"
+        else
+            error "protoc not found. Install protobuf or ensure nanopb generator is available."
+        fi
+    fi
+
+    # Add nanopb include paths
+    CFLAGS+=(-I"$NANOPB_DIR")
+    CFLAGS+=(-I"$BUILD_DIR")
+
+    for proto in "${PROTO_FILES[@]}"; do
+        proto_name=$(basename "$proto" .proto)
+        info "  Compiling: $proto_name.proto"
+
+        # Run protoc with nanopb
+        "$PROTOC" \
+            -I"$(dirname "$proto")" \
+            -I"$NANOPB_DIR/generator/proto" \
+            --nanopb_out="$BUILD_DIR" \
+            "$proto" || error "Proto compilation failed: $proto"
+
+        success "Generated ${proto_name}.pb.c and ${proto_name}.pb.h"
+    done
+
+    HAS_PROTO=1
+fi
+
+# Extract app name from source (look for app_t structure with .name field)
+info "Extracting app metadata..."
+APP_DISPLAY_NAME=""
+for src in "${SOURCE_FILES[@]}"; do
+    APP_DISPLAY_NAME=$(grep -A 10 "app_t.*=" "$src" | grep "\.name.*=" | sed 's/.*"\(.*\)".*/\1/' | head -1)
+    if [ -n "$APP_DISPLAY_NAME" ]; then
+        break
+    fi
+done
+if [ -z "$APP_DISPLAY_NAME" ]; then
+    APP_DISPLAY_NAME="$APP_NAME"
+fi
+info "  App name: $APP_DISPLAY_NAME"
+
+# Generate manifest automatically
+MANIFEST_C="$BUILD_DIR/${APP_NAME}_manifest.c"
+cat > "$MANIFEST_C" <<EOF
+#include <stdint.h>
+
+// Auto-generated manifest - do not edit
+#define EXT_APP_MANIFEST_MAGIC     0x50504154  // "TAPP"
+#define EXT_APP_MANIFEST_VERSION   1
+
+typedef struct {
+    uint32_t manifest_magic;
+    uint32_t manifest_version;
+    uint16_t api_version_major;
+    uint16_t api_version_minor;
+    uint16_t hardware_target_id;
+    uint16_t reserved;   // must match lib/tapp/tapp_manifest.h; omitting it only works by padding
+} tapp_manifest_base_t;
+
+typedef struct {
+    tapp_manifest_base_t base;
+    uint32_t stack_size;
+    uint32_t app_version;
+    char name[32];
+} tapp_manifest_t;
+
+__attribute__((section(".tapp_manifest")))
+const tapp_manifest_t __tapp_manifest = {
+    .base = {
+        .manifest_magic = EXT_APP_MANIFEST_MAGIC,
+        .manifest_version = EXT_APP_MANIFEST_VERSION,
+        .api_version_major = 1,
+        .api_version_minor = 0,
+        .hardware_target_id = 1,
+        .reserved = 0,
+    },
+    .stack_size = 4096,
+    .app_version = 1,
+    .name = "$APP_DISPLAY_NAME",
+};
+EOF
+success "Generated manifest: $APP_DISPLAY_NAME"
+
+# Compile manifest
+info "Compiling manifest..."
+"$CC" "${CFLAGS[@]}" -c "$MANIFEST_C" -o "$BUILD_DIR/${APP_NAME}_manifest.o" || error "Manifest compilation failed"
+
+# Compile all source files
+info "Compiling source files..."
+OBJECT_FILES=("$BUILD_DIR/${APP_NAME}_manifest.o")
+for src in "${SOURCE_FILES[@]}"; do
+    src_name=$(basename "$src" .c)
+    obj_file="$BUILD_DIR/${src_name}.o"
+    "$CC" "${CFLAGS[@]}" -c "$src" -o "$obj_file" || error "Compilation failed: $src"
+    OBJECT_FILES+=("$obj_file")
+    success "Compiled $(basename "$src")"
+done
+
+# Compile assets if they exist
+if [ $HAS_ASSETS -eq 1 ]; then
+    info "Compiling assets..."
+    "$CC" "${CFLAGS[@]}" -c "$ASSETS_C" -o "$BUILD_DIR/${APP_NAME}_assets.o" || error "Asset compilation failed"
+    success "Compiled assets"
+    OBJECT_FILES+=("$BUILD_DIR/${APP_NAME}_assets.o")
+fi
+
+# Compile proto files if they exist
+if [ $HAS_PROTO -eq 1 ]; then
+    info "Compiling proto sources..."
+    for proto in "${PROTO_FILES[@]}"; do
+        proto_name=$(basename "$proto" .proto)
+        pb_c="$BUILD_DIR/${proto_name}.pb.c"
+        if [ -f "$pb_c" ]; then
+            "$CC" "${CFLAGS[@]}" -c "$pb_c" -o "$BUILD_DIR/${proto_name}.pb.o" || error "Proto source compilation failed: $pb_c"
+            OBJECT_FILES+=("$BUILD_DIR/${proto_name}.pb.o")
+            success "Compiled ${proto_name}.pb.c"
+        fi
+    done
+fi
+
+# Link. -r produces the relocatable object the firmware loader expects; no layout script needed.
+info "Linking TAPP..."
+# discard.ld drops clang's .ARM.exidx unwind tables, whose R_ARM_PREL31 relocations the
+# firmware loader rejects. lld resolves nothing under -r, so no --unresolved-symbols needed.
+"$LD" \
+    -r \
+    -T "$SDK_PATH/discard.ld" \
+    "${OBJECT_FILES[@]}" \
+    -o "$OUTPUT_FILE" || error "Linking failed"
+
+success "TAPP built successfully: $OUTPUT_FILE"
+
+# Show file size
+SIZE=$(ls -lh "$OUTPUT_FILE" | awk '{print $5}')
+info "Size: $SIZE"
+
+# Show sections
+info "Sections:"
+"$READELF" -S "$OUTPUT_FILE" | grep -E "tapp_manifest|\.text|\.data|\.rodata|\.bss" | sed 's/^/  /'
+
+# Check every import resolves against the firmware's export table.
+#
+# Linking cannot catch this: `ld -r` leaves undefined symbols undefined by design, so an app that
+# calls something the firmware doesn't export builds perfectly and then fails to load on device.
+# -ffast-math makes it easy to hit by accident — clang rewrites powf(x, 1.0f/3.0f) into a call to
+# cbrtf and powf(2.0f, n) into ldexpf, neither of which exists in the firmware.
+#
+# Skipped (with a note) when the SDK is used standalone, since the table lives in the firmware tree.
+if [ -f "$API_TABLE" ] && [ -x "$SDK_PATH/tools/verify-tapp.sh" ]; then
+    echo ""
+    if ! "$SDK_PATH/tools/verify-tapp.sh" --exports "$API_TABLE" "$OUTPUT_FILE"; then
+        rm -f "$OUTPUT_FILE"
+        error "$(basename "$OUTPUT_FILE") failed verification (see above) — not written"
+    fi
+elif [ ! -f "$API_TABLE" ]; then
+    echo ""
+    info "Skipping import check (no firmware tree found — run tools/verify-tapp.sh --exports manually)"
+fi
+
+echo ""
+success "Done! Copy $OUTPUT_FILE to your SD card."
