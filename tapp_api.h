@@ -323,8 +323,6 @@ struct params {
 typedef struct gfx_t gfx_t;
 typedef uint16_t gfx_uint_t;
 typedef struct os_core_s os_core_t;
-typedef struct os_controls_s os_controls_t;
-typedef struct console_command_s console_command_t;
 typedef struct ui_menu ui_menu_t;
 typedef struct ui_notify ui_notify_t;
 
@@ -438,9 +436,6 @@ typedef enum {
     AppTypeTotal = 2,
 } AppTypeEnum;
 
-// Total number of control events (must match firmware)
-#define TotalEventsNum 6
-
 // Forward declare app types
 typedef struct os_app os_app_t;
 typedef struct os_app_data os_app_data_t;
@@ -452,14 +447,8 @@ typedef bool (*os_app_tick)(os_app_t* app);
 typedef void (*os_app_redraw)(gfx_t* gfx, const os_app_t* app);
 typedef void (*os_app_storage_mem_cb)(os_app_t* app);
 typedef bool (*os_app_storage_file_cb)(const char* full_path);
-typedef void (*os_app_ctrl_cb)(os_app_t*, os_controls_t*, KeyStateEnum);
 typedef bool (*on_pause_cb)(os_app_t* app);
 typedef bool (*on_resume_cb)(os_app_t* app);
-
-// Control input callbacks (must match ctrl_input_callbacks in firmware)
-typedef struct {
-    void (*funcs[TotalEventsNum])(os_app_t*, KeyStateEnum);
-} ctrl_input_callbacks;
 
 // Memory interface structure (must match os_app_memory_if_t in firmware)
 typedef struct {
@@ -509,7 +498,10 @@ struct os_app {
     const os_app_memory_if_t* memory_if;
     const engine_callbacks_t* engine_cb;
     void* engine_ctx;
-    const console_command_t* commands;
+    /* console_command_t* — the DEBUG-only dev console, firmware-only. Present
+     * unconditionally so the tapp ABI is identical in DEBUG and release builds:
+     * app_menu below sits after these, and gating them would move it. */
+    const void* commands;
     size_t commands_size;
     const ui_menu_node_t* app_menu;
 };
@@ -813,6 +805,58 @@ void os_app_close(os_app_t* app);
  * @endcode
  */
 void* os_app_get_model(const os_app_t* app);
+
+/**
+ * @name Timing
+ * @{
+ */
+
+/**
+ * @brief Milliseconds since boot
+ *
+ * The only clock available to a TAPP. Use it for animation and timeouts:
+ * @code{.c}
+ * uint32_t now = os_tick_get();
+ * if (now - m->last_step >= 120) { m->last_step = now; step(m); }
+ * @endcode
+ */
+uint32_t os_tick_get(void);
+
+/* NOTE: os_delay()/os_delay_until() are deliberately not exposed. Your tick(),
+ * redraw() and on_input() all run on the OS controls task, so blocking inside one
+ * freezes buttons and the encoder for the entire device, not just your app. Time
+ * things by comparing os_tick_get() across ticks, as above. */
+
+/** @} */
+
+/**
+ * @name LEDs
+ * The device has 4 RGB LEDs (index 0-3). The OS runs its own LED patterns, so
+ * stop the current one before driving them yourself:
+ * @code{.c}
+ * os_led_stop_current();               // once, in init()
+ * hal_led_set_rgb(0, 100, 70, 20);     // then from tick()
+ * @endcode
+ * @{
+ */
+
+/**
+ * @brief Set one LED's colour
+ * @param led_num LED index, 0-3
+ * @param red,green,blue 0-255
+ * @note The driver latches: an LED keeps its last written colour until you
+ * change it. Nothing restores OS patterns when your app exits, so set the LEDs
+ * back or call os_led_stop_current() in deinit().
+ */
+void hal_led_set_rgb(const uint8_t led_num, const uint8_t red, const uint8_t green,
+                     const uint8_t blue);
+
+/**
+ * @brief Stop the OS LED pattern currently playing
+ */
+void os_led_stop_current(void);
+
+/** @} */
 
 /** @} */ // end of grp_app
 
@@ -1202,6 +1246,152 @@ void ui_statusbar_show(bool state);
 /** @} */ // end of grp_menu
 
 // ============================================================================
+// Parameters
+// ============================================================================
+
+/**
+ * @defgroup grp_params Parameters
+ * @brief Smoothed, range-clamped values — the unit ui_menu edits and the encoder drives
+ *
+ * A params_t holds a target and a smoothed current value. You set the target;
+ * param_update_fast() walks `val` toward it and returns true on the frames it
+ * changed, which is your cue to redraw. Set `refresh = true` or `val` never
+ * follows `target`.
+ *
+ * @section param_encoder Driving a param from the encoder
+ * @code{.c}
+ * // in tick()
+ * param_write_delta_coarse(&m->cutoff, os_controls_encoder_get_delta());
+ * if (param_update_fast(&m->cutoff, m)) m->dirty = true;
+ *
+ * // in redraw()
+ * gfx_draw_strf(gfx, 10, 40, "cutoff %d%%", (int)(param_val_percent(&m->cutoff) * 100));
+ * @endcode
+ *
+ * Put the same params_t in a ui_menu_node_t's `param` field and the menu edits it
+ * for you — the two paths are interchangeable.
+ *
+ * @note There is no param_init(): it hands back a slot from a firmware-owned pool.
+ * Declare params_t values in your own model and fill the fields directly.
+ * @{
+ */
+
+/** @brief Set the value immediately (clamped to min/max), skipping smoothing */
+void param_set(params_t* param, const float value);
+
+/** @brief Set the value with no clamp and no smoothing — fast path for audio code */
+void param_set_rawfast(params_t* param, const float value);
+
+/** @brief Set the target; `val` then eases toward it on param_update_fast() */
+void param_set_target(params_t* param, const float value);
+
+/** @brief Add to the target (clamped) */
+void param_inc(params_t* param, const float value);
+
+/** @brief Subtract from the target (clamped) */
+void param_dec(params_t* param, const float value);
+
+/** @brief Advance `val` toward `target`; true if it moved this call (redraw cue) */
+bool param_update_fast(params_t* param, void* ctx);
+
+/** @brief Advance `val` toward `target` without firing the callback */
+bool param_update_val(params_t* param);
+
+/** @brief Did the value change since the last check? */
+bool param_updated(const params_t* param);
+
+/** @brief Apply an encoder delta using the param's `coarse` step */
+void param_write_delta_coarse(params_t* param, int32_t acc);
+
+/** @brief Apply an encoder delta using the param's `fine` step */
+void param_write_delta_val(params_t* param, int32_t acc);
+
+/** @brief Called whenever the value changes; receives the param and your ctx */
+void param_set_callback(params_t* param, void (*callback)(params_t* self, void* context));
+
+/** @brief Raw current value, before range mapping */
+float param_raw(const params_t* param);
+
+/** @brief Current value rescaled from the param's range into [min, max] */
+float param_map(const params_t* param, const float min, const float max);
+
+/** @brief Current value as 0.0-1.0 across the param's own range */
+float param_val_percent(const params_t* param);
+
+/** @brief Do two params hold the same value? */
+bool param_same(const params_t* p1, const params_t* p2);
+
+/** @} */ // end of grp_params
+
+// ============================================================================
+// Notifications
+// ============================================================================
+
+/**
+ * @defgroup grp_notify Notifications
+ * @brief Toasts and modal dialogues drawn over your app
+ *
+ * The firmware owns one notification. Every function here acts on it, so there is
+ * nothing to allocate or free — pass NULL wherever a ui_notify_t* is asked for.
+ *
+ * @warning A **modal** notification swallows input: while it is up the firmware
+ * consumes button events before your on_input() sees them and drains the encoder
+ * accumulator, so the first os_controls_encoder_get_delta() afterwards reads 0.
+ * Do not drive your UI from on_input() while a modal is showing.
+ * @{
+ */
+
+/** @brief Toast: header + hint + optional icon. @param timeout_ms 0 = stay until hidden */
+void ui_notify_info(const char* header, const char* hint, const gfx_img_t* icon,
+                    uint16_t timeout_ms);
+
+/** @brief Error toast */
+void ui_notify_error(const char* message, uint16_t timeout_ms);
+
+/** @brief Success toast */
+void ui_notify_success(const char* message, uint16_t timeout_ms);
+
+/** @brief Warning toast */
+void ui_notify_warning(const char* message, uint16_t timeout_ms);
+
+/**
+ * @brief Yes/no dialogue; @p callback fires on confirm
+ * @code{.c}
+ * static void on_erase(void* ctx, void* unused) { (void)unused; wipe(ctx); }
+ * ui_notify_confirm("Erase all?", NULL, on_erase, m);
+ * @endcode
+ */
+void ui_notify_confirm(const char* message, const gfx_img_t* icon,
+                       void (*callback)(void*, void*), void* callback_ctx);
+
+/** @brief Text dialogue with a callback */
+void ui_notify_dialogue(const char* text, void (*callback)(void*, void*), void* callback_ctx);
+
+/** @brief Popup whose callback reports which way it was dismissed */
+void ui_notify_popup_with_cb(const char* header, const char* hint, const gfx_img_t* icon,
+                             void (*callback)(void*, bool), void* callback_ctx);
+
+/** @brief Hide the current notification. Pass NULL. */
+void ui_notify_hide(ui_notify_t* n);
+
+/** @brief Is a notification showing? */
+bool ui_notify_is_active(void);
+
+/** @brief Is this notification visible? Pass NULL for the current one. */
+bool ui_notify_is_visible(const ui_notify_t* n);
+
+/** @brief Make the next notification modal (swallows input — see the warning above) */
+void ui_notify_set_modal(bool modal);
+
+/** @brief Show or hide the confirm button */
+void ui_notify_set_show_confirm_btn(bool show);
+
+/** @brief Move the notification on screen */
+void ui_notify_set_pos_global(const uint16_t x, const uint16_t y);
+
+/** @} */ // end of grp_notify
+
+// ============================================================================
 // Audio Engine Functions
 // ============================================================================
 
@@ -1277,6 +1467,39 @@ void engine_set_active(bool state);
  */
 void engine_clear_callbacks(const engine_callbacks_t* cb);
 
+/**
+ * @brief Get the global engine handle
+ *
+ * Your process() callback is handed an engine_t*, but init()/tick() are not —
+ * use this when you need it outside the audio callback.
+ */
+engine_t* engine_get(void);
+
+/**
+ * @brief Is the audio engine currently processing? (non-zero = yes)
+ *
+ * Returns uint_fast8_t, not bool, to match the firmware ABI — same as the
+ * is_active member of engine_callbacks_t above.
+ */
+uint_fast8_t engine_is_active(void);
+
+/**
+ * @brief Get the global mixer handle
+ *
+ * The counterpart to engine_get(): your process() callback is handed a mixer_t*,
+ * but init()/tick() have no other way to reach it. Use the accessors above for
+ * buffers; mixer_t itself stays opaque.
+ */
+mixer_t* mixer_get(void);
+
+/* NOTE: the mixer ROUTING setters — mixer_monitor_enable, mixer_mix_wet_enable,
+ * mixer_output_resample_enable — are deliberately not exposed. They flip fields on
+ * the one global mixer with nothing to restore them when your app exits, so a tapp
+ * that sets one (or crashes holding it) leaves the whole device mis-routed; the
+ * firmware's own hw_test saves and restores them by hand for exactly that reason.
+ * mixer_mix_wet_enable additionally calls os_audio_update_chain(), the OS-level
+ * control the note below already rules out. Mix into mixer_get_out() instead. */
+
 /* NOTE: there is deliberately no audio_pause_rx/tx or audio_resume_rx/tx here.
  * SAI DMA is an OS-level control, not part of the engine abstraction, and the
  * firmware already pauses/resumes RX+TX around an engine-app swap (os_app_launch)
@@ -1311,7 +1534,13 @@ void engine_clear_callbacks(const engine_callbacks_t* cb);
  * | 2 | BTN3 | - |
  * | 3 | BTN4 | Back/Exit |
  * | 4 | BTN5 | - |
- * | 5 | ENC | Encoder button |
+ * | 5 | ENCODER_I | Rotation notification — see below, NOT a button |
+ *
+ * There is no encoder push button. ID 5 fires when the encoder is *turned*, and
+ * the firmware sends it with a zero-initialised state, so `state` is always
+ * `KEY_STATE_RELEASED`. Never branch on the state for ID 5 — either ignore the
+ * event and poll os_controls_encoder_get_delta() from tick(), or use ID 5 purely
+ * as a "something moved" hint and read the delta in response.
  *
  * @{
  */
@@ -1328,6 +1557,11 @@ void engine_clear_callbacks(const engine_callbacks_t* cb);
  * @endcode
  */
 int32_t os_controls_encoder_get_delta(void);
+
+/* NOTE: os_controls_set_hold_timeout() is deliberately not exposed. The hold
+ * threshold is device-wide state shared with the OS and every other app; a tapp
+ * changing it would silently retune the whole UI, and nothing restores it on
+ * exit. Handle your own long-press by timing KEY_STATE_PUSH with os_tick_get(). */
 
 /** @} */ // end of grp_input
 
@@ -1600,6 +1834,32 @@ void tape_timeline_switch_track(uint8_t tr);
  * display. Device-only (no tape in the emulator's non-combined build).
  */
 void tape_timeline_attach_default(uint8_t tracks);
+
+/**
+ * @brief Bind YOUR params to a timeline track, instead of the tapehead singleton
+ * @param track Track index (0-3), within the count given to tape_timeline_setup()
+ * @param pos   Playhead position, in tape positions (frames / 64)
+ * @param start Loop/selection start
+ * @param end   Loop/selection end
+ *
+ * Use this rather than tape_timeline_attach_default() when your TAPP owns the
+ * engine: the tapehead singleton stops advancing then, so a default-attached
+ * timeline sits frozen. Drive the three params yourself from tick() and the widget
+ * follows.
+ *
+ * Call after tape_timeline_setup() and before tape_timeline_show(true). The
+ * params must outlive the timeline — put them in your model, not on the stack —
+ * and the visible span is taken from the currently loaded tape, so there is
+ * nothing to size by hand.
+ *
+ * @code{.c}
+ * tape_timeline_setup(1, 8, 206, SCREEN_WIDTH - 16, 28);
+ * tape_timeline_attach_params(0, &m->tl_pos, &m->tl_start, &m->tl_end);
+ * tape_timeline_switch_track(0);
+ * tape_timeline_show(true);
+ * @endcode
+ */
+void tape_timeline_attach_params(uint8_t track, params_t* pos, params_t* start, params_t* end);
 
 /** @} */ // end of grp_timeline
 

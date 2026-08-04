@@ -21,7 +21,10 @@
 #include <stdbool.h>
 #include "tapp_api.h" // also declares the libc subset (memcpy, snprintf, sinf, ...)
 
-extern float soft_limit(float x);
+/* Soft clipper. Trivial DSP lives in the app, not the API. */
+static inline float soft_limit(float x) {
+    return x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x * (1.5f - 0.5f * x * x);
+}
 
 // ----------------------------------------------------------------------------
 // Config
@@ -659,6 +662,9 @@ static bool ch_init(os_app_t* app, va_list args) {
     mk_param(&m->memory,  "memory",  0.f,   0.f,   1.f,   0.05f);
 
     m->menu = ui_menu_create(m, ch_menu_build);
+    /* Wider than the 165px default: the value is drawn right-anchored to the
+     * menu width, so narrow panels run the value into the entry name. */
+    ui_menu_set_width(m->menu, 230);
     m->enc_target = ENC_TEMPO;
     m->playing = true;
 
