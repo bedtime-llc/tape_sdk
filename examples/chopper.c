@@ -19,9 +19,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <string.h>
-#include <stdio.h>
-#include "tapp_api.h"
+#include "tapp_api.h" // also declares the libc subset (memcpy, snprintf, sinf, ...)
 
 extern float soft_limit(float x);
 

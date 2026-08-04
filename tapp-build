@@ -180,9 +180,10 @@ CFLAGS=(
     -Werror=double-promotion
     # An undeclared libc function must fail here, not at load time on the device.
     -Werror=implicit-function-declaration
-    # Self-contained header set: clang builtins + the SDK's minimal libc (see libc/README).
+    # Freestanding: clang's builtin headers only, no system libc on the include path. The subset a
+    # tapp may call is declared in tapp_api.h; anything else is a compile error there rather than a
+    # missing import when the device loads it.
     -nostdlibinc
-    -isystem "$SDK_PATH/libc"
     "${CFLAGS[@]}"
 )
 
@@ -593,7 +594,7 @@ info "Linking TAPP..."
 # firmware loader rejects. lld resolves nothing under -r, so no --unresolved-symbols needed.
 "$LD" \
     -r \
-    -T "$SDK_PATH/discard.ld" \
+    -T "$SDK_PATH/tools/discard.ld" \
     "${OBJECT_FILES[@]}" \
     -o "$OUTPUT_FILE" || error "Linking failed"
 

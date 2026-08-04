@@ -51,6 +51,21 @@ package a bare-metal-capable clang + `ld.lld`, so it cannot build tapps.
 
 ### Build Your First TAPP
 
+```bash
+make init my_app     # scaffolds my_app/my_app.c
+./tapp-build my_app  # -> my_app.tapp
+```
+
+`make init` writes a working app you can build and run straight away - a counter with button hints
+and a BTN4-hold exit. It creates a **folder** rather than a bare `.c`, so you can drop in more
+sources, an `inc/` folder or an `assets/` folder later without moving anything. It refuses to
+overwrite an existing directory.
+
+Then **deploy**: create an "apps" folder via disk mode on your *tape!*, copy `my_app.tapp` into it,
+and the app appears in the setup menu.
+
+The rest of this section explains what the generated file contains.
+
 1. **Write your app** (`my_app.c`):
 
 ```c
@@ -132,10 +147,11 @@ Create "apps" folder via disk mode on your *tape!*, and copy `my_app.tapp` - app
 sdk/
 ├── tapp_api.h          # API header (types and functions)
 ├── tapp-build          # Build script - compiles and links a .tapp
-├── discard.ld          # Linker script; drops clang's .ARM.exidx (the loader rejects it)
-├── libc/               # Freestanding libc shim - declares only what the firmware exports
+├── Makefile            # make init (scaffold), example, all, check, clean
 ├── tools/
-│   └── verify-tapp.sh  # Standalone gate checker (tapp-build runs it automatically)
+│   ├── verify-tapp.sh      # Standalone gate checker (tapp-build runs it automatically)
+│   ├── tapp_skeleton.c.in  # Template `make init` copies (@NAME@ is substituted)
+│   └── discard.ld          # Linker script; drops clang's .ARM.exidx (the loader rejects it)
 ├── examples/
 │   ├── simple_app.c    # Minimal example (gfx + input)
 │   ├── my_app.c        # Audio synthesis + MIDI example

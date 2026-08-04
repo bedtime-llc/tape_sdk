@@ -25,17 +25,30 @@ jobs:
     - name: Build examples
       run: |
         mkdir -p out
-        for src in examples/simple_app.c examples/my_app.c examples/chopper.c \
-                   examples/tuner.c examples/groovebox.c; do
+        # nullglob: an unmatched glob would otherwise be passed through literally and tapp-build
+        # would fail on the string "examples/*.c" instead of the loop simply not running.
+        shopt -s nullglob
+        n=0
+        for src in examples/*.c; do
           name=$(basename "$src" .c)
           echo "::group::$name"
           ./tapp-build "$src" "out/$name.tapp"
           echo "::endgroup::"
+          n=$((n+1))
         done
-        # folder-style app with assets
-        echo "::group::demo"
-        ./tapp-build examples/demo out/demo.tapp
-        echo "::endgroup::"
+        # Folder-style apps (multi-file, or carrying assets) — tapp-build takes the directory.
+        for dir in examples/*/; do
+          ls "$dir"*.c >/dev/null 2>&1 || { echo "skipping $dir (no .c)"; continue; }
+          name=$(basename "$dir")
+          echo "::group::$name"
+          ./tapp-build "$dir" "out/$name.tapp"
+          echo "::endgroup::"
+          n=$((n+1))
+        done
+        # Auto-detection that matches nothing is worse than a hardcoded list: the job would go
+        # green having built zero apps. Fail loudly, and print the count so the log shows coverage.
+        [ "$n" -gt 0 ] || { echo "::error::no examples found under examples/"; exit 1; }
+        echo "built $n example(s)"
 
     - name: Verify TAPPs
       run: ./tools/verify-tapp.sh out/*.tapp

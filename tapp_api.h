@@ -45,11 +45,212 @@
  * - @ref grp_input - Input handling
  */
 
+/* Only clang's freestanding builtin headers — tapp-build passes -nostdlibinc, so there is no
+ * system libc on the include path. Everything else a tapp may call is declared below. */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <string.h>
 #include <stdarg.h>
+
+#ifdef FIRMWARE_BUILD
+/* The firmware links a real libc; the freestanding subset below must not shadow it — its
+ * isnan/isinf macros would rewrite the system declarations into builtins and fail to compile. */
+#include <string.h>
+#else
+
+// ============================================================================
+// Freestanding C library subset  (external tapp builds only)
+// ============================================================================
+/*
+ * There is no libc to link against. A .tapp is a relocatable object whose undefined symbols are
+ * resolved by the firmware at load time, so the rule is:
+ *
+ *     declare only what the firmware actually exports.
+ *
+ * Anything omitted is a compile error at the call site (tapp-build passes
+ * -Werror=implicit-function-declaration) instead of a "missing import" when the device loads the
+ * tapp. That matters most for a standalone SDK checkout, where the import gate cannot run — it
+ * needs the firmware export table, which is not there.
+ *
+ * NO DOUBLES. The FPU is FPv5-D16 so doubles work, but at roughly half the throughput of float and
+ * double the register pressure — unacceptable on the audio path. Three things enforce it:
+ *   1. -Werror=double-promotion: a bare `1.1` in a float expression is an error. Write `1.1f`.
+ *   2. Only float entry points are declared here, so `sin(x)` cannot compile.
+ *   3. tools/verify-tapp.sh disassembles the finished .tapp and rejects any .f64 instruction —
+ *      the backstop for what the flags cannot catch (an explicit `double acc;` promotes nothing).
+ *
+ * Two kinds of declaration below, and the difference is load-bearing:
+ *   extern        — the firmware exports it; stays undefined in the .tapp, bound at load.
+ *   static inline — NOT exported, but FPv5 has a single instruction for it, so the builtin expands
+ *                   in place and costs no import. Verified with llvm-nm that none emit a libcall.
+ * Moving one of the inlines to extern silently creates an unresolvable import.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---- string / memory (exported) ----------------------------------------------------------
+ * Absent on purpose: strcat, strncat, strdup, strtok, strcasecmp, strspn, strcspn, strpbrk,
+ * memccpy — none are exported. */
+void* memchr(const void* s, int c, size_t n);
+int memcmp(const void* a, const void* b, size_t n);
+void* memcpy(void* dst, const void* src, size_t n);
+void* memmove(void* dst, const void* src, size_t n);
+void* memset(void* s, int c, size_t n);
+
+char* strchr(const char* s, int c);
+int strcmp(const char* a, const char* b);
+char* strcpy(char* dst, const char* src);
+size_t strlen(const char* s);
+int strncasecmp(const char* a, const char* b, size_t n);
+int strncmp(const char* a, const char* b, size_t n);
+char* strncpy(char* dst, const char* src, size_t n);
+char* strndup(const char* s, size_t n);
+size_t strnlen(const char* s, size_t n);
+char* strrchr(const char* s, int c);
+char* strstr(const char* hay, const char* needle);
+
+/* ---- formatting (exported) ----------------------------------------------------------------
+ * snprintf is the ONLY formatting entry point. printf / sprintf / vsnprintf / puts / fprintf /
+ * fopen are not exported — a tapp calling them links fine and then fails to load. File I/O goes
+ * through the storage_* API further down this header. */
+int snprintf(char* buf, size_t n, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
+
+/* ---- stdlib (exported) ---------------------------------------------------------------------
+ * Prefer os_malloc/os_free below — they are tracked against the app's budget. Absent on purpose:
+ * calloc, exit, abort, atof, atol, bsearch, getenv, system. */
+void* malloc(size_t n);
+void free(void* p);
+void* realloc(void* p, size_t n);
+void qsort(void* base, size_t n, size_t size, int (*cmp)(const void*, const void*));
+int rand(void);
+long random(void);
+int atoi(const char* s);
+float atoff(const char* s); /* float-returning atof; the double atof is not exported */
+long strtol(const char* s, char** end, int base);
+unsigned long strtoul(const char* s, char** end, int base);
+float strtof(const char* s, char** end);
+
+/* ---- math, single precision only (exported) ------------------------------------------------
+ * The double entry points (sin, cos, pow, exp, log, sqrt, ...) are not exported — use the `f`
+ * variants. Absent on purpose (no export AND no instruction): asinf, acosf, log2f, cbrtf, tanhf,
+ * ldexpf, copysignf. logf is derived from the exported log10f below. */
+float sinf(float x);
+float cosf(float x);
+float tanf(float x);
+float sinhf(float x);
+float coshf(float x);
+float asinhf(float x);
+float atanf(float x);
+float atan2f(float y, float x);
+float expf(float x);
+float exp2f(float x);
+float expm1f(float x);
+float log10f(float x);
+float log1pf(float x);
+float powf(float x, float y);
+float pow10f(float x);
+float fmodf(float x, float y);
+float hypotf(float x, float y);
+float frexpf(float x, int* exp);
+float scalbnf(float x, int n);
+long lrintf(float x);
+int finitef(float x);
+float nanf(const char* tag);
+
+#ifdef __cplusplus
+}
+#endif
+
+/* ---- single FPv5 instruction, no import needed ---------------------------------------------- */
+
+/*
+ * sqrtf must NOT go through __builtin_sqrtf. Without -fno-math-errno (implied by -ffast-math) the
+ * builtin may lower to a *call* to sqrtf — i.e. to this very function — which at -O0 is infinite
+ * recursion (verified: one `bl <sqrtf>` inside <sqrtf>). tapp-build always passes -ffast-math so it
+ * happens to be safe, but a header must not depend on that, and there is no libm to fall back to.
+ */
+#if defined(__ARM_FP) && (__ARM_FP & 4) /* single-precision VFP present */
+static inline float sqrtf(float x) {
+    float r;
+    __asm__("vsqrt.f32 %0, %1" : "=t"(r) : "t"(x));
+    return r;
+}
+#else
+static inline float sqrtf(float x) { return __builtin_sqrtf(x); }
+#endif
+
+static inline float fabsf(float x) { return __builtin_fabsf(x); }
+static inline float fminf(float x, float y) { return __builtin_fminf(x, y); }
+static inline float fmaxf(float x, float y) { return __builtin_fmaxf(x, y); }
+static inline float ceilf(float x) { return __builtin_ceilf(x); }
+static inline float floorf(float x) { return __builtin_floorf(x); }
+static inline float roundf(float x) { return __builtin_roundf(x); }
+static inline float truncf(float x) { return __builtin_truncf(x); }
+static inline float rintf(float x) { return __builtin_rintf(x); }
+
+/* natural log via the exported base-10 one (ln(x) = log10(x) * ln(10)) */
+static inline float logf(float x) { return log10f(x) * 2.302585093f; }
+
+static inline int abs(int x) { return __builtin_abs(x); }
+static inline long labs(long x) { return __builtin_labs(x); }
+
+/*
+ * ---- classification: compiler builtins, no imports ----
+ *
+ * CAUTION: tapp-build compiles with -ffast-math, which implies -ffinite-math-only — the compiler is
+ * then entitled to assume NaN and infinity never occur, so isnan()/isinf() fold to constant false
+ * and INFINITY/NAN comparisons are undefined. clang warns (-Wnan-infinity-disabled) at each use.
+ * These exist for source compatibility, not as a working guard: to reject bad input, range-check it
+ * (e.g. `x > 0.0f && x < 1e30f`) rather than testing for NaN.
+ */
+#define isnan(x) __builtin_isnan(x)
+#define isinf(x) __builtin_isinf(x)
+#define isfinite(x) __builtin_isfinite(x)
+#define isnormal(x) __builtin_isnormal(x)
+#define signbit(x) __builtin_signbit(x)
+
+#define INFINITY __builtin_inff()
+#define NAN __builtin_nanf("")
+#define HUGE_VALF __builtin_inff()
+
+/*
+ * Float-suffixed on purpose: with -Werror=double-promotion a double-typed M_PI would make
+ * `x * M_PI` a hard error rather than the intended f32 multiply.
+ */
+#define M_PI 3.14159265358979323846f
+#define M_PI_2 1.57079632679489661923f
+#define M_PI_4 0.78539816339744830962f
+#define M_1_PI 0.31830988618379067154f
+#define M_2_PI 0.63661977236758134308f
+#define M_TWOPI 6.28318530717958647692f /* non-standard, kept for existing app code */
+#define M_E 2.71828182845904523536f
+#define M_LOG2E 1.44269504088896340736f
+#define M_LOG10E 0.43429448190325182765f
+#define M_LN2 0.69314718055994530942f
+#define M_LN10 2.30258509299404568402f
+#define M_SQRT2 1.41421356237309504880f
+#define M_SQRT1_2 0.70710678118654752440f
+
+/*
+ * struct tm exists only as a TYPE. The firmware exports no time entry point at all — not time(),
+ * mktime(), localtime(), gmtime(), difftime(), clock() or strftime() — so none are declared:
+ * calling one must be a compile error, not a load-time missing import. Portable emulator cores
+ * include <time.h> just to name this in an RTC-setter prototype (e.g. Peanut-GB's gb_set_rtc).
+ */
+struct tm {
+    int tm_sec;   /* seconds after the minute [0,60] */
+    int tm_min;   /* minutes after the hour [0,59] */
+    int tm_hour;  /* hours since midnight [0,23] */
+    int tm_mday;  /* day of the month [1,31] */
+    int tm_mon;   /* months since January [0,11] */
+    int tm_year;  /* years since 1900 */
+    int tm_wday;  /* days since Sunday [0,6] */
+    int tm_yday;  /* days since January 1 [0,365] */
+    int tm_isdst; /* daylight saving flag */
+};
+
+#endif /* !FIRMWARE_BUILD */
 
 // When building firmware, use native headers
 // When building external apps, use type definitions below
@@ -966,6 +1167,20 @@ typedef struct {
 void ui_hints_set_labels(const tapp_hint_pair_t* labels);
 
 /**
+ * @brief Put your app's text in the system statusbar (left side)
+ * @param text string to show; NULL or "" removes the item
+ *
+ * The pointer is REFERENCED, not copied. Point it at a buffer your app owns and
+ * just rewrite that buffer whenever the text changes — the statusbar follows with
+ * no further calls. Call this ONCE, in init().
+ *
+ * The firmware owns the statusbar object, so nothing internal crosses the ABI, and
+ * the item is hidden automatically when your app loses focus and dropped when it
+ * exits. The right-hand side is reserved for battery/USB.
+ */
+void ui_statusbar_set_text(const char* text);
+
+/**
  * @brief Show or hide UI hints
  * @param stat true to show hints, false to hide
  */
@@ -1283,6 +1498,29 @@ uint32_t tape_read(const tape_t* tape, uint32_t pos_frame, float* dst, uint32_t 
  * from the audio process() callback.
  */
 uint32_t tape_write(tape_t* tape, uint32_t pos_frame, const float* src, uint32_t n_frames);
+
+/**
+ * @brief Add a cue (a navigable point of interest) spanning [start, end) frames
+ * @return false if the span is empty or shorter than one 64-frame sector
+ *
+ * Cues are what the device's skip-to-cue navigation steps through. Duplicates
+ * within one sector are merged, the list is kept in tape order, and the save is
+ * flagged for you. A cue at position 0 is perfectly legal.
+ */
+bool tape_cue_add(tape_t* tape, uint32_t start_frame, uint32_t end_frame);
+
+/**
+ * @brief Number of cues on the tape
+ */
+uint32_t tape_cues_count(tape_t* tape);
+
+/**
+ * @brief Read cue `idx` (0..tape_cues_count-1), in stereo frames
+ * @return false if idx is out of range
+ *
+ * Cues are stored in tape order, so stepping between them is index +/- 1.
+ */
+bool tape_cue_get(tape_t* tape, uint32_t idx, uint32_t* start_frame, uint32_t* end_frame);
 
 /**
  * @brief Current tape playhead position, in stereo frames
