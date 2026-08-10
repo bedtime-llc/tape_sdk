@@ -2340,6 +2340,22 @@ mixer_t* mixer_get(void);
  * firmware already pauses/resumes RX+TX around an engine-app swap (os_app_launch)
  * — the resume lands after your init() returns. Use engine_set_active(). */
 
+/**
+ * @brief Switch which external source the codec listens to, and apply it
+ * @param line_mic_only true toggles line<->mic only; false cycles every source
+ * @return The source now selected: 0 = line/aux, 1 = mic, 2 = fx, 3 = usb
+ *
+ * This is the same global the device's own input setting drives — it reconfigures
+ * the codec input path, re-derives monitoring (mic monitoring needs the headphone
+ * jack, because the speaker would feed back) and wakes the audio DMA if it had
+ * idled. It PERSISTS after your app exits, exactly as if the user had changed it in
+ * the menu, so only call it in response to a deliberate user action.
+ *
+ * There is no getter: the source cannot be read without switching it, so drive your
+ * UI from the returned value and show "unknown" until the user has pressed once.
+ */
+uint8_t os_audio_switch_input(bool line_mic_only);
+
 /** @} */ // end of grp_audio
 
 // ============================================================================

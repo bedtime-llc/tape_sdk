@@ -13,7 +13,7 @@
 #   3. unwind tables  no .ARM.exidx — clang emits it and its R_ARM_PREL31 is not supported
 #   4. manifest       a .tapp_manifest section with magic "TAPP"
 #   5. entry point    a defined tapp_get_descriptor symbol
-#   6. imports        (optional) every undefined symbol is in the firmware's export table
+#   6. imports        every undefined symbol is in the firmware's export table
 #
 # NOTE: no `set -o pipefail` here — `cmd | grep -q` SIGPIPEs the producer and would fail every check.
 
@@ -44,33 +44,49 @@ FW_OK='^R_ARM_(NONE|ABS32|REL32|THM_CALL|THM_JUMP24|TARGET1|TARGET2|THM_MOVW_ABS
 EMU_OK='^R_ARM_(NONE|ABS32|REL32|THM_CALL|THM_JUMP24|TARGET1|THM_JUMP19)$'
 
 EXPORTS_SRC=""
-EXPORTS_EXPLICIT=0
-if [ "${1:-}" = "--exports" ]; then EXPORTS_SRC="${2:-}"; EXPORTS_EXPLICIT=1; shift 2; fi
+if [ "${1:-}" = "--exports" ]; then EXPORTS_SRC="${2:-}"; shift 2; fi
 [ "$#" -gt 0 ] || { echo "usage: $0 [--exports tapp_api_table.c] <file.tapp> ..." >&2; exit 2; }
 
-# Find the firmware export table automatically when not told where it is. Without it the import
-# gate cannot run, and a run that silently skips a gate but still prints "all checks passed" is the
-# same false confidence this tool exists to remove. This SDK lives at
-# <firmware>/lib/tapp/builder/sdk, so from tools/ the table is three levels up under api/.
+# The export set comes from tapp_api.h — the same header the tapp compiled against — via
+# tools/api_exports.py, which is also what the firmware's generate_api_table.py uses to build the
+# on-device symbol table. One parser, so the gate cannot disagree with the device about what is
+# importable. No generated symbol list to keep in sync, and it works in a standalone SDK checkout
+# with no firmware tree, which is where this gate matters most.
+#
+# --exports still takes an explicit tapp_api_table.c, for checking a .tapp against a DIFFERENT
+# firmware than the header in this checkout describes.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -z "$EXPORTS_SRC" ] && [ -f "$SCRIPT_DIR/../../../api/tapp_api_table.c" ]; then
-    EXPORTS_SRC="$SCRIPT_DIR/../../../api/tapp_api_table.c"
-fi
 
 EXPORTS_LIST=""
+EXPORTS_FROM=""
 if [ -n "$EXPORTS_SRC" ]; then
     if [ ! -f "$EXPORTS_SRC" ]; then
-        # An explicit bad path is a usage error; a missing auto-detected one just means standalone.
-        [ "$EXPORTS_EXPLICIT" -eq 1 ] && { echo "exports file not found: $EXPORTS_SRC" >&2; exit 2; }
-        EXPORTS_SRC=""
-    else
-        EXPORTS_LIST=$(mktemp)
-        # The table is a .rodata asm blob; each row carries the symbol name in a /* comment */.
-        grep -oE '/\* [A-Za-z_][A-Za-z0-9_]* \*/' "$EXPORTS_SRC" \
-            | sed 's|/\* ||;s| \*/||' | sort -u > "$EXPORTS_LIST"
-        trap 'rm -f "$EXPORTS_LIST"' EXIT
+        echo "exports file not found: $EXPORTS_SRC" >&2
+        exit 2
+    fi
+    EXPORTS_LIST=$(mktemp)
+    trap 'rm -f "$EXPORTS_LIST"' EXIT
+    # tapp_api_table.c is a .rodata asm blob whose rows carry the name in a /* comment */. A row
+    # may export one name at another's address (`/* memcpy -> memcpy4 */`) — the EXPORTED name is
+    # the first one, and matching only the bare form used to drop it, so every tapp calling memcpy
+    # was reported as an unresolvable import.
+    grep -oE '/\* [A-Za-z_][A-Za-z0-9_]*( -> [A-Za-z_][A-Za-z0-9_]*)? \*/' "$EXPORTS_SRC" \
+        | sed -E 's|/\* ([A-Za-z_][A-Za-z0-9_]*).*|\1|' | sort -u > "$EXPORTS_LIST"
+    EXPORTS_FROM="$EXPORTS_SRC"
+elif command -v python3 >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/api_exports.py" ]; then
+    EXPORTS_LIST=$(mktemp)
+    trap 'rm -f "$EXPORTS_LIST"' EXIT
+    if python3 "$SCRIPT_DIR/api_exports.py" 2>/dev/null | sort -u > "$EXPORTS_LIST"; then
+        EXPORTS_FROM="tapp_api.h"
     fi
 fi
+
+if [ -n "$EXPORTS_LIST" ] && [ ! -s "$EXPORTS_LIST" ]; then
+    echo "no symbols found via ${EXPORTS_FROM:-api_exports.py} — is the header intact?" >&2
+    exit 2
+fi
+[ -n "$EXPORTS_LIST" ] && \
+    echo "exports: $EXPORTS_FROM ($(grep -c . "$EXPORTS_LIST" | tr -d ' ') symbols)"
 
 RC=0
 SKIPPED=0
@@ -206,8 +222,10 @@ for TAPP in "$@"; do
         fi
     else
         # Never stay silent about a gate that did not run — see the note at EXPORTS_SRC above.
-        echo -e "  ${YELLOW}!${NC} imports NOT checked (no firmware export table found)"
-        echo -e "     pass --exports <firmware>/lib/tapp/api/tapp_api_table.c to enable it"
+        # Reachable only without python3, or with tools/api_exports.py missing.
+        echo -e "  ${YELLOW}!${NC} imports NOT checked (could not read the export set)"
+        echo -e "     needs python3 and tools/api_exports.py, or"
+        echo -e "     --exports <firmware>/lib/tapp/api/tapp_api_table.c"
         SKIPPED=1
     fi
 

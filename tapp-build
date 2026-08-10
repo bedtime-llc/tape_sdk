@@ -615,16 +615,18 @@ info "Sections:"
 # -ffast-math makes it easy to hit by accident — clang rewrites powf(x, 1.0f/3.0f) into a call to
 # cbrtf and powf(2.0f, n) into ldexpf, neither of which exists in the firmware.
 #
-# Skipped (with a note) when the SDK is used standalone, since the table lives in the firmware tree.
-if [ -f "$API_TABLE" ] && [ -x "$SDK_PATH/tools/verify-tapp.sh" ]; then
+# Inside the firmware tree the live table is authoritative, so hand it over. Standalone, the gate
+# reads the same export set out of tapp_api.h itself (tools/api_exports.py) — so verification runs
+# either way. It used to be skipped ENTIRELY without a firmware tree, which meant a public SDK user
+# got no shape, exidx, manifest or f64 gate either, not just no import check.
+if [ -x "$SDK_PATH/tools/verify-tapp.sh" ]; then
     echo ""
-    if ! "$SDK_PATH/tools/verify-tapp.sh" --exports "$API_TABLE" "$OUTPUT_FILE"; then
+    VERIFY_ARGS=()
+    [ -f "$API_TABLE" ] && VERIFY_ARGS=(--exports "$API_TABLE")
+    if ! "$SDK_PATH/tools/verify-tapp.sh" "${VERIFY_ARGS[@]}" "$OUTPUT_FILE"; then
         rm -f "$OUTPUT_FILE"
         error "$(basename "$OUTPUT_FILE") failed verification (see above) — not written"
     fi
-elif [ ! -f "$API_TABLE" ]; then
-    echo ""
-    info "Skipping import check (no firmware tree found — run tools/verify-tapp.sh --exports manually)"
 fi
 
 echo ""

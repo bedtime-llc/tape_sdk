@@ -1,25 +1,12 @@
 /**
  * @file led_patterns.c
- * @brief Showcase LED patterns for the "leds" example.
+ * @brief Showcase LED patterns.
  *
- * These used to live in the firmware (lib/ui/ui_led_patterns.c) purely to fill
- * a dev menu. They are pure animation with no device meaning, so they belong
- * out here where they cost nothing. The firmware keeps only the patterns that
- * stand for something -- startup, battery, undo, record arm and friends.
- *
- * They run on the real OS pattern engine, unchanged: a step callback plus a
- * step count, handed to os_led_set_pattern(). The only edit made when moving
- * them was os_led_get_step(led) becoming os_led_get_step(led), because a tapp sees
- * os_led_t as an opaque type.
  */
 
 #include "tapp_api.h"
 
 #include "led_patterns.h"
-
-// ============================================================================
-// Shared helpers (copied from the firmware's ui_led_patterns.c)
-// ============================================================================
 
 static inline void
 hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t* r, uint8_t* g, uint8_t* b) {
@@ -81,10 +68,6 @@ static inline uint8_t led_hash(uint8_t x) {
     x ^= x << 4;
     return x;
 }
-
-// ============================================================================
-// DEMO / CREATIVE PATTERNS
-// ============================================================================
 
 // --- Rainbow: HSV hue rotates across 4 LEDs ---
 static void led_rainbow_cb(const os_led_t* led, const void* ctx) {
@@ -211,7 +194,6 @@ static void led_candle_cb(const os_led_t* led, const void* ctx) {
     }
 }
 
-// --- Demo pattern structs ---
 
 led_pattern_t led_pattern_rainbow = {
     .callback = &led_rainbow_cb,
@@ -262,9 +244,6 @@ led_pattern_t led_pattern_candle = {
     .rate = 50,
 };
 
-// ============================================================================
-// 20 ADDITIONAL CREATIVE PATTERNS
-// ============================================================================
 
 // --- Aurora: slow green/cyan/purple shimmer, phase-shifted ---
 static void led_aurora_cb(const os_led_t* led, const void* ctx) {
@@ -537,7 +516,6 @@ static void led_ember_cb(const os_led_t* led, const void* ctx) {
     }
 }
 
-// --- New pattern structs ---
 
 led_pattern_t led_pattern_aurora = {
     .callback = &led_aurora_cb,
@@ -659,10 +637,6 @@ led_pattern_t led_pattern_ember = {
     .steps = 255,
     .rate = 50,
 };
-
-// ============================================================================
-// 20 NEW CREATIVE PATTERNS (10 ANIMATIONS + 10 REACTIVE)
-// ============================================================================
 
 // --- Plasma: multi-frequency color mixing ---
 static void led_plasma_cb(const os_led_t* led, const void* ctx) {
@@ -1129,10 +1103,6 @@ led_pattern_t led_pattern_vu_strobe = {
     .rate = 50,
 };
 
-// ============================================================================
-// CREATIVE PATTERNS v2 (Q15 MATH BASED)
-// ============================================================================
-
 // --- Tide: smooth sinusoidal color waves, 90° phase per LED ---
 static void led_tide_cb(const os_led_t* led, const void* ctx) {
     (void)ctx;
@@ -1243,14 +1213,17 @@ static void led_interference_cb(const os_led_t* led, const void* ctx) {
 // --- Thermal: color temperature drifts warm↔cool over slow cycle ---
 static void led_thermal_cb(const os_led_t* led, const void* ctx) {
     (void)ctx;
-    uint16_t phase = (uint16_t)(os_led_get_step(led) * 100);
+    /* x256 = one full warm<->cool cycle over the 256 steps; x100 covered ~39% of a
+     * period so the drift was nearly static and jumped at the wrap. Range widened
+     * from ~35/15/35 to something actually readable as a colour shift. */
+    uint16_t phase = (uint16_t)(os_led_get_step(led) * 256);
     int16_t s = lutsin_q15(phase);
     uint8_t warmth = (uint8_t)(((int32_t)s + 32768) >> 8);
     for(uint8_t i = 0; i < 4; i++) {
         uint8_t w = (uint8_t)(warmth + i * 15);
-        uint8_t r = (uint8_t)(35 - (uint16_t)w * 25 / 255);
-        uint8_t g = 15;
-        uint8_t b = (uint8_t)(5 + (uint16_t)w * 30 / 255);
+        uint8_t r = (uint8_t)(90 - (uint16_t)w * 70 / 255);
+        uint8_t g = 30;
+        uint8_t b = (uint8_t)(15 + (uint16_t)w * 75 / 255);
         hal_led_set_rgb(i, r, g, b);
     }
 }
@@ -1297,22 +1270,34 @@ static void led_syncopation_cb(const os_led_t* led, const void* ctx) {
 // --- Mist: barely-there ambient blue-white, ultra-slow sine ---
 static void led_mist_cb(const os_led_t* led, const void* ctx) {
     (void)ctx;
-    uint16_t base = (uint16_t)(os_led_get_step(led) * 40);
+    /* x256 walks exactly one full cycle across the 256 steps (x40 covered only ~15%
+     * of a period, so it barely moved), and the level range was [1,8] out of 255 —
+     * indistinguishable from off. [1,80] still reads as a soft mist. */
+    uint16_t base = (uint16_t)(os_led_get_step(led) * 256);
     for(uint8_t i = 0; i < 4; i++) {
         uint16_t phase = (uint16_t)(base + i * 11000u);
         int16_t s = lutsin_q15(phase);
-        uint8_t v = (uint8_t)(((int32_t)s + 32768) * 7 >> 16) + 1;
+        uint8_t v = (uint8_t)(((int32_t)s + 32768) * 80 >> 16) + 1;
         hal_led_set_rgb(i, (uint8_t)(v / 2), (uint8_t)(v * 3 / 4), v);
     }
 }
 
-// ============================================================================
-// REACTIVE PATTERNS v2 (Q15 MATH BASED)
-// ============================================================================
 
 static inline float led_get_level_q15(const os_led_t* led, const void* ctx) {
     if(ctx) return *(const float*)ctx;
-    return (float)(((int32_t)lutsin_q15((uint16_t)(os_led_get_step(led) << 8)) + 32768) >> 8) / 255.f;
+
+    /* No audio source: synthesise a PERCUSSIVE envelope, not a smooth sine.
+     *
+     * The v2 patterns below are attack detectors — "vu particl" needs level to rise
+     * by >0.15 in a single step and "vu impact" by >0.12. A full-circle sine over
+     * 256 steps moves at most 0.0123 per step, so with one of those neither gate can
+     * ever fire: both patterns sat dark forever and looked like dead entries. A
+     * retriggering decay gives them the transients they were written for, and still
+     * reads as a level for the metering patterns. */
+    const uint8_t beat = (uint8_t)(os_led_get_step(led) & 31u); // hit every 32 steps
+    if(beat == 0) return 1.0f;                                  // attack
+    const float v = 1.0f - (float)beat / 32.f;
+    return v * v; // squared -> snappier tail
 }
 
 // --- VU Log: logarithmic compressed metering ---
@@ -1320,7 +1305,10 @@ static void led_vu_log_cb(const os_led_t* led, const void* ctx) {
     float level = led_get_level_q15(led, ctx);
     int16_t raw = (int16_t)(level * 32767.f);
     int16_t compressed = lutsat_q15(raw);
-    float clvl = (float)(compressed + 32768) / 65535.f;
+    /* raw is UNIPOLAR [0,32767], so compressed is too — biasing it by 32768 as if it
+     * were bipolar pinned clvl to [0.5,1.0], which held LEDs 0 and 1 permanently at
+     * full brightness and left only the top two responding. */
+    float clvl = (float)compressed / 32767.f;
     for(uint8_t i = 0; i < 4; i++) {
         float threshold = (float)i / 4.f;
         float above = clvl - threshold;

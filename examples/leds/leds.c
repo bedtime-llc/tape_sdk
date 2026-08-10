@@ -2,14 +2,8 @@
  * @file leds.c
  * @brief Browse and play the device's LED patterns.
  *
- * A tour of the OS LED pattern engine. Scroll the list with the encoder, press
- * BTN1 to play, BTN2 to stop.
- *
- * The interesting part is how little this file does. It never touches an LED.
- * It hands a led_pattern_t to os_led_set_pattern() and the OS LED task drives
- * the animation on its own timer -- tick() below does nothing but read the
- * encoder. That is why patterns keep animating smoothly no matter how slow
- * your redraw is.
+ * A tour of the OS LED pattern engine. Scroll the list with the encoder and
+ * press to play; the first entry stops everything.
  *
  * The patterns themselves live in led_patterns.c.
  */
@@ -18,115 +12,118 @@
 
 #include "led_patterns.h"
 
-#define TOP_BAR 60 // the system hint band clears rows 0..59
-#define ROW_H   20
-#define ROWS    8 // (240 - 60) / 20, leaving a little slack at the bottom
-#define LIST_X  16
+#define MENU_X       14
+#define MENU_Y       74
+#define MENU_W       244
+#define MENU_VISIBLE 5
+
+#define STATUS_X 278
+#define STATUS_Y 96
 
 typedef struct {
-    uint16_t sel;     // highlighted row
-    uint16_t top;     // first visible row
-    int32_t playing;  // index of the running pattern, -1 for none
+    ui_menu_t* menu;
+    int32_t playing; // index of the running pattern, -1 for none
 } leds_model_t;
 
 static void leds_all_off(void) {
     for(uint8_t i = 0; i < 4; i++) hal_led_set_rgb(i, 0, 0, 0);
 }
 
-static void leds_play(leds_model_t* m, uint16_t idx) {
-    // ctx NULL: the reactive patterns fall back to an internal triangle wave,
+static void leds_stop(leds_model_t* m) {
+    os_led_stop_current();
+    leds_all_off();
+    m->playing = -1;
+}
+
+static void leds_pick(ui_menu_t* menu, ui_menu_node_t* entry) {
+    leds_model_t* m = ui_menu_ctx(menu);
+    if(m == NULL || entry == NULL) return;
+
+    const uint32_t slot = (uint32_t)(uintptr_t)entry->user_data;
+    if(slot == 0) {
+        leds_stop(m);
+        return;
+    }
+
+    const uint32_t idx = slot - 1;
+    if(idx >= led_demo_count) return;
+    // ctx NULL: the reactive patterns fall back to an internal level source,
     // so they animate here without an audio source to drive them.
     os_led_set_pattern(led_demos[idx].pattern, NULL);
     m->playing = (int32_t)idx;
 }
 
-static void leds_stop(leds_model_t* m) {
-    os_led_stop_current();
-    // The KTD2052 latches: stopping the pattern leaves whatever colour was
-    // written last sitting on the strip, so clear it explicitly.
-    leds_all_off();
-    m->playing = -1;
+static void leds_menu_build(ui_menu_t* menu) {
+    if(ui_menu_ctx(menu) == NULL) return;
+
+    ui_menu_add(menu,
+                (ui_menu_node_t){.name = "- off -",
+                                 .type = MenuNodeCustom,
+                                 .callback = leds_pick,
+                                 .user_data = (void*)(uintptr_t)0});
+
+    for(uint16_t i = 0; i < led_demo_count; i++) {
+        ui_menu_add(menu,
+                    (ui_menu_node_t){.name = (char*)led_demos[i].name,
+                                     .type = MenuNodeCustom,
+                                     .callback = leds_pick,
+                                     .user_data = (void*)(uintptr_t)(i + 1)});
+    }
+}
+
+static void leds_menu_closed(void* ctx, ui_menu_t* menu) {
+    (void)ctx;
+    (void)menu;
+    os_app_exit();
 }
 
 static bool leds_init(os_app_t* app, va_list args) {
     leds_model_t* m = os_app_get_model(app);
-    m->sel = 0;
-    m->top = 0;
     m->playing = -1;
 
-    static const tapp_hint_pair_t hints[5] = {
-        {"play", 0}, {"stop", 0}, {0, 0}, {0, "exit"}, {0, 0},
-    };
-    ui_hints_set_labels(hints);
-    ui_hints_show(true);
+    m->menu = ui_menu_create(m, leds_menu_build);
+    if(m->menu == NULL) return false;
 
-    leds_play(m, 0); // something on the strip straight away
+    ui_menu_set_type(m->menu, MenuTypeWidget);
+    ui_menu_set_header(m->menu, true);
+    ui_menu_set_name(m->menu, "led patterns");
+    ui_menu_set_visible(m->menu, MENU_VISIBLE);
+    ui_menu_set_pos(m->menu, MENU_X, MENU_Y);
+    ui_menu_set_width(m->menu, MENU_W);
+    ui_menu_set_close_cb(m->menu, leds_menu_closed);
+    ui_menu_show(m->menu);
+
     return true;
 }
 
 static bool leds_deinit(os_app_t* app) {
     leds_model_t* m = os_app_get_model(app);
-    leds_stop(m); // never hand the device back with the strip stuck lit
+    leds_stop(m); 
+    if(m->menu != NULL) {
+        ui_menu_destroy(m->menu);
+        m->menu = NULL;
+    }
     return true;
 }
 
 static void leds_redraw(gfx_t* gfx, const os_app_t* app) {
     leds_model_t* m = os_app_get_model(app);
 
-    char buf[40];
-
     gfx_set_color(gfx, 1);
-    snprintf(buf, sizeof(buf), "%d/%d", (int)m->sel + 1, (int)led_demo_count);
-    gfx_draw_str(gfx, LIST_X, TOP_BAR, buf);
-
-    for(uint16_t r = 0; r < ROWS; r++) {
-        const uint16_t idx = m->top + r;
-        if(idx >= led_demo_count) break;
-
-        const gfx_uint_t y = TOP_BAR + 22 + r * ROW_H;
-        const bool sel = (idx == m->sel);
-
-        if(sel) {
-            gfx_set_color(gfx, 1);
-            gfx_draw_rect_fill(gfx, LIST_X - 4, y - 2, 200, ROW_H);
-        }
-        // Inverted text on the selected row, normal elsewhere.
-        gfx_set_color(gfx, sel ? 0 : 1);
-        snprintf(buf, sizeof(buf), "%s%s", (idx == (uint16_t)m->playing) ? "> " : "  ",
-                 led_demos[idx].name);
-        gfx_draw_str(gfx, LIST_X, y, buf);
+    if(m->playing >= 0 && m->playing < (int32_t)led_demo_count) {
+        gfx_draw_str(gfx, STATUS_X, STATUS_Y, "playing");
+        gfx_draw_str(gfx, STATUS_X, STATUS_Y + 18, led_demos[m->playing].name);
+    } else {
+        gfx_draw_str(gfx, STATUS_X, STATUS_Y, "stopped");
     }
-}
-
-static bool leds_tick(os_app_t* app) {
-    leds_model_t* m = os_app_get_model(app);
-
-    const int32_t d = os_controls_encoder_get_delta();
-    if(d != 0) {
-        int32_t s = (int32_t)m->sel + d;
-        if(s < 0) s = 0;
-        if(s >= (int32_t)led_demo_count) s = led_demo_count - 1;
-        m->sel = (uint16_t)s;
-
-        // Keep the selection inside the visible window.
-        if(m->sel < m->top) m->top = m->sel;
-        else if(m->sel >= m->top + ROWS) m->top = m->sel - (ROWS - 1);
-    }
-    return true;
 }
 
 static void leds_input(os_app_t* app, uint8_t btn, KeyStateEnum state) {
     leds_model_t* m = os_app_get_model(app);
 
-    if(state == KEY_STATE_PRESSED) {
-        switch(btn) {
-        case 0:
-            leds_play(m, m->sel);
-            break;
-        case 1:
-            leds_stop(m);
-            break;
-        }
+    if(m->menu != NULL && ui_menu_is_visible(m->menu)) {
+        ui_menu_input(m->menu, btn, state);
+        return;
     }
     if(btn == 3 && state == KEY_STATE_HOLD) os_app_exit();
 }
@@ -143,7 +140,6 @@ static os_app_t leds_app = {
     .type = AppFullscreenType,
     .data = &leds_data,
     .redraw = (os_app_redraw)leds_redraw,
-    .tick = leds_tick,
     .on_input = leds_input,
 };
 

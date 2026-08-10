@@ -150,6 +150,7 @@ sdk/
 ├── Makefile            # make init (scaffold), example, all, check, clean
 ├── tools/
 │   ├── verify-tapp.sh      # Standalone gate checker (tapp-build runs it automatically)
+│   ├── api_exports.py      # What tapp_api.h exports; verify-tapp.sh's import gate reads it
 │   ├── tapp_skeleton.c.in  # Template `make init` copies (@NAME@ is substituted)
 │   └── discard.ld          # Linker script; drops clang's .ARM.exidx (the loader rejects it)
 ├── examples/
