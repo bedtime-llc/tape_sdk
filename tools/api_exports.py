@@ -83,6 +83,7 @@ NEVER_EXPORT_EXACT = {
     'os_settings_get',   # mutable pointer to the entire device config
     'os_audio_get',      # OS-level SAI/DMA state
     'os_led_get',        # LED task queue + task id
+    'os_app_close',      # frees the image on the caller's stack — tapps call os_app_exit()
 }
 
 

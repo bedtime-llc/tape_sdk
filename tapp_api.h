@@ -570,7 +570,7 @@ static inline void os_app_data_init(
  * transform stack: each call takes absolute screen coordinates and paints in the current
  * draw colour.
  *
- * @section gfx_color Colour model
+ * @section gfx_color Color model
  *
  * The panel is 1-bit and the frame starts cleared to black, so drawing means turning pixels
  * *on*. gfx_set_color() selects what a draw call does to the pixels it touches:
@@ -860,7 +860,8 @@ void gfx_fill_rect_gradient_h_dithered_bayer(gfx_t* gfx, gfx_uint_t x, gfx_uint_
  * @param x0 Centre X
  * @param y0 Centre Y
  * @param r Radius in pixels
- * @param opt Quadrant mask — ::GFX_DRAW_ALL, or an OR of the ::GFX_DRAW_UPPER_RIGHT family
+ * @param opt Quadrant mask — ::GFX_DRAW_ALL, or an OR of the ::GFX_DRAW_* family
+ * @note GFX_DRAW_ALL draws full circle and matches ::GFX_DRAW_UPPER_LEFT | GFX_DRAW_UPPER_RIGHT | GFX_DRAW_LOWER_RIGHT | GFX_DRAW_LOWER_LEFT
  */
 void gfx_draw_circle(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uint8_t opt);
 
@@ -871,6 +872,7 @@ void gfx_draw_circle(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uin
  * @param y0 Centre Y
  * @param r Radius in pixels
  * @param opt Quadrant mask — ::GFX_DRAW_ALL, or an OR of the ::GFX_DRAW_UPPER_RIGHT family
+ * @note GFX_DRAW_ALL draws full circle and matches ::GFX_DRAW_UPPER_LEFT | GFX_DRAW_UPPER_RIGHT | GFX_DRAW_LOWER_RIGHT | GFX_DRAW_LOWER_LEFT
  */
 void gfx_draw_disc(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uint8_t opt);
 
@@ -881,6 +883,7 @@ void gfx_draw_disc(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uint8
  * @param y0 Centre Y
  * @param r Radius in pixels
  * @param opt Quadrant mask — ::GFX_DRAW_ALL, or an OR of the ::GFX_DRAW_UPPER_RIGHT family
+ * @note GFX_DRAW_ALL draws full circle and matches ::GFX_DRAW_UPPER_LEFT | GFX_DRAW_UPPER_RIGHT | GFX_DRAW_LOWER_RIGHT | GFX_DRAW_LOWER_LEFT
  */
 void gfx_draw_circle_dotted(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uint8_t opt);
 
@@ -1346,6 +1349,25 @@ typedef enum {
  */
 void ui_format_time(char* restrict buff, uint32_t size, float val, TimeFormatStyle style);
 
+/** @brief Fill texture for ui_draw_shade_pattern() */
+typedef enum {
+    UI_SHADE_VLINES = 1,          /**< Vertical stripes */
+    UI_SHADE_HLINES,              /**< Horizontal stripes */
+    UI_SHADE_CROSSHATCH,          /**< Horizontals and verticals */
+    UI_SHADE_CHECKER,             /**< Checkerboard */
+    UI_SHADE_DOTS,                /**< Dot grid */
+    UI_SHADE_DIAGONAL,            /**< Diagonals, 45° down-right */
+    UI_SHADE_DIAGONAL_X,          /**< Diagonals both ways */
+    UI_SHADE_CROSSHATCH_FINE,     /**< Cross-hatch at half the spacing */
+    UI_SHADE_CHECKER_LARGE,       /**< Checkerboard in bigger, sparser blocks */
+    UI_SHADE_DOTS_OFFSET,         /**< Staggered dots — a softer grid */
+    UI_SHADE_VDASH,               /**< Vertical dashes */
+    UI_SHADE_HDASH,               /**< Horizontal dashes */
+    UI_SHADE_DOTS_DENSE,          /**< Dots on every other row */
+    UI_SHADE_STIPPLE,             /**< Alternating filled and sparse rows */
+    UI_SHADE_SOLID,               /**< Filled rectangle */
+} ui_shade_pattern_t;
+
 /**
  * @brief Fill a rectangle with a line/dot texture instead of a dither pattern
  * @param gfx Graphics context
@@ -1353,16 +1375,14 @@ void ui_format_time(char* restrict buff, uint32_t size, float val, TimeFormatSty
  * @param y Top edge
  * @param w Width in pixels
  * @param h Height in pixels
- * @param pattern Texture: 1 vertical stripes, 2 horizontal stripes, 3 cross-hatch,
- *                4 checkerboard, 5 dot grid, 6 diagonal, 7 diagonal cross, 8 fine
- *                cross-hatch, 9 large checker, 10 staggered dots, 11 vertical dashes,
- *                12 horizontal dashes, 13 dense dots, 14 stipple, 15 solid
+ * @param pattern Which texture — see ::ui_shade_pattern_t
  * @param density 1-14, spacing between texture elements — bigger is tighter. 0 draws
  *                nothing at all.
  * @note Distinct from the dithered fills: this is a geometric texture at your chosen
  * spacing, not a grey level. Clipped to the screen internally.
+ * @note A pattern outside the enum — 0 included — fills solid.
  */
-void ui_draw_shade_pattern(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint_fast8_t pattern, uint_fast8_t density);
+void ui_draw_shade_pattern(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui_shade_pattern_t pattern, uint_fast8_t density);
 
 /**
  * @brief Single horizontal level bar
@@ -1535,12 +1555,6 @@ void os_free(void* ptr);
  * will be called before the app is unloaded.
  */
 void os_app_exit(void);
-
-/**
- * @brief Close the given app
- * @param app App to close
- */
-void os_app_close(os_app_t* app);
 
 /**
  * @brief Get app's model data
