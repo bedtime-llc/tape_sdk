@@ -132,9 +132,6 @@ typedef struct {
 
     params_t bpm, density, grain, pitch, spread, reverse, scatter, repeat, memory;
     ui_menu_t* menu;
-
-    char s_info[40];
-    char s_enc[28];
 } ch_model_t;
 
 static ch_model_t* g_model = 0;
@@ -409,17 +406,13 @@ static void ch_redraw(gfx_t* gfx, const os_app_t* app) {
     ch_model_t* m = os_app_get_model(app);
     gfx_set_color(gfx, 1);
 
-    snprintf(m->s_info, sizeof(m->s_info), "%s marks:%u BPM %d",
-             m->playing ? ">" : "=", (unsigned)m->n_marks, (int)(m->bpm.val + 0.5f));
-    gfx_draw_str(gfx, 8, TOP_BAR + 2, m->s_info);
-    snprintf(m->s_enc, sizeof(m->s_enc), "ENC %s", ENC_NAME[m->enc_target]);
-    gfx_draw_str(gfx, 200, TOP_BAR + 2, m->s_enc);
+    gfx_draw_strf(gfx, 8, TOP_BAR + 2, "%s marks:%u BPM %d",
+                  m->playing ? ">" : "=", (unsigned)m->n_marks, (int)(m->bpm.val + 0.5f));
+    gfx_draw_strf(gfx, 200, TOP_BAR + 2, "ENC %s", ENC_NAME[m->enc_target]);
     if (m->state == CH_LOADING) {
         gfx_draw_str(gfx, 322, TOP_BAR + 2, "reading");
     } else if (m->memory.val > 0.02f && m->phrase_len >= 2) {
-        char mem[16];
-        snprintf(mem, sizeof(mem), "loop%u", (unsigned)m->phrase_len);
-        gfx_draw_str(gfx, 322, TOP_BAR + 2, mem);
+        gfx_draw_strf(gfx, 322, TOP_BAR + 2, "loop%u", (unsigned)m->phrase_len);
     }
 
     // Say exactly what is wrong, rather than drawing empty boxes.
@@ -450,10 +443,8 @@ static void ch_redraw(gfx_t* gfx, const os_app_t* app) {
                                    i == m->play_bank ? 6 : 3);
             // Which recording this bank is chopping — a bank whose mark is a
             // sliver in the strip below is still identifiable here.
-            char lbl[8];
-            snprintf(lbl, sizeof(lbl), "r%u", (unsigned)m->src_mark[i] + 1u);
             gfx_set_color(gfx, 1);
-            gfx_draw_str(gfx, x + 3, by - 3, lbl);
+            gfx_draw_strf(gfx, x + 3, by - 3, "r%u", (unsigned)m->src_mark[i] + 1u);
         } else if (i == m->load_bank) {
             const int fill = (int)((float)m->load_done / (float)(m->load_want ? m->load_want : 1)
                                    * (bh - 4));

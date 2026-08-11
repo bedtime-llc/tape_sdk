@@ -22,6 +22,14 @@ jobs:
     - name: Check dependencies
       run: make check
 
+    # nanopb is deliberately not vendored — a tapp only needs it if it ships a .proto, so the
+    # instructions tell authors to add it themselves. examples/persistence does ship one, so CI
+    # walks that same path: fetch nanopb next to the SDK, where tapp-build looks for it.
+    - name: Fetch nanopb (for .proto examples)
+      run: |
+        git clone --depth 1 https://github.com/nanopb/nanopb.git nanopb
+        pip install --quiet protobuf grpcio-tools
+
     - name: Build examples
       run: |
         mkdir -p out

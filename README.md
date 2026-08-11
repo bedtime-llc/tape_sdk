@@ -159,6 +159,7 @@ sdk/
 │   ├── tuner.c         # Chromatic tuner + circle of fifths
 │   ├── groovebox.c     # Morphing drum machine (+ tape record)
 │   ├── chopper.c       # Tape-marks cutup composer
+│   ├── persistence/    # Saving settings with a .proto schema
 │   └── demo/           # Assets demo (sprites + animation)
 └── README.md           # This file
 ```
@@ -271,6 +272,39 @@ uint32_t storage_write_file(const char* path, const void* buffer, size_t size);
 bool storage_file_exists(const char* path);
 uint32_t storage_file_size(const char* path);
 ```
+
+### Persisting settings
+
+Nothing saves for you: the `memory_if` field of your descriptor is overwritten by the loader and
+its callbacks are NULL, so load in `init()` and save in `deinit()`. Never call storage from
+`process()` — it blocks on the SD card. Test the write result as `> 0`, not `== size`;
+
+For a couple of values, write a struct behind a magic word. For anything you expect to extend, use
+a `.proto`: protobuf keys fields by number, so a file written by an older build still loads after
+you add a field. Drop the schema next to your `.c` and build the **folder** —
+
+```bash
+./tapp-build myapp          # myapp/myapp.c + myapp/settings.proto
+```
+
+`tapp-build` runs nanopb, then compiles and links the generated descriptors and the nanopb runtime
+(~4KB) into your `.tapp`. Include the result as `"settings.pb.h"`; it is generated into a temp
+directory that is already on the include path. Bound every string/repeated field with
+`[(nanopb).max_size = N]` / `[(nanopb).max_count = N]`, or nanopb emits callback fields instead of
+plain C members.
+
+nanopb is **not bundled** — add it yourself if you use `.proto`:
+
+```bash
+git submodule add https://github.com/nanopb/nanopb.git nanopb
+pip install protobuf grpcio-tools
+```
+
+or point `NANOPB_DIR` at an existing checkout. Inside the firmware tree it is found automatically.
+
+The [browser builder](https://tapp.b.edti.me) compiles `.proto` too — it runs protoc as wasm and
+then nanopb's own generator, so the `.pb.c` it produces is byte-identical to the CLI's, and nothing
+needs installing. See `examples/persistence/` and the Persistence page of the API docs.
 
 ### Math Utilities
 
@@ -438,6 +472,10 @@ Only use functions from the API. Check `tapp_api.h` for available functions.
 - `examples/simple_app.c` - minimal working example (gfx + input only).
 - `examples/my_app.c` - audio synthesis + MIDI.
 - `examples/demo/` - demo with assets and features.
+- `examples/persistence/` - settings that survive a power cycle. A `.proto` schema
+  (`persistence.proto`) encoded with nanopb and written with `storage_write_file`; loads in
+  `init()`, saves in `deinit()`, versions the blob and clamps everything it reads back. The
+  reference for the "Persisting settings" section above.
 
 Three larger, musically-substantial, **system-integrated** examples - each uses
 the `params_t` + `ui_menu_*` settings pattern, an in-app hint bar, and the audio

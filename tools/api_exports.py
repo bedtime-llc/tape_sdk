@@ -46,8 +46,20 @@ from pathlib import Path
 # faulting PC in both unaligned-access reports. memset4/memmove4 stay defined in
 # sys_utils.c (gc-sections drops them while unreferenced) and get re-enabled ONE AT
 # A TIME once the hang is explained. Do not widen this map speculatively.
+#
+# The lut*_q15 entries are a DIFFERENT class and carry none of the caution above:
+# they name the same code, not a different implementation. sys_utils.c wraps four
+# `static FORCE_INLINE` LUT readers in non-inline exportable functions; those used
+# an __asm__("lutsin_q15") rename, which collided with the name being wrapped and
+# made all four compile to `b.n .` — a shipped infinite loop. Exporting the wrapper
+# under its own symbol removes the collision; the declared name, and therefore the
+# hash every built tapp already resolves, is untouched.
 IMPL_ALIAS = {
     'memcpy': 'memcpy4',
+    'lutsin_q15': 'lutsin_q15_extern',
+    'lutcos_q15': 'lutcos_q15_extern',
+    'lutsat_q15': 'lutsat_q15_extern',
+    'lutexp_neg_q15': 'lutexp_neg_q15_extern',
 }
 
 

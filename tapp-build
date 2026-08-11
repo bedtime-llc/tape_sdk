@@ -201,7 +201,11 @@ BUILD_DIR=$(mktemp -d)
 trap "rm -rf $BUILD_DIR" EXIT
 
 # Determine assets directory (check both current dir and source file directory)
-if [ ${#SOURCE_FILES[@]} -eq 1 ]; then
+#
+# SOURCE_DIR is only set in directory mode. Listing several .c files as separate arguments left
+# SRC_BASE_DIR empty, and `[ -d "" ]` is false — so assets AND .proto discovery were silently
+# skipped for exactly the builds most likely to have them. Fall back to the first source's dir.
+if [ ${#SOURCE_FILES[@]} -eq 1 ] || [ -z "$SOURCE_DIR" ]; then
     SRC_BASE_DIR=$(dirname "${SOURCE_FILES[0]}")
 else
     SRC_BASE_DIR="$SOURCE_DIR"
@@ -458,10 +462,21 @@ HAS_PROTO=0
 if [ ${#PROTO_FILES[@]} -gt 0 ]; then
     info "Processing proto files..."
 
-    # Check for nanopb
-    NANOPB_DIR="$FIRMWARE_PATH/lib/nanopb"
+    # Locate nanopb. It is deliberately NOT vendored in this repo — a tapp only needs it if it
+    # actually ships a .proto — so resolve, in order: an explicit NANOPB_DIR, the firmware tree,
+    # then a checkout the user added next to the SDK.
+    if [ -z "$NANOPB_DIR" ]; then
+        if [ -d "$FIRMWARE_PATH/lib/nanopb" ]; then
+            NANOPB_DIR="$FIRMWARE_PATH/lib/nanopb"
+        elif [ -d "$SDK_PATH/nanopb" ]; then
+            NANOPB_DIR="$SDK_PATH/nanopb"
+        fi
+    fi
     if [ ! -d "$NANOPB_DIR" ]; then
-        error "nanopb not found at $NANOPB_DIR. Proto compilation requires nanopb."
+        error "nanopb not found — .proto support needs it. Add it next to the SDK:
+      git submodule add https://github.com/nanopb/nanopb.git nanopb
+      pip install protobuf grpcio-tools
+  or point NANOPB_DIR at an existing checkout."
     fi
 
     # Check for protoc (try nanopb's wrapper first)
@@ -474,19 +489,28 @@ if [ ${#PROTO_FILES[@]} -gt 0 ]; then
         fi
     fi
 
-    # Add nanopb include paths
+    # Add nanopb include paths.
+    #
+    # PB_SYSTEM_HEADER replaces nanopb's own system-include block, which pulls <string.h> — not on
+    # the include path under -nostdlibinc. Pointing it at tapp_api.h means nanopb sees exactly the
+    # freestanding libc subset the tapp itself sees: stdint/stddef/stdbool plus the exported
+    # memcpy/memset, which is all the runtime touches. <limits.h> is not needed; pb.h falls back to
+    # __CHAR_BIT__ when CHAR_BIT is undefined.
     CFLAGS+=(-I"$NANOPB_DIR")
     CFLAGS+=(-I"$BUILD_DIR")
+    CFLAGS+=(-DPB_SYSTEM_HEADER='"tapp_api.h"')
 
     for proto in "${PROTO_FILES[@]}"; do
         proto_name=$(basename "$proto" .proto)
         info "  Compiling: $proto_name.proto"
 
-        # Run protoc with nanopb
+        # Run protoc with nanopb. --options-path is what makes a sibling <name>.options work:
+        # without a plugin parameter nanopb searches the process CWD, so the same build succeeded
+        # or silently ignored the options file depending on where you ran it from.
         "$PROTOC" \
             -I"$(dirname "$proto")" \
             -I"$NANOPB_DIR/generator/proto" \
-            --nanopb_out="$BUILD_DIR" \
+            --nanopb_out="--options-path=$(dirname "$proto"):$BUILD_DIR" \
             "$proto" || error "Proto compilation failed: $proto"
 
         success "Generated ${proto_name}.pb.c and ${proto_name}.pb.h"
@@ -577,6 +601,17 @@ fi
 # Compile proto files if they exist
 if [ $HAS_PROTO -eq 1 ]; then
     info "Compiling proto sources..."
+
+    # The nanopb runtime. The generated .pb.c is only descriptor tables — without these three the
+    # tapp links (ld -r leaves undefined symbols alone) and then fails verify-tapp.sh's import
+    # gate on pb_encode/pb_decode, which the firmware does not export.
+    for rt in pb_encode pb_decode pb_common; do
+        "$CC" "${CFLAGS[@]}" -c "$NANOPB_DIR/$rt.c" -o "$BUILD_DIR/$rt.o" \
+            || error "nanopb runtime compilation failed: $rt.c"
+        OBJECT_FILES+=("$BUILD_DIR/$rt.o")
+    done
+    success "Compiled nanopb runtime"
+
     for proto in "${PROTO_FILES[@]}"; do
         proto_name=$(basename "$proto" .proto)
         pb_c="$BUILD_DIR/${proto_name}.pb.c"

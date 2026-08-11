@@ -41,6 +41,7 @@
  * - @ref grp_app - Application lifecycle
  * - @ref grp_led - RGB LEDs
  * - @ref grp_storage - File I/O
+ * - @ref grp_persist - Saving settings and app data
  * - @ref grp_menu - Menu system
  * - @ref grp_audio - Audio processing
  * - @ref grp_math - Math utilities
@@ -1792,6 +1793,176 @@ uint32_t storage_file_size(const char* path);
 /** @} */ // end of grp_storage
 
 // ============================================================================
+// Persistence — settings and app data
+// ============================================================================
+
+/**
+ * @defgroup grp_persist Persistence
+ * @brief Saving and loading settings, and the .proto build path
+ *
+ * There is no settings API — persistence is the @ref grp_storage calls plus a convention. This
+ * page is that convention: when to save, where to put the file, and how to lay out its bytes so
+ * that shipping a new version of your tapp does not orphan everyone's settings.
+ *
+ * A complete working app is at `examples/persistence/`.
+ *
+ * @section persist_lifecycle Nothing saves for you
+ *
+ * A tapp gets no automatic save hook. The `memory_if` field of your descriptor looks like one, but
+ * the loader overwrites whatever you put there with its own interface, whose save and load
+ * callbacks are NULL — so the firmware never asks your tapp to persist anything. That field is how
+ * the loader recognises an external app; it is not yours to use.
+ *
+ * The whole contract is therefore two calls of your own:
+ *
+ * - load in `init()`, and fall back to defaults when the file is missing or rejected
+ * - save in `deinit()`
+ *
+ * `deinit()` runs on a normal exit. It does not run if the battery dies, so anything the user
+ * would be upset to lose should also be written at the moment it changes — or behind an explicit
+ * "save" button, which is what the example does.
+ *
+ * @warning Never touch storage from `process()`. Every call here blocks on the SD card for
+ *          milliseconds; the audio callback has microseconds. Use `init()`, `deinit()`, `tick()`
+ *          or an input handler.
+ *
+ * @section persist_paths Where to put the file
+ *
+ * Paths go straight to the filesystem from the SD root. There is no per-tapp namespace and, on
+ * device, no sandbox — you can read and write anything, including firmware data, so pick a path
+ * that is unmistakably yours and create it before first use:
+ *
+ * @code{.c}
+ * #define MY_DIR  "/myapp"
+ * #define MY_FILE "/myapp/settings.pb"
+ *
+ * storage_mkdir(MY_DIR);   // succeeds if it already exists
+ * @endcode
+ *
+ * Two conventions are in use. A top-level `/<appname>/` directory is visible when the device is
+ * mounted over USB, which is what you want for anything the user might copy off. Hiding data under
+ * `.db/.appdata/<appname>/` keeps it out of the way instead. Firmware apps get a per-tape path
+ * derived from the tape's hash, but that helper is not exported — a tapp that wants per-tape
+ * settings has to build the path itself.
+ *
+ * @note The desktop emulator DOES sandbox: paths are confined to a root directory and `..` is
+ *       rejected. Code that reaches outside its own directory works on device and fails in the
+ *       emulator.
+ *
+ * @section persist_blob The quick way: a fixed struct
+ *
+ * For a handful of values that will never change shape, write the struct. Guard it with a magic
+ * word and check the length, because the file lives on a removable card that a host can overwrite
+ * with anything:
+ *
+ * @code{.c}
+ * #define HISCORE_MAGIC 0x54544831u
+ *
+ * static void load_hiscore(my_model_t* m) {
+ *     uint32_t rec[2];
+ *     if(storage_read_file("/myapp/hiscore.bin", rec, sizeof(rec)) != sizeof(rec)) return;
+ *     if(rec[0] != HISCORE_MAGIC) return;
+ *     m->hiscore = rec[1];
+ * }
+ *
+ * static void save_hiscore(const my_model_t* m) {
+ *     const uint32_t rec[2] = {HISCORE_MAGIC, m->hiscore};
+ *     storage_mkdir("/myapp");
+ *     storage_write_file("/myapp/hiscore.bin", rec, sizeof(rec));
+ * }
+ * @endcode
+ *
+ * The catch is that adding a field invalidates every file already written. Bump the magic and old
+ * saves are discarded; forget to, and they are misread. That is fine for a high score and painful
+ * for a settings page.
+ *
+ * @note Test the write result as `> 0`, never `== size`. On device `storage_write_file()` returns
+ *       the byte count, but the desktop emulator returns 1 for success — `== size` passes on
+ *       hardware and silently reports failure in the emulator.
+ *
+ * @section persist_proto The durable way: a .proto schema
+ *
+ * Protobuf stores field numbers rather than offsets, so a reader skips fields it does not know and
+ * defaults the ones that are absent. Add a field, ship an update, and last week's file still
+ * loads. The cost is roughly 4KB of nanopb runtime in your tapp.
+ *
+ * Drop a `.proto` next to your `.c` and `tapp-build` does the rest:
+ *
+ * @code{.c}
+ * // myapp/settings.proto
+ * syntax = "proto3";
+ * import "nanopb.proto";
+ *
+ * message PB_Settings {
+ *     uint32 ver = 1;
+ *     uint32 bpm = 2;
+ *     string label = 3 [(nanopb).max_size = 16];
+ * }
+ * @endcode
+ *
+ * Build the folder, not the file — `./tapp-build myapp`. The generated `settings.pb.h` and
+ * `settings.pb.c` land in a temporary directory that is already on the include path, and the
+ * nanopb runtime is compiled and linked in automatically:
+ *
+ * @code{.c}
+ * #include "tapp_api.h"
+ * #include <pb_encode.h>
+ * #include <pb_decode.h>
+ * #include "settings.pb.h"
+ *
+ * static bool settings_save(const my_model_t* m) {
+ *     PB_Settings pb = PB_Settings_init_zero;
+ *     pb.ver = 1;
+ *     pb.bpm = m->bpm;
+ *     strncpy(pb.label, m->label, sizeof(pb.label) - 1);
+ *
+ *     uint8_t buf[PB_Settings_size];              // generated: the largest possible encoding
+ *     pb_ostream_t out = pb_ostream_from_buffer(buf, sizeof(buf));
+ *     if(!pb_encode(&out, PB_Settings_fields, &pb)) return false;
+ *
+ *     storage_mkdir("/myapp");
+ *     return storage_write_file("/myapp/settings.pb", buf, out.bytes_written) > 0;
+ * }
+ * @endcode
+ *
+ * Things worth knowing before you reach for it:
+ *
+ * - **nanopb is not bundled.** Add it yourself with
+ *   `git submodule add https://github.com/nanopb/nanopb.git nanopb`, or point `NANOPB_DIR` at a
+ *   checkout. Its generator needs the `protobuf` and `grpcio-tools` Python packages. Inside the
+ *   firmware tree it is found automatically, and the browser builder needs nothing installed at
+ *   all — it runs protoc as wasm and produces the same bytes.
+ * - **Bound every variable-length field.** `[(nanopb).max_size = N]` on a string or bytes field,
+ *   `[(nanopb).max_count = N]` on a repeated one. Without a bound nanopb emits a callback field
+ *   instead of a plain C member, which is far more code than settings need. A sibling
+ *   `<name>.options` file works too, but inline options travel with the schema.
+ * - **Only your own directory is on the proto include path**, plus nanopb's. `import
+ *   "nanopb.proto"` resolves; importing another project's `.proto` does not.
+ * - **The generated files are temporary.** They are deleted when the build finishes, so there is
+ *   nothing to inspect or commit — the `.proto` is the source of truth.
+ *
+ * @section persist_versioning Version it, then distrust it
+ *
+ * Make the first field a version number and refuse anything that disagrees. proto3 cannot
+ * distinguish an absent field from a zero one, so this is the only cheap way to reject a file
+ * written when field 4 meant something else.
+ *
+ * A successful decode says the bytes were well-formed, not that the values are usable. Clamp
+ * numbers to the range your code assumes and treat every index or enum as hostile — this file is
+ * user-writable over USB, and an out-of-range index read straight into an array subscript is a
+ * hard fault:
+ *
+ * @code{.c}
+ * if(pb.ver != SETTINGS_VER) return false;                         // reject, use defaults
+ * m->bpm = pb.bpm < 40u ? 40u : (pb.bpm > 300u ? 300u : pb.bpm);   // clamp, never trust
+ * @endcode
+ *
+ * @{
+ */
+
+/** @} */ // end of grp_persist
+
+// ============================================================================
 // Math Utilities
 // ============================================================================
 
@@ -2037,8 +2208,12 @@ typedef struct {
  * @param labels array of 5, in physical button order BTN1..BTN5
  *
  * The band renders at the TOP of the screen, where the buttons are, with the
- * same styling and slide-in as the built-in apps. Call this in init() followed
- * by ui_hints_show(true); do not draw your own hint bar.
+ * same styling and slide-in as the built-in apps: press labels on the top row,
+ * hold labels on the row beneath. Do not draw your own hint bar — reserve the
+ * top 60px instead.
+ *
+ * Installing labels does NOT change visibility, so re-call this as often as your
+ * labels change (typically from on_input, right after the state they describe).
  *
  * The firmware owns the hint objects, so nothing internal crosses the ABI —
  * you only hand over the strings.
@@ -2060,8 +2235,15 @@ void ui_hints_set_labels(const tapp_hint_pair_t* labels);
 void ui_statusbar_set_text(const char* text);
 
 /**
- * @brief Show or hide UI hints
+ * @brief Raise or drop the hint band installed by ui_hints_set_labels()
  * @param stat true to show hints, false to hide
+ *
+ * Two idioms, both driven from here — the band itself has no mode:
+ *   - always visible: call once with true in init(), then just re-call
+ *     ui_hints_set_labels() whenever a label changes.
+ *   - reveal on hold: true on BTN_HOLD, false on BTN_RELEASE, from on_input.
+ *     Yours to drive, because only you know which of your buttons is free to be
+ *     a reveal rather than an action (see examples/groovebox.c).
  */
 void ui_hints_show(bool stat);
 

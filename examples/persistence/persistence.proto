@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+// Settings for the `persistence` example tapp.
+//
+// tapp-build finds this file because it sits next to persistence.c, runs it through nanopb, and
+// links the generated descriptors plus the nanopb runtime into the .tapp. The generated header is
+// persistence.pb.h — include it by that name; it lives in a temp build dir that is already on the
+// include path.
+//
+// `import "nanopb.proto"` resolves because tapp-build puts nanopb's generator/proto on the include
+// path. It is what makes the [(nanopb)...] field options below available; without them nanopb has
+// no bound for a `string` or a `repeated` field and refuses to generate a plain C struct.
+import "nanopb.proto";
+
+message PB_PersistSettings {
+    // Keep a schema version first and check it on load. proto3 cannot tell "field absent" from
+    // "field zero", so this is the only cheap way to reject a blob written by an older build
+    // whose field numbers meant something else.
+    uint32 ver = 1;
+
+    uint32 bpm = 2;      // 40..300
+    float volume = 3;    // 0.0..1.0
+    bool invert = 4;     // draw inverted
+
+    // Bounded string -> a plain `char label[16]` in the generated struct. Without max_size nanopb
+    // would emit a callback field, which is far more code than a settings blob needs.
+    string label = 5 [(nanopb).max_size = 16];
+
+    // Proof that the file really round-trips: incremented every time the app starts.
+    uint32 launches = 6;
+}
