@@ -1034,8 +1034,7 @@ uint32_t ui_get_frame(gfx_t* gfx);
  * The only fonts the firmware exports. Pass one to gfx_set_font().
  *
  * These three are the firmware's own working set (proportional regular, proportional bold,
- * monospace) and are the ones the browser emulator can render. Every other font in the
- * firmware is deliberately unexported: each exported name is ABI we can never rename or drop.
+ * monospace) and are the ones the browser emulator can render.
  * @{
  */
 extern const uint8_t gfx_nunito_semibold_14[];  /**< Default UI body font */
@@ -1602,6 +1601,7 @@ uint32_t os_tick_get(void);
  * that animates on its own clock, hand the OS a ::led_pattern_t instead: the LED task steps
  * it on its own timer, so the animation keeps running at a steady rate even when your tick()
  * is busy, and it survives a frame you skip.
+ * Check examples/leds/ for led patterns usage example
  *
  * @note Nothing restores the OS patterns when your app exits. Put the device back the way you
  * found it in deinit() — either write the LEDs yourself or call os_led_stop_current().
@@ -1845,9 +1845,6 @@ uint32_t storage_file_size(const char* path);
  * derived from the tape's hash, but that helper is not exported — a tapp that wants per-tape
  * settings has to build the path itself.
  *
- * @note The desktop emulator DOES sandbox: paths are confined to a root directory and `..` is
- *       rejected. Code that reaches outside its own directory works on device and fails in the
- *       emulator.
  *
  * @section persist_blob The quick way: a fixed struct
  *
@@ -1877,8 +1874,7 @@ uint32_t storage_file_size(const char* path);
  * for a settings page.
  *
  * @note Test the write result as `> 0`, never `== size`. On device `storage_write_file()` returns
- *       the byte count, but the desktop emulator returns 1 for success — `== size` passes on
- *       hardware and silently reports failure in the emulator.
+ *       the byte count.
  *
  * @section persist_proto The durable way: a .proto schema
  *
@@ -2254,7 +2250,6 @@ void ui_hints_show(bool stat);
  * When shown and hints are not active it displays the idle status items
  * (battery etc). TAPPs should call ui_statusbar_show(true) in init() so the
  * system statusbar stays visible, matching the rest of the device.
- * @note Device-only: the desktop emulator does not render the statusbar.
  */
 void ui_statusbar_show(bool state);
 
@@ -2711,7 +2706,6 @@ bool tape_rec_undo_execute(tape_t* tape);
 // ----------------------------------------------------------------------------
 // Tape "creative kernel" - minimal read access for sampling/cutup TAPPs.
 // Positions are in STEREO FRAMES (1 frame = L+R; tape_size() is also frames).
-// Device-only: the desktop emulator has no tape (these return empty there).
 // ----------------------------------------------------------------------------
 
 /**
@@ -2864,7 +2858,7 @@ void tape_timeline_switch_track(uint8_t tr);
  * Call after tape_timeline_setup(...) and before tape_timeline_show(true) so the
  * real firmware timeline widget renders the actual tape playhead/waveform (where a
  * TAPP's recording lands). Without this the widget has no track params and won't
- * display. Device-only (no tape in the emulator's non-combined build).
+ * display.
  */
 void tape_timeline_attach_default(uint8_t tracks);
 
