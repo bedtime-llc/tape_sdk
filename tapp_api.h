@@ -1515,9 +1515,10 @@ void ui_draw_switch(gfx_t* restrict gfx, uint16_t x, uint16_t y, bool val, bool 
  * @param size Number of bytes to allocate
  * @return Pointer to allocated memory, or NULL if out of memory
  * @note Memory is limited - always check return values
- * @note Large blocks may be served from external PSRAM — uncached, slower than internal RAM. 
- *       Never access such memory per-sample in the audio callback. 
- *       Several smaller blocks are more likely to land in fast internal RAM than one big one.
+ * @note Large blocks may be served from external PSRAM, which is write-back cached and
+ *       fine to use at audio rate (delay lines, sample buffers). Internal RAM still has
+ *       the lowest worst-case latency, so keep your very hottest per-sample state small —
+ *       smaller blocks are more likely to land internal.
  *
  * @code{.c}
  * void* buffer = os_malloc(1024);
@@ -2311,7 +2312,10 @@ void ui_hints_show(bool stat);
  * @param row 0 = press row, 1 = hold row
  * @param name Cell label — REFERENCED, must outlive the app state showing it
  * @param param The params_t this cell displays and whose ->val you adjust
- *              (typically from the encoder in on_input). NULL clears the cell.
+ *              (typically from the encoder in on_input). NULL clears the cell —
+ *              unless `name` is non-empty, which installs a plain LABEL cell
+ *              instead (e.g. "<" / ">" nav arrows on the buttons that switch
+ *              your selection, the same affordance the device's band has).
  *              Use ParamValDBType for gain-style 0..2.0 params — the linear draw
  *              branch assumes 0..1.
  * @param icon_id Icon AND VU source: 0 = output (volume icon, output bus),
@@ -2895,7 +2899,7 @@ bool tape_cue_get(tape_t* tape, uint32_t idx, uint32_t* start_frame, uint32_t* e
  * afterwards. The erase is captured by the single-level record undo
  * (tape_rec_undo_execute() restores it) for spans up to ~136 s and until the
  * next tape_rec_begin(); longer spans erase without undo. Refused while a
- * recording in progress — commit or abort first.
+ * recording in progressq — commit or abort first.
  */
 bool tape_erase(tape_t* tape, uint32_t start_frame, uint32_t end_frame);
 

@@ -261,9 +261,10 @@ void os_free(void* ptr);
 **refuses the launch** if it doesn't fit — up to ~64 KB is reliable today, ~100 KB already
 fails with "Model N KB > free RAM" on screen. Keep the model to state/UI (a few KB) and
 allocate big buffers (sample memory, delay lines, FFT tables) in `init()` with `os_malloc()`.
-`os_malloc()` has no such limit, but large blocks may come from slower PSRAM -
-never touch that per-sample in the audio callback; several smaller allocations are likelier to
-stay in fast RAM than one big one.
+`os_malloc()` has no such limit — large blocks may come from external PSRAM, which is
+write-back cached and fine at audio rate (delay lines, sample buffers). Internal RAM still
+has the lowest worst-case latency, so keep your very hottest per-sample state small;
+smaller allocations are likelier to land internal.
 
 ### App Control
 
