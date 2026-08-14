@@ -260,6 +260,7 @@ struct tm {
 #ifdef FIRMWARE_BUILD
 #include "os_app_types.h"
 #include "ui_components.h"
+#include "ui_statusbar.h" /* HintActionType for ui_hints_set_active */
 #else
 // ============================================================================
 // Type Definitions for External Apps
@@ -465,6 +466,12 @@ typedef struct {
 // IMPORTANT: Field names changed from alloc/free to init/deinit
 struct os_app_data {
     void* model;
+    /* Firmware allocates + zeroes model_size bytes from fast internal RAM at
+     * launch and REFUSES the launch if it does not fit ("Model N KB > free
+     * RAM" on screen). That RAM is shared and fragmented: <=64 KB is currently
+     * reliable, ~100 KB already fails. Keep the model to state/UI; allocate
+     * large buffers (sample memory, delay lines) in init() via os_malloc()
+     * (see its PSRAM note). */
     size_t model_size;
     os_app_model_init init;   // Init called after model allocation
     os_app_model_deinit deinit;  // Deinit called before model deallocation
@@ -1494,7 +1501,7 @@ void ui_draw_switch(gfx_t* restrict gfx, uint16_t x, uint16_t y, bool val, bool 
 /** @} */ // end of grp_ui
 
 // ============================================================================
-// Memory Management (FreeRTOS)
+// Memory Management
 // ============================================================================
 
 /**
@@ -1504,10 +1511,13 @@ void ui_draw_switch(gfx_t* restrict gfx, uint16_t x, uint16_t y, bool val, bool 
  */
 
 /**
- * @brief Allocate memory from FreeRTOS heap
+ * @brief Allocate memory from heap
  * @param size Number of bytes to allocate
  * @return Pointer to allocated memory, or NULL if out of memory
  * @note Memory is limited - always check return values
+ * @note Large blocks may be served from external PSRAM — uncached, slower than internal RAM. 
+ *       Never access such memory per-sample in the audio callback. 
+ *       Several smaller blocks are more likely to land in fast internal RAM than one big one.
  *
  * @code{.c}
  * void* buffer = os_malloc(1024);
@@ -2230,6 +2240,42 @@ typedef struct {
  */
 void ui_hints_set_labels(const tapp_hint_pair_t* labels);
 
+#ifndef FIRMWARE_BUILD
+/**
+ * One hint-band cell, interleaved press/hold per physical button — the same
+ * enum the firmware's own hint tables use. Values are pinned; do not reorder.
+ */
+typedef enum {
+    HintPress1, HintHold1,
+    HintPress2, HintHold2,
+    HintPress3, HintHold3,
+    HintPress4, HintHold4,
+    HintPress5, HintHold5,
+    HintsActionsTotal,
+} HintActionType;
+#endif
+
+/**
+ * @brief Highlith a hint cell (solid plate, inverted text)
+ * Use it for any on/off mode your button toggles.
+ *
+ * PRESERVED across ui_hints_set_labels() rebuilds — set it when your mode
+ * actually changes; re-calling after a rebuild is harmless. An empty cell is a
+ * no-op.
+ */
+void ui_hints_set_active(HintActionType action, bool active);
+
+/**
+ * @brief Dim a hint cell as UNAVAILABLE (dithered knockout, outline intact) —
+ * how the device greys out actions that don't apply, e.g. cut/copy while the
+ * deck is playing. Purely visual for a tapp: your on_input still decides.
+ *
+ * PRESERVED across ui_hints_set_labels() rebuilds — set it when availability
+ * actually changes; re-calling after a rebuild is harmless. Active wins over
+ * locked visually; do not set both on one cell. An empty cell is a no-op.
+ */
+void ui_hints_set_locked(HintActionType action, bool locked);
+
 /**
  * @brief Put your app's text in the system statusbar (left side)
  * @param text string to show; NULL or "" removes the item
@@ -2238,9 +2284,9 @@ void ui_hints_set_labels(const tapp_hint_pair_t* labels);
  * just rewrite that buffer whenever the text changes — the statusbar follows with
  * no further calls. Call this ONCE, in init().
  *
- * The firmware owns the statusbar object, so nothing internal crosses the ABI, and
+ * The firmware owns the statusbar object, so nothing internal crosses the ABI
  * the item is hidden automatically when your app loses focus and dropped when it
- * exits. The right-hand side is reserved for battery/USB.
+ * exits. The right side is reserved for battery/USB and other system items.
  */
 void ui_statusbar_set_text(const char* text);
 
@@ -2256,6 +2302,36 @@ void ui_statusbar_set_text(const char* text);
  *     a reveal rather than an action (see examples/groovebox.c).
  */
 void ui_hints_show(bool stat);
+
+/**
+ * @brief Install one VOLUME cell in the hint band — the same cells the device's
+ * own hold-PLAY volume band is made of (icon + name + live VU + cursor, active
+ * cell enlarged with the same animation).
+ * @param slot Physical button, 1..5
+ * @param row 0 = press row, 1 = hold row
+ * @param name Cell label — REFERENCED, must outlive the app state showing it
+ * @param param The params_t this cell displays and whose ->val you adjust
+ *              (typically from the encoder in on_input). NULL clears the cell.
+ *              Use ParamValDBType for gain-style 0..2.0 params — the linear draw
+ *              branch assumes 0..1.
+ * @param icon_id Icon AND VU source: 0 = output (volume icon, output bus),
+ *                1 = input (jack/mic icon following the live source, input bus),
+ *                2 = fx
+ *
+ * Installing volume cells REPLACES the label band (ui_hints_set_labels) and vice
+ * versa — hold-to-reveal apps install the cells on BTN_HOLD and re-install their
+ * labels on BTN_RELEASE (see examples/recorder.c). The firmware owns the cell
+ * objects; only the name string and your params_t cross the ABI, and both are
+ * dropped automatically when your app exits.
+ */
+void ui_hints_set_volume(uint8_t slot, uint8_t row, const char* name,
+                         params_t* param, uint8_t icon_id);
+
+/**
+ * @brief Enlarge/activate one volume cell (slot 0 = none). The cells animate
+ * exactly like the device's own band; call this when your selection moves.
+ */
+void ui_hints_volume_select(uint8_t slot, uint8_t row);
 
 /**
  * @brief Show or hide the whole system statusbar (battery, status items, hints)
@@ -2533,19 +2609,24 @@ mixer_t* mixer_get(void);
 
 /**
  * @brief Switch which external source the codec listens to, and apply it
- * @param line_mic_only true toggles line<->mic only; false cycles every source
- * @return The source now selected: 0 = line/aux, 1 = mic, 2 = fx, 3 = usb
+ * @param line_mic_only Vestigial — line and mic are the only sources; both modes toggle
+ * @return The source now selected: 0 = line/aux, 1 = mic
  *
  * This is the same global the device's own input setting drives — it reconfigures
  * the codec input path, re-derives monitoring (mic monitoring needs the headphone
  * jack, because the speaker would feed back) and wakes the audio DMA if it had
  * idled. It PERSISTS after your app exits, exactly as if the user had changed it in
  * the menu, so only call it in response to a deliberate user action.
- *
- * There is no getter: the source cannot be read without switching it, so drive your
- * UI from the returned value and show "unknown" until the user has pressed once.
  */
 uint8_t os_audio_switch_input(bool line_mic_only);
+
+/**
+ * @brief Current input source WITHOUT changing it: 0 = line/aux, 1 = mic
+ *
+ * Settled before your init() runs (a persisted mic selection is re-applied at
+ * boot), so it is safe to drive your UI from this at launch.
+ */
+uint8_t os_audio_get_input(void);
 
 /** @} */ // end of grp_audio
 
@@ -2761,13 +2842,16 @@ uint32_t tape_read(const tape_t* tape, uint32_t pos_frame, float* dst, uint32_t 
  * @return Number of stereo frames actually written
  *
  * Clamped to the tape length and addressed from the tape's own data area, so it
- * cannot reach the WAV header or any other file. Partial sectors are
- * read-modify-written.
+ * cannot reach any other file. Partial sectors are read-modify-written.
  *
  * This is how a TAPP records: ring your process() output in RAM and drain it
  * here from tick(), bracketed by tape_rec_begin()/tape_rec_commit() so a mark is
  * created. Undo covers only what tape_rec_begin() armed — writes outside a
  * begin/commit pair overwrite tape audio permanently.
+ *
+ * While a recording, frames written also drive the timeline widget's
+ * live-record waveform automatically (anchored at the position passed to
+ * tape_rec_begin(); writes below that anchor are not drawn).
  *
  * @warning Blocks on SD DMA. Call from tick()/init() (main thread), NEVER
  * from the audio process() callback.
@@ -2796,6 +2880,24 @@ uint32_t tape_cues_count(tape_t* tape);
  * Cues are stored in tape order, so stepping between them is index +/- 1.
  */
 bool tape_cue_get(tape_t* tape, uint32_t idx, uint32_t* start_frame, uint32_t* end_frame);
+
+/**
+ * @brief Erase [start_frame, end_frame): audio, marks, and cues
+ * @return false if the span is empty, off-tape, or a take is open
+ *
+ * The audio blocks are zeroed (asynchronously, on the storage task), 
+ * the span is punched out of the recorded-region marks 
+ * (a longer mark is split around it), every cue
+ * overlapping the span is deleted, and the timeline waveform is refreshed.
+ * Everything persists automatically.
+ *
+ * Cue indices shift on deletion — re-read tape_cues_count() and re-select
+ * afterwards. The erase is captured by the single-level record undo
+ * (tape_rec_undo_execute() restores it) for spans up to ~136 s and until the
+ * next tape_rec_begin(); longer spans erase without undo. Refused while a
+ * recording in progress — commit or abort first.
+ */
+bool tape_erase(tape_t* tape, uint32_t start_frame, uint32_t end_frame);
 
 /**
  * @brief Current tape playhead position, in stereo frames

@@ -257,6 +257,14 @@ void* os_malloc(size_t size);
 void os_free(void* ptr);
 ```
 
+**Model size:** the firmware allocates your model from fast internal RAM at launch and
+**refuses the launch** if it doesn't fit — up to ~64 KB is reliable today, ~100 KB already
+fails with "Model N KB > free RAM" on screen. Keep the model to state/UI (a few KB) and
+allocate big buffers (sample memory, delay lines, FFT tables) in `init()` with `os_malloc()`.
+`os_malloc()` has no such limit, but large blocks may come from slower PSRAM -
+never touch that per-sample in the audio callback; several smaller allocations are likelier to
+stay in fast RAM than one big one.
+
 ### App Control
 
 ```c
@@ -456,6 +464,11 @@ Only use functions from the API. Check `tapp_api.h` for available functions.
 1. Use static initializers (no runtime pointer modification!)
 2. Ensure `tapp_get_descriptor()` entry point exists
 3. Set `model_size` in app data
+
+### "Model N KB > free RAM" / "Model alloc failed"
+Your `model_size` is too large for contiguous free internal RAM (~64 KB is the reliable
+bound). Shrink the model; move large buffers to `os_malloc()` in `init()` — see
+"Memory Management" above.
 
 ### Blank Screen
 1. Set draw color: `gfx_set_color(gfx, 1)`
