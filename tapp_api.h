@@ -3,6 +3,7 @@
 /**
  * @file tapp_api.h
  * @brief TAPP SDK - API for external applications loaded from SD card
+ * @version 1.3
  *
  * @mainpage TAPP SDK API Reference
  *
