@@ -537,6 +537,7 @@ info "  App name: $APP_DISPLAY_NAME"
 MANIFEST_C="$BUILD_DIR/${APP_NAME}_manifest.c"
 cat > "$MANIFEST_C" <<EOF
 #include <stdint.h>
+#include "tapp_api.h"   /* TAPP_API_VERSION_*, generated — never a hand-copied number */
 
 // Auto-generated manifest - do not edit
 #define EXT_APP_MANIFEST_MAGIC     0x50504154  // "TAPP"
@@ -563,8 +564,8 @@ const tapp_manifest_t __tapp_manifest = {
     .base = {
         .manifest_magic = EXT_APP_MANIFEST_MAGIC,
         .manifest_version = EXT_APP_MANIFEST_VERSION,
-        .api_version_major = 1,
-        .api_version_minor = 0,
+        .api_version_major = TAPP_API_VERSION_MAJOR,
+        .api_version_minor = TAPP_API_VERSION_MINOR,
         .hardware_target_id = 1,
         .reserved = 0,
     },

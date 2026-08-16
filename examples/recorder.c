@@ -66,6 +66,7 @@ typedef struct {
     volatile uint32_t play_frame;    // absolute tape frame being heard
     uint32_t play_start, play_end;   // the take being played
     uint32_t fill_next;              // next tape frame to read
+    volatile uint32_t seek_gen;      // bumped on every seek; invalidates in-flight fills
     bool     loop;                   // BTN3: replay the take instead of stopping
 
     // metering (process writes, redraw reads)
@@ -74,7 +75,7 @@ typedef struct {
     float hold_l, hold_r; uint16_t hold_t;
 
     // volume band (BTN1 hold; input reads, process applies)
-    params_t vol_in, vol_out;        // app-local trims, 0..2.0, default 1.0
+    params_t vol_out;                // app-local PLAYBACK trim (IN is the device's)
     uint8_t  vol_sel;                // 0 = IN, 1 = OUT
     volatile bool vol_ui;            // band shown while PLAY is held
     volatile bool erase_req;         // confirm popup said yes; tick performs it
@@ -87,6 +88,7 @@ typedef struct {
     uint8_t  hint_state;             // state the hint labels were built for
     uint8_t  hint_src;               // source the hint labels were built for
     uint8_t  hint_takes;             // take-presence the hint LOCKS were built for
+    uint8_t  hint_mon;               // monitor state the hint labels were built for
 
     params_t tl_pos, tl_start, tl_end;
 
@@ -114,18 +116,20 @@ static void rec_process(engine_t* engine, mixer_t* mix) {
 
     const float g_target = (m->state == ST_REC && !m->stop_req) ? 1.0f : 0.0f;
     const float g_step = 1.0f / (float)REC_FADE_FR;
-    const float vin = m->vol_in.val, vout = m->vol_out.val;
+    const float vout = m->vol_out.val;
 
     float pl = 0.f, pr = 0.f;
 
     for (uint32_t i = 0; i < fs; i += 2) {
-        float l = 0.f, r = 0.f;
+        float l = 0.f, r = 0.f;      // what we RECORD and METER
+        float ol = 0.f, orr = 0.f;   // what we contribute to the output bus
 
         if (m->state == ST_PLAY && m->play_buf) {
             if (m->half_ready[m->play_cur]) {
                 const float* s = m->play_buf + (size_t)m->play_cur * PLAY_FR * 2u
                                  + (size_t)m->play_idx * 2u;
                 l = s[0] * vout; r = s[1] * vout;
+                ol = l; orr = r;                  // playback IS ours to output
                 m->play_frame++;
                 if (++m->play_idx >= PLAY_FR) {
                     m->half_ready[m->play_cur] = false;
@@ -136,8 +140,13 @@ static void rec_process(engine_t* engine, mixer_t* mix) {
             // Not ready: output silence rather than stale audio, and do not
             // advance — tick() will catch up.
         } else if (in) {
-            // Monitor the input while idle or recording.
-            l = in[i] * vin; r = in[i + 1] * vin;
+            // Read the input for the ring and the meters — but DO NOT echo it,
+            // and apply NO gain: in_bus is already scaled by the device's input
+            // volume (mixer_input), which the IN cell drives directly.
+            // Monitoring is the firmware's job and it happens AFTER this callback
+            // (os_audio_chain_default): mic is monitored inside the codec (ADCMIX,
+            // ~0 ms), line/USB by the chain's own in->out add.
+            l = in[i]; r = in[i + 1];
         }
 
         if (m->state == ST_REC && m->ring) {
@@ -163,7 +172,9 @@ static void rec_process(engine_t* engine, mixer_t* mix) {
         if (al > pl) pl = al;
         if (ar > pr) pr = ar;
 
-        out[i] = l; out[i + 1] = r;
+        // Always WRITE (not +=): out_bus still holds the previous block, and the
+        // chain's monitor add lands on top of whatever we leave here.
+        out[i] = ol; out[i + 1] = orr;
     }
 
     m->peak_l = (pl > m->peak_l) ? pl : m->peak_l * 0.85f;
@@ -293,23 +304,35 @@ static void rec_play_seek(rec_model_t* m, uint32_t frame) {
     m->play_idx = 0;
     m->play_frame = frame;
     m->fill_next = frame;
+    m->seek_gen++;   // invalidates any fill already in flight — see rec_fill_halves
 }
 
 static void rec_fill_halves(rec_model_t* m, tape_t* t) {
     if (!m->play_buf) return;
+    // Latch play_cur ONCE: process() flips it whenever a half runs out, so
+    // re-reading it per iteration could fill the same half twice and leave the
+    // other empty.
+    const uint8_t cur = m->play_cur;
     for (int h = 0; h < 2; h++) {
-        const uint8_t idx = (uint8_t)((m->play_cur + h) & 1u);
+        const uint8_t idx = (uint8_t)((cur + h) & 1u);
         if (m->half_ready[idx]) continue;
         if (m->fill_next >= m->play_end) return;          // take finished
         uint32_t n = m->play_end - m->fill_next;
         if (n > PLAY_FR) n = PLAY_FR;
         float* dst = m->play_buf + (size_t)idx * PLAY_FR * 2u;
-        const uint32_t got = tape_read(t, m->fill_next, dst, n);
+        // tape_read BLOCKS for milliseconds, and BTN1/BTN4/BTN5 run on another
+        // task — a seek can land mid-read. Snapshot the generation and drop the
+        // fill if it moved, instead of clobbering the freshly reset fill_next and
+        // publishing a half full of pre-seek audio.
+        const uint32_t gen = m->seek_gen;
+        const uint32_t at = m->fill_next;
+        const uint32_t got = tape_read(t, at, dst, n);
+        if (m->seek_gen != gen) return;
         if (n < PLAY_FR) {                                // zero the tail
             memset(dst + (size_t)n * 2u, 0, (size_t)(PLAY_FR - n) * 2u * sizeof(float));
         }
-        m->half_src[idx] = m->fill_next;
-        m->fill_next += got ? got : n;
+        m->half_src[idx] = at;
+        m->fill_next = at + (got ? got : n);
         m->half_ready[idx] = true;
     }
 }
@@ -492,12 +515,16 @@ static void rec_hints(const rec_model_t* m) {
                                    m->in_src == 1u ? "mic" :
                                    m->in_src == 0u ? "line" : "input" };
     hints[3] = (tapp_hint_pair_t){ "< prev", "exit" };
-    hints[4] = (tapp_hint_pair_t){ "next >", NULL };
+    hints[4] = (tapp_hint_pair_t){ "next >", "mon" };
     ui_hints_set_labels(hints);
 
     // set_labels rebuilds the cells and clears active/locked state — re-assert
     // last. Unavailable actions render as dithered 
     ui_hints_set_active(HintPress3, m->loop);
+    // Lit = the live input is being monitored. Read the EFFECTIVE state: it also
+    // moves on its own (jack replug, source switch), which the tick drift check
+    // below notices.
+    ui_hints_set_active(HintHold5, os_audio_get_monitor());
     const bool no_takes = m->take_n == 0;
     ui_hints_set_locked(HintPress1, m->state == ST_REC ||
                         (m->state == ST_STOP && m->play_end <= m->play_start));
@@ -524,11 +551,14 @@ static bool rec_tick(os_app_t* app) {
             rec_stop_take(m, t);
         }
     } else if (m->state == ST_PLAY && t) {
-        rec_fill_halves(m, t);
+        // End-of-take FIRST: a loop wrap then refills within this same tick,
+        // instead of leaving both halves empty until the next one (~40 ms of
+        // silence at every loop point).
         if (m->play_frame >= m->play_end) {
             if (m->loop && m->play_end > m->play_start) rec_play_seek(m, m->play_start);
             else m->state = ST_STOP;
         }
+        if (m->state == ST_PLAY) rec_fill_halves(m, t);
     }
 
     // Peak hold, ~1 s.
@@ -557,10 +587,12 @@ static bool rec_tick(os_app_t* app) {
     // the locked cells follow the model, not only the press that changed it.
     // Never while the volume band is up: set_labels would replace its cells.
     if (!m->vol_ui && (m->hint_state != m->state || m->hint_src != m->in_src ||
-                       m->hint_takes != (m->take_n != 0))) {
+                       m->hint_takes != (m->take_n != 0) ||
+                       m->hint_mon != os_audio_get_monitor())) {
         m->hint_state = m->state;
         m->hint_src = m->in_src;
         m->hint_takes = m->take_n != 0;
+        m->hint_mon = os_audio_get_monitor();
         rec_hints(m);
     }
 
@@ -639,10 +671,17 @@ static void rec_vol_step(params_t* p, int32_t acc) {
     p->target = p->val = clampf(t, p->min, p->max);
 }
 
+// IN is the DEVICE's input level (monitor + record + USB, persistent)
+static params_t* rec_vol_param(rec_model_t* m, bool out) {
+    return out ? &m->vol_out : mixer_get_input_vol(mixer_get());
+}
+
 static void rec_vol_show(rec_model_t* m) {
-    ui_hints_set_volume(1, 0, "in",  &m->vol_in,  1);
+    params_t* in_vol = rec_vol_param(m, false);
+    if (in_vol) ui_hints_set_volume(1, 0, "in", in_vol, 1);
     ui_hints_set_volume(2, 0, "out", &m->vol_out, 0);
-    ui_hints_volume_select(m->vol_sel ? 2 : 1, 0);
+    // No input param (mixer not up): fall back to OUT so the band is never empty.
+    ui_hints_volume_select((m->vol_sel || !in_vol) ? 2 : 1, 0);
 }
 
 static void rec_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
@@ -651,11 +690,15 @@ static void rec_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
     if (btn == 5) {
         // Encoder rotation (state is always RELEASED — never branch on it).
         // Drain the delta unconditionally so the accumulator can't dump a stale
-        // jump into the first trim adjustment. Writing our own param->val is the
-        // same architecture tapedecks uses — the cells redraw from it each frame.
         const int32_t d = os_controls_encoder_get_delta();
         if (m->vol_ui && d) {
-            rec_vol_step(m->vol_sel ? &m->vol_out : &m->vol_in, d);
+            params_t* p = rec_vol_param(m, m->vol_sel != 0);
+            if (p == &m->vol_out) {
+                rec_vol_step(p, d);          // ours: no callback to fire
+            } else if (p) {
+                param_write_delta_val(p, d);
+                param_update_fast(p, NULL);
+            }
         }
         return;
     }
@@ -689,6 +732,7 @@ static void rec_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
         m->hint_state = m->state;
         m->hint_src = m->in_src;
         m->hint_takes = m->take_n != 0;
+        m->hint_mon = os_audio_get_monitor();
 
         if (!m->vol_ui) rec_hints(m);
     } else if (st == KEY_STATE_HOLD) {
@@ -703,6 +747,13 @@ static void rec_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
             // Mic <-> line. This writes the DEVICE-WIDE input setting and it.
             m->in_src = os_audio_switch_input(true);
             m->hint_src = m->in_src;
+            if (!m->vol_ui) rec_hints(m);
+        }
+        if (btn == 4) {
+            // Monitor on/off. Refused for mic with no headphones (feedback), so
+            // take the state from the return value, not from what we asked for.
+            // Playback is unaffected — this gates the LIVE input only.
+            m->hint_mon = os_audio_set_monitor(!os_audio_get_monitor());
             if (!m->vol_ui) rec_hints(m);
         }
     } else if (st == KEY_STATE_RELEASED) {
@@ -736,9 +787,7 @@ static bool rec_init(os_app_t* app, va_list args) {
     mk_param(&m->tl_pos,   "pos",   0.f, 0.f, 1e9f, 1.f);
     mk_param(&m->tl_start, "start", 0.f, 0.f, 1e9f, 1.f);
     mk_param(&m->tl_end,   "end",   0.f, 0.f, 1e9f, 1.f);
-    mk_param(&m->vol_in,  "in",  1.f, 0.f, 2.f, 0.02f);
     mk_param(&m->vol_out, "out", 1.f, 0.f, 2.f, 0.02f);
-    *(ParamTypeUI_t*)&m->vol_in.type = ParamValDBType;
     *(ParamTypeUI_t*)&m->vol_out.type = ParamValDBType;
     m->vol_sel = 0;
     m->state = ST_STOP;
@@ -766,6 +815,7 @@ static bool rec_init(os_app_t* app, va_list args) {
     ui_statusbar_show(true);
     m->hint_state = m->state;
     m->hint_takes = m->take_n != 0;
+    m->hint_mon = os_audio_get_monitor();
     rec_hints(m);
     ui_hints_show(true);
 

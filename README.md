@@ -478,7 +478,9 @@ bound). Shrink the model; move large buffers to `os_malloc()` in `init()` — se
 
 ## Version Compatibility
 
-**API Version**: 1.0
+**API Version**: see `@version` at the top of `tapp_api.h`, or the `TAPP_API_VERSION_MAJOR` /
+`TAPP_API_VERSION_MINOR` macros beside it — both are generated, so the header always states the
+version it actually provides. (This line used to name a number, and sat at 1.0 for four releases.)
 **Hardware Target**: 1
 
 ## Examples
