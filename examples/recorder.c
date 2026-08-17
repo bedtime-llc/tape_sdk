@@ -788,6 +788,8 @@ static bool rec_init(os_app_t* app, va_list args) {
     mk_param(&m->tl_start, "start", 0.f, 0.f, 1e9f, 1.f);
     mk_param(&m->tl_end,   "end",   0.f, 0.f, 1e9f, 1.f);
     mk_param(&m->vol_out, "out", 1.f, 0.f, 2.f, 0.02f);
+    m->vol_out.dflt = 1.f;
+    m->vol_out.target = 1.f;
     *(ParamTypeUI_t*)&m->vol_out.type = ParamValDBType;
     m->vol_sel = 0;
     m->state = ST_STOP;
