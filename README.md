@@ -157,7 +157,7 @@ sdk/
 │   ├── simple_app.c    # Minimal example (gfx + input)
 │   ├── my_app.c        # Audio synthesis + MIDI example
 │   ├── tuner.c         # Chromatic tuner + circle of fifths
-│   ├── groovebox.c     # Morphing drum machine (+ tape record)
+│   ├── infinigroove.c  # Morphing 6-track generative groovebox
 │   ├── chopper.c       # Tape-marks cutup composer
 │   ├── persistence/    # Saving settings with a .proto schema
 │   └── demo/           # Assets demo (sprites + animation)
@@ -501,13 +501,21 @@ engine; all three are verified against the real firmware before release:
   into a RAM ring; `tick()` runs NSDF pitch detection (no `math.h`); `redraw`
   shows a circle of fifths (`isin`/`icos`) + a big block-font note + a cents
   needle. A `ui_menu` edits the reference-A4 param.
-- **`examples/groovebox.c`** - morphing X/Y drum-pattern generator.
-  ONE morph knob (encoder) bilinear-interpolates a 3×3 grid of authored 16-step
-  drum patterns; inline drum synths (pitch-swept sine kick, noise+tone snare,
-  HPF-noise hat, saw→LP bass) render in `process()`. A `ui_menu` exposes the
-  "glitch" params (BPM, per-drum density, bitcrush, decimate, ratchet, chaos,
-  swing). On the device it records the live groove to tape (guarded on
-  `tape_get()`).
+- **`examples/infinigroove.c`** - generative 6-track groovebox, and the reference
+  for **inline polyphonic synthesis without `math.h`**. ONE morph knob (encoder)
+  walks a **figure-8** across a 4×4 grid of generated 16-step patterns,
+  bilinear-interpolating the four nearest nodes into a live pattern; the knob
+  wraps, because the path is a closed loop. Six distinct voices render in
+  `process()`: swept-sine kick, resonant-BP snare, six-square 808 hat, polyBLEP
+  saw bass, hard-sync lead and a detuned 3-note pad. Patterns carry a per-step
+  `tune` byte alongside intensity — pitch for the melodic tracks, character for
+  the drums, so no two kicks are alike — and tracks run at their own loop
+  lengths (polymeter). Shows the uint32 phase accumulator + polyBLEP + Chamberlin
+  SVF idiom, an integer step clock with a Q8 remainder, and double-buffered
+  pattern tables so UI-thread generation can never tear under `process()`.
+  A `ui_menu` exposes per-track density and level plus the "glitch" params
+  (scale, swing, crush, decimate, ratchet, chaos). No tape involvement — for
+  that, see `recorder.c`.
 - **`examples/chopper.c`** - tape-marks cutup composer. Reads the current tape's
   recorded-region **marks** (`tape_marks_count`/`tape_marks_get`), chops random
   slices of recorded audio into a RAM pool with `tape_read` (in `tick()`, off
@@ -545,8 +553,14 @@ The menu edits your `params_t.val` live; your `process()`/`redraw` just read it.
 
 ### In-app hint bar
 
-The firmware statusbar is device-side, so draw your own bottom control-hint strip
-from the primitives below:
+Prefer the system surfaces when they fit: `ui_hints_set_labels()` gives you the real
+button-hint band, and `ui_statusbar_set_gfx_cb(cb, width, ctx)` hands you a
+`width x TAPP_STATUSBAR_H` cell of the system statusbar to draw whatever you like into —
+a transport glyph, a meter, a position indicator — instead of spending a strip of your
+own panel on it (`examples/infinigroove.c` does exactly that). Draw only inside the cell;
+the bar erases each item's own box and nothing else.
+
+If you do want a self-contained strip anyway, build one from the primitives below:
 
 ```c
 static void draw_hint(gfx_t* g, int x, const char* label, bool hold) {

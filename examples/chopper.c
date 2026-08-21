@@ -666,7 +666,7 @@ static bool ch_init(os_app_t* app, va_list args) {
     ch_hints(m);
     ui_hints_show(true);
 
-    // Install OUR engine before activating it — see the note in groovebox.c.
+    // Install OUR engine before activating it — see the note in infinigroove.c.
     engine_set_callbacks(app, m);
     engine_set_active(true);
     return true;
