@@ -1,14 +1,26 @@
-// infinigroove.c — generative 6-track groovebox TAPP.
-// Controls: BTN1=play/stop, hold reveals the hints
-//           BTN4=enc target back / hold exit   BTN5=enc target fwd / hold randomize
-//           ENC drives the selected target: morph drift tempo dens tone key scale.
+// grooves.c — generative 6-track groovebox SOURCE tapp: renders at 24k into its own
+// scratch, upsamples into the mixer in_bus with ups2x_f32_add(), so the tapedecks
+// record it like the radio. (The firmware does no rate conversion — a source tapp
+// always gets the real 48k bus and owns its own internal rate.)
+// Controls: BTN1=play/stop (custom glyph hint)   BTN2=shuffle   BTN3=param readout (no action)
+//           BTN4/BTN5 press = enc target back/fwd (hold = system back/exit)
+//           ENC drives the selected target: morph drift tempo dens tone key scale
+//                                           tracks pump.
+// With the tapedecks' WET switch on it also PROCESSES the live input: dec2x_f32
+// brings it to 24k, the drum-driven sidechain ducks it (and the bass/pad) by the
+// `pump` param
 
 #include "tapp_api.h"
+
+TAPP_DECLARE_TYPE(AppTypeSrc);
 
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
-#define SR          48000.0f
+#define SR          24000.0f
+/* 24k render scratch: half the 48k block, with headroom over the shipping block
+ * size. n24 is clamped to this every block, so a larger block can never overrun. */
+#define GB_SCRATCH24 256
 #define STEPS       16           // max steps per track
 #define GRID        4            // 4x4 morph node grid
 #define NODES       (GRID * GRID)
@@ -17,25 +29,65 @@
 
 enum { T_KICK = 0, T_SNARE, T_HAT, T_BASS, T_LEAD, T_PAD };
 
-#define INF_SX    120
-#define INF_SY    42
-#define INF_X     ((400 - INF_SX) / 2)          // 140..260 — centred on the panel
-#define INF_Y     36                            // 36..78, between statusbar and grid
-#define INF_TH     11                           // stroke thickness
+#define INF_SX    96
+#define INF_SY    36
+#define INF_X     70                            // 70..166 — center-left, clear of metro and params
+#define INF_Y     40                            // 50..86, below the hint band, above the grid
+#define INF_TH     9                            // stroke thickness
 #define INF_DOT_R  4                            // travelling marker radius (9px)
 #define UI_HALFTONE 4                           // 50% halftone — shared by the figure-8 and metronome
 #define INF_PAD   (INF_TH / 2 + 2)
-#define PATH_N    200                           // 2px sampling of a 330px path needs 160
-#define PATH_GAP2  4
+/* Baked figure-8 stencils: band-local 1bpp bitmaps of the stroked path (base =
+ * INF_TH, fat = INF_TH+4 for the selected halo). Rendered once at init and
+ * blitted per frame — the live version re-stroked ~200 thick segments (600
+ * when selected) every single frame. */
+#define FIG_W   (INF_SX + 2 * INF_PAD + 1)
+#define FIG_H   (INF_SY + 2 * INF_PAD + 1)
+#define FIG_BPR ((FIG_W + 7) / 8)
 
 // Encoder targets — BTN4/BTN5 step through these
-enum { ENC_MORPH = 0, ENC_DRIFT, ENC_TEMPO, ENC_DENS, ENC_TONE, ENC_KEY, ENC_SCALE, ENC_TOTAL };
-static const char* const ENC_NAME[ENC_TOTAL] = {
-    "morph", "drift", "tempo", "dens", "tone", "key", "scale"
+enum { ENC_MORPH = 0, ENC_DRIFT, ENC_TRACKS, ENC_PUMP,  ENC_DENS, ENC_TONE, ENC_KEY, ENC_SCALE,
+    ENC_TEMPO, ENC_TOTAL };
+
+/* One params_t per encoder target, edited the way the main menu edits its rows:
+ * the encoder writes the TARGET (param_write_delta_coarse), the tick eases val
+ * toward it (param_update_val), the panel draws val. File-scope because the
+ * const fields (name/type) need compile-time init. MORPH is the exception —
+ * its state stays the raw wrapping uint16 in the model (a closed loop can't
+ * clamp), so its slot is only a named placeholder gb_enc_apply skips. */
+/* All knob edits go through the FINE writer (param_write_delta_val: target +=
+ * fine * detents) — the old coarse steps moved values too fast per detent, and
+ * morph in particular visibly hopped. Morph is a REAL param now: val 0..1 is
+ * the loop fraction (wraps — see gb_enc_apply), phase = val * 65536. */
+static params_t gb_prm[ENC_TOTAL] = {
+    [ENC_MORPH] = { .name = "morph", .type = ParamValScaledType, .coarse = 1.f / 128.f,
+                    .fine = 1.f / 256.f,
+                    .min = 0.f,  .max = 1.f,   .dflt = 0.125f, .val = 0.125f, .target = 0.125f,
+                    .refresh = true },
+    [ENC_DRIFT] = { .name = "drift", .type = ParamValScaledType, .coarse = 0.02f, .fine = 0.01f,
+                    .min = 0.f,  .max = 1.f,   .dflt = 0.f,   .val = 0.f,   .target = 0.f,   .refresh = true },
+    [ENC_TRACKS]= { .name = "tracks", .type = ParamValExactType, .coarse = .01f, .fine = 0.01f,
+        .min = 1.f,  .max = (float)TRACKS,
+        .dflt = (float)TRACKS, .val = (float)TRACKS, .target = (float)TRACKS,
+        .refresh = true },
+    [ENC_PUMP]  = { .name = "pump",  .type = ParamValScaledType, .coarse = 0.02f, .fine = 0.01f,
+        .min = 0.f,  .max = 1.f,   .dflt = 0.75f, .val = 0.75f, .target = 0.75f,
+        .refresh = true },
+    [ENC_DENS]  = { .name = "dens",  .type = ParamValScaledType, .coarse = 0.02f, .fine = 0.01f,
+        .min = 0.f,  .max = 1.f,   .dflt = 0.85f, .val = 0.85f, .target = 0.85f, .refresh = true },
+    [ENC_TONE]  = { .name = "tone",  .type = ParamValScaledType, .coarse = 0.02f, .fine = 0.01f,
+        .min = 0.f,  .max = 1.f,   .dflt = 0.5f,  .val = 0.5f,  .target = 0.5f,  .refresh = true },
+    [ENC_KEY]   = { .name = "key",   .type = ParamValExactType,  .coarse = 1.f, .fine = .02f,
+        .min = 24.f, .max = 48.f,  .dflt = 33.f,  .val = 33.f,  .target = 33.f,  .refresh = true },
+    [ENC_SCALE] = { .name = "scale", .type = ParamValSelectType, .coarse = 1.f, .fine = .02f,
+        .min = 0.f,  .max = 3.f,   .dflt = 0.f,   .val = 0.f,   .target = 0.f,   .refresh = true,
+        .text_opt = true, .option_name = { "minor", "dorian", "phrygian", "major" } },
+    [ENC_TEMPO] = { .name = "tempo", .type = ParamValExactType,  .coarse = 1.f, .fine = 0.5f,
+                    .min = 60.f, .max = 200.f, .dflt = 112.f, .val = 112.f, .target = 112.f, .refresh = true },
 };
 
 
-#define HZ2INC(f)  ((uint32_t)((f) * 89478.485f))   /* f * 2^32 / SR */
+#define HZ2INC(f)  ((uint32_t)((f) * 178956.97f))   /* f * 2^32 / SR */
 #define I32_TO_F   (1.0f / 2147483648.0f)
 
 static inline float fast_exp2f(float x) {
@@ -68,7 +120,7 @@ static inline float sat1(float x) {
     (lp) += (f) * (bp);                              \
 } while (0)
 static inline float svf_f(float hz) {                /* 2*sin(pi*fc/SR), no sinf */
-    return fminf(2.0f * fsin_i32((int32_t)(uint32_t)(hz * 44739.24f)), 1.2f);
+    return fminf(2.0f * fsin_i32((int32_t)(uint32_t)(hz * 89478.49f)), 1.2f);
 }
 
 static inline float blep_u32(uint32_t ph, uint32_t inc, float rinc) {
@@ -79,6 +131,8 @@ static inline float blep_u32(uint32_t ph, uint32_t inc, float rinc) {
 }
 
 static inline float decay_coef(float ms) { return 1.0f - 1.0f / (fmaxf(ms, 0.05f) * (SR / 1000.0f)); }
+
+#define SC_FLOOR 0.06f
 static inline float dnz(float x) { return (x < 1e-15f && x > -1e-15f) ? 0.0f : x; }
 static float note_to_freq(float midi) { return 440.0f * fast_exp2f((midi - 69.0f) * (1.0f / 12.0f)); }
 
@@ -88,7 +142,6 @@ static const int8_t SCALE[4][7] = {
     { 0, 1, 3, 5, 7, 8, 10 },   // phrygian
     { 0, 2, 4, 5, 7, 9, 11 },   // major
 };
-static const char* const SCALE_NAME[4] = { "minor", "dorian", "phrygian", "major" };
 static const char* const NOTE_NAME[12] = { "C",  "C#", "D",  "D#", "E",  "F",
                                            "F#", "G",  "G#", "A",  "A#", "B" };
 
@@ -123,9 +176,13 @@ typedef struct {
     uint32_t xs_ui;                         // xorshift state, ui thread (separate: no race)
 
     volatile bool playing;                  // written from both contexts
-    uint16_t morph;                         // WRAPS — the path is a closed loop
+    /* Morph position = gb_prm[ENC_MORPH].val * 65536 + morph_drift (mod 65536 —
+     * the path is a closed loop, wraps). Each context is the SOLE writer of its
+     * half: UI (encoder param) owns the param, audio (drift, clock_next) owns
+     * morph_drift — a shared read-modify-write here once let the audio thread
+     * silently revert encoder detents. See morph_phase(). */
+    uint16_t morph_drift;                   // audio-owned drift accumulator
     uint8_t  enc_target;
-    uint8_t  held_mask;                     // bit per button: a hold fired, so the release is not a tap
     uint8_t pat [2][TRACKS][NODES][STEPS];  // 0..255 intensity
     int8_t  tune[2][TRACKS][NODES][STEPS];  // drums: character  pitched: scale degree
     uint8_t plen[2][TRACKS];                // polymeter loop length
@@ -141,12 +198,12 @@ typedef struct {
     uint32_t regen_seed;
 
     // synth voices ---------------------------------------------------------
-    uint32_t k_ph;  float k_f, k_f0, k_env, k_click, k_dec;
+    uint32_t k_ph;  float k_f, k_f0, k_env, k_click, k_dec, k_drv, k_h2, k_h4, k_nrm;
     uint32_t s_ph1, s_ph2, s_inc1, s_inc2;
     float    s_nenv, s_tenv, s_tr, s_ndec, s_lp, s_bp, s_bpf, s_nmix;
     uint32_t h_ph[6], h_inc[6];  float h_env, h_dec, h_lp, h_bp, h_f;
     uint32_t b_ph, b_sph, b_inc, b_sinc;
-    float    b_rinc, b_env, b_fenv, b_amp, b_lp, b_bp, b_q, b_fd, b_dec;
+    float    b_rinc, b_env, b_fenv, b_amp, b_lp, b_bp, b_q, b_fd, b_dec, b_sub;
     uint32_t l_pm, l_ps, l_incm, l_incs;
     float    l_rincs, l_ratio, l_f, l_tgt, l_env, l_dec, l_lp, l_la;
     uint8_t  l_prev;                        // lead played last step -> glide
@@ -156,12 +213,29 @@ typedef struct {
     float    p_lpL, p_bpL, p_lpR, p_bpR, p_hpL, p_hpR, p_fc;
 
     float   dcx_l, dcy_l, dcx_r, dcy_r;
-    float   bpm, root, tone, drift;
-    float   dens[TRACKS];
-    uint8_t scale;                          
+    float   dens[TRACKS];                   // per-track density — the dens PARAM is a macro over these
 
-    uint8_t path_x[PATH_N], path_y[PATH_N], path_n;
-    uint16_t sb_enc_x, sb_bar_x, sb_bar_w;
+    uint8_t fig_base[FIG_H * FIG_BPR];      // baked INF_TH path stroke (band-local bits)
+    uint8_t fig_fat[FIG_H * FIG_BPR];       // baked INF_TH+4 stroke (selected halo)
+    uint16_t arc_lut[256];                  // uniform arc fraction -> raw lemniscate t (gb_init)
+    ui_roll_text_t enc_roll;                // mechanical roll for the enc-target name
+    ui_roll_text_t val_roll;                // mechanical roll for the key/scale VALUE text
+    char key_txt[8];                        // persistent note-name text the value roll diffs against
+    /* 24k render scratch + its upsampler state. The state MUST persist across
+     * blocks (it carries the interpolator seam) — a model field, zeroed once. */
+    float scratch24[GB_SCRATCH24];
+    ups2x_f32_t ups;
+    /* Live input, brought down to our 24k working rate so the drum-driven duck
+     * can be applied sample-accurately alongside the groove; the sum goes back
+     * up in the single ups2x_f32_add below. Only non-zero when the user has the
+     * tapedecks' WET switch on — otherwise the firmware parks the input and
+     * hands us a zeroed bus. */
+    float in24[GB_SCRATCH24];
+    dec2x_f32_t dec;
+    /* ONE sidechain envelope shared by pad, bass and the live input. Slammed by
+     * the drum triggers, released slower than the kick's own amplitude decay —
+     * that longer tail is what reads as a pump rather than a click. */
+    float sc_env, sc_dec;
 } gb_model_t;
 
 static gb_model_t* g_model = 0;
@@ -255,7 +329,8 @@ static void gen_node(gb_model_t* m, int buf, int tr, int node) {
             const uint32_t r = urand(m);
             deg += (int)(r % 7) - 3;
             if (deg < lo) deg = lo; else if (deg > hi) deg = hi;
-            td[s] = (int8_t)(deg + ((((r >> 16) & 7) == 0) ? 7 : 0));
+            const bool lift = (((r >> 16) & 7) == 0) && tr != T_BASS;
+            td[s] = (int8_t)(deg + (lift ? 7 : 0));
         }
     }
     if (tr == T_BASS) { pd[0] = 255; td[0] = 0; }
@@ -289,7 +364,13 @@ static void gb_regen(gb_model_t* m, uint32_t seed) {
 // ----------------------------------------------------------------------------
 // Morph: figure-8 over the node grid
 // ----------------------------------------------------------------------------
-static void morph_xy(uint16_t morph, float* fx, float* fy) {
+/* RAW Bernoulli-lemniscate parametrization. Its speed along the curve is NOT
+ * uniform: the derivative vanishes at the lobe tips and peaks at the crossing,
+ * so equal phase steps move the point sub-pixel in one place and several px in
+ * another — the knob felt "stuck then jumping". Every consumer goes through
+ * morph_arc() below, which re-maps phase by ARC LENGTH; only the init-time
+ * LUT/path bakes sample this directly. */
+static void morph_xy_raw(uint16_t morph, float* fx, float* fy) {
     const uint32_t t = (uint32_t)morph << 16;
     const float s = fsin_i32((int32_t)t);
     const float c = fsin_i32((int32_t)(t + 0x40000000u));   // cos
@@ -298,8 +379,75 @@ static void morph_xy(uint16_t morph, float* fx, float* fy) {
     *fy = 0.5f + 1.4142136f * s * c * d;
 }
 
-static void morph_weights(uint16_t morph, morph_w_t* w) {
-    float nx, ny; morph_xy(morph, &nx, &ny);
+/* The one morph-position read: param val (UI-owned loop fraction) + the
+ * audio-owned drift accumulator, wrapped into the uint16 phase domain. */
+static uint16_t morph_phase(const gb_model_t* m) {
+    /* val can sit just OUTSIDE 0..1 for a tick around a seam crossing (see
+     * gb_enc_apply) — go through int32 so the cast wraps instead of saturating. */
+    return (uint16_t)((int32_t)(gb_prm[ENC_MORPH].val * 65536.0f) + (int32_t)m->morph_drift);
+}
+
+/* Uniform phase -> raw parameter, via the arc-length LUT baked in gb_init.
+ * One knob detent = the same distance ANYWHERE on the loop. */
+static uint16_t morph_arc(const gb_model_t* m, uint16_t phase) {
+    const uint32_t idx = phase >> 8;   // 256 buckets, lerp inside
+    const uint32_t fr  = phase & 0xFFu;
+    const uint32_t t0 = m->arc_lut[idx];
+    const uint32_t t1 = (idx == 255) ? (uint32_t)m->arc_lut[0] + 65536u : m->arc_lut[idx + 1];
+    return (uint16_t)(t0 + (((t1 - t0) * fr) >> 8));
+}
+
+/* ---- baked figure-8 stencils ------------------------------------------- */
+
+/* Stamp a filled disc into a band-local 1bpp stencil (bake-time only). */
+static void gb_stamp(uint8_t* s, int cx, int cy, int r) {
+    for (int dy = -r; dy <= r; dy++) {
+        const int yy = cy + dy;
+        if ((unsigned)yy >= FIG_H) continue;
+        const int dx = (int)isqrt((uint32_t)(r * r - dy * dy));
+        int x0 = cx - dx, x1 = cx + dx;
+        if (x0 < 0) x0 = 0;
+        if (x1 >= FIG_W) x1 = FIG_W - 1;
+        uint8_t* row = &s[yy * FIG_BPR];
+        for (int x = x0; x <= x1; x++) row[x >> 3] |= (uint8_t)(1u << (x & 7));
+    }
+}
+
+/* Stroke the closed path into both stencils: a disc stamped every ~0.5px of
+ * loop = a round-capped stroke, same coverage as the old per-frame
+ * gfx_draw_line_thick chain. */
+static void gb_bake_fig(gb_model_t* m) {
+    memset(m->fig_base, 0, sizeof(m->fig_base));
+    memset(m->fig_fat, 0, sizeof(m->fig_fat));
+    for (int i = 0; i < 512; i++) {
+        float nx, ny; morph_xy_raw((uint16_t)(i * 128), &nx, &ny);
+        const int px = INF_PAD + (int)(nx * INF_SX + 0.5f);
+        const int py = INF_PAD + (int)(ny * INF_SY + 0.5f);
+        gb_stamp(m->fig_base, px, py, INF_TH / 2);
+        gb_stamp(m->fig_fat, px, py, (INF_TH + 4) / 2);
+    }
+}
+
+/* Transparent stencil blit: SET bits only, as hline runs in the CURRENT color
+ * (there is no transparent xbm blit in the API — gfx_draw_xbm overwrites the
+ * whole box). Runs keep it cheap: a few hlines per row. */
+static void gb_blit(gfx_t* gfx, const uint8_t* s) {
+    for (int row = 0; row < FIG_H; row++) {
+        const uint8_t* b = &s[row * FIG_BPR];
+        const gfx_uint_t y = (gfx_uint_t)(INF_Y - INF_PAD + row);
+        int x = 0;
+        while (x < FIG_W) {
+            if (b[x >> 3] == 0) { x = (x & ~7) + 8; continue; }
+            if (!(b[x >> 3] & (1u << (x & 7)))) { x++; continue; }
+            const int x0 = x;
+            while (x < FIG_W && (b[x >> 3] & (1u << (x & 7)))) x++;
+            gfx_draw_hline(gfx, (gfx_uint_t)(INF_X - INF_PAD + x0), y, (gfx_uint_t)(x - x0));
+        }
+    }
+}
+
+static void morph_weights(const gb_model_t* m, uint16_t morph, morph_w_t* w) {
+    float nx, ny; morph_xy_raw(morph_arc(m, morph), &nx, &ny);
     const float fx = nx * (GRID - 1), fy = ny * (GRID - 1);
     int x0 = (int)fx; if (x0 > GRID - 2) x0 = GRID - 2;
     int y0 = (int)fy; if (y0 > GRID - 2) y0 = GRID - 2;
@@ -327,6 +475,16 @@ static void step_cell(const gb_model_t* m, const morph_w_t* w, int tr, int st,
     else              *tune = (si > 0.5f) ? (sT / si) : 0.0f;
 }
 
+static int steps_to_next(const gb_model_t* m, const morph_w_t* w, int tr, int from) {
+    const int L = m->plen[m->live][tr] ? m->plen[m->live][tr] : STEPS;
+    for (int g = 1; g <= L; g++) {
+        float inten, tn;
+        step_cell(m, w, tr, (from + g) % L, &inten, &tn);
+        if (inten > 1.0f - m->dens[tr]) return g;
+    }
+    return L;   /* nothing else fires this loop — ring for the whole thing */
+}
+
 static float node_char(const int8_t tab[TRACKS][NODES], const morph_w_t* w, int tr) {
     float s = 0.f;
     for (int k = 0; k < 4; k++) s += (float)tab[tr][w->n[k]] * w->w[k];
@@ -338,6 +496,8 @@ static inline float drum_pitch(float base_hz, float semis, float jitter) {
     return base_hz * fast_exp2f((float)st * (1.0f / 12.0f)) * jitter;
 }
 
+static inline float tone_semis(float tone) { return (tone - 0.5f) * 48.0f; }
+
 static inline float drum_octave(gb_model_t* m, float bias, uint32_t odds) {
     if ((xrand(m) >> 24) >= odds) return 0.0f;
     return ((frand(m) < bias) ? -12.0f : 12.0f);
@@ -346,25 +506,33 @@ static inline float drum_octave(gb_model_t* m, float bias, uint32_t odds) {
 // ----------------------------------------------------------------------------
 // Voice triggers
 // ----------------------------------------------------------------------------
-static void trig_kick(gb_model_t* m, float vel, float c, float np, float nd) {
+static void trig_kick(gb_model_t* m, float vel, float c, float tone, float np, float nd) {
     const float j = 1.0f + (frand(m) - 0.5f) * 0.03f;
-    m->k_f0    = drum_pitch(42.0f, np * 8.0f + c * 7.0f
+    m->k_f0    = drum_pitch(42.0f, np * 8.0f + c * 7.0f + tone_semis(tone)
                                   + drum_octave(m, 0.85f, 40u), j);
     m->k_f     = m->k_f0 * (3.2f + 1.6f * c);
+    const float lo = clampf((42.0f - m->k_f0) * (1.0f / 31.5f), 0.f, 1.f);   /* 0 at 42Hz, 1 at 10.5 */
+    m->k_h2    = 0.55f * lo;
+    m->k_h4    = 0.40f * lo * lo;
+    m->k_nrm   = 1.0f / (1.0f + m->k_h2 + m->k_h4);
     m->k_ph    = 0x40000000u;
     m->k_env   = vel;
-    m->k_click = vel * (0.16f + 0.10f * (c + 1.0f));
+    m->k_click = vel * (0.16f + 0.10f * (c + 1.0f)) * (1.0f - 0.55f * lo);
+    m->sc_env  = 1.0f;                 // full pump on every kick
     m->k_dec   = decay_coef((150.0f + 110.0f * c) * (1.0f + nd * 0.8f)
                             * (0.92f + 0.16f * frand(m)));
+     m->k_drv   = 1.7f + 0.7f * lo;
 }
 
 static void trig_snare(gb_model_t* m, float vel, float c, float tone, float np, float nd) {
     const float j = 1.0f + (frand(m) - 0.5f) * 0.03f;
-    const float f = drum_pitch(180.0f, np * 8.0f + c * 7.0f
+    const float f = drum_pitch(180.0f, np * 8.0f + c * 7.0f + tone_semis(tone)
                                       + drum_octave(m, 0.5f, 30u), j);
     m->s_inc1 = HZ2INC(f);  m->s_inc2 = HZ2INC(f * 1.79f);
     m->s_ph1  = 0; m->s_ph2 = 0;
     m->s_nenv = vel;
+    /* Partial pump — fmaxf so a snare landing on a kick never LOWERS the duck. */
+    m->sc_env = fmaxf(m->sc_env, 0.5f);
     m->s_tenv = vel * (0.85f - 0.35f * c);
     m->s_tr   = vel;
     m->s_ndec = decay_coef((26.0f + 17.0f * (c + 1.0f)) * (1.0f + nd * 0.7f));
@@ -374,7 +542,8 @@ static void trig_snare(gb_model_t* m, float vel, float c, float tone, float np, 
 
 static void trig_hat(gb_model_t* m, float vel, float c, bool open, float tone,
                      float np, float nd) {
-    const float f0 = drum_pitch(263.0f, np * 7.0f + c * 6.0f + drum_octave(m, 0.5f, 30u),
+    const float f0 = drum_pitch(263.0f, np * 7.0f + c * 6.0f + tone_semis(tone)
+                                       + drum_octave(m, 0.5f, 30u),
                                1.0f + (frand(m) - 0.5f) * 0.05f);
     for (int k = 0; k < 6; k++) m->h_inc[k] = HZ2INC(f0 * HAT_RATIO[k]);
     m->h_env = vel;
@@ -383,18 +552,22 @@ static void trig_hat(gb_model_t* m, float vel, float c, bool open, float tone,
     m->h_f   = svf_f(5200.0f + 2200.0f * c + 2200.0f * tone);
 }
 
-static void trig_bass(gb_model_t* m, int semi, bool acc, float tone, float np, float nd) {
+static void trig_bass(gb_model_t* m, int semi, bool acc, float tone, float np, float nd,
+                      float gap_ms) {
     const float f = note_to_freq((float)semi);
     m->b_inc  = HZ2INC(f);
     m->b_rinc = 1.0f / (float)m->b_inc;
     m->b_sinc = m->b_inc >> 1;
+    const float fsub = f * 0.5f;
+    m->b_sub  = 0.5f + 0.45f * clampf((fsub - 26.0f) * (1.0f / 16.0f), 0.f, 1.f);
     m->b_env  = 1.0f; m->b_fenv = 1.0f;
     m->b_amp  = acc ? 1.0f : 0.72f;
     m->b_q    = clampf(((acc ? 0.28f : 0.55f) - np * 0.20f) * (0.82f + frand(m) * 0.36f),
-                       0.18f, 0.85f);                                  // Q <= 5.6: squelch, not howl
+                       0.18f, 0.85f);
     m->b_fd   = (acc ? (0.42f + 0.25f * tone) : (0.26f + 0.18f * tone))
                 * (1.0f + np * 0.55f) * (0.75f + frand(m) * 0.5f);
-    m->b_dec  = decay_coef(200.0f * (1.0f + nd * 0.75f));   // 50 .. 350 ms: pluck to sustain
+    const float base_ms = 200.0f * (1.0f + nd * 0.75f);
+    m->b_dec  = decay_coef(clampf(fmaxf(base_ms, gap_ms * 0.9f), 60.0f, 900.0f));
 }
 
 static void trig_lead(gb_model_t* m, int semi, bool acc, bool glide, float tone,
@@ -426,10 +599,11 @@ static void trig_pad(gb_model_t* m, int deg, int sc, int base, float np, float n
 // Sequencer
 // ----------------------------------------------------------------------------
 static void fire_step(gb_model_t* m, const morph_w_t* w) {
-    const int   sc   = m->scale & 3;
-    const int   root = (int)m->root;
-    const float tone = clampf(m->tone, 0.f, 1.f);
+    const int   sc   = (int)gb_prm[ENC_SCALE].val & 3;
+    const int   root = (int)gb_prm[ENC_KEY].val;
+    const float tone = clampf(gb_prm[ENC_TONE].val, 0.f, 1.f);
     const int   buf  = m->live;
+    const float step_ms = 15000.0f / fmaxf(gb_prm[ENC_TEMPO].val, 1.0f);
     uint8_t fired = 0;
 
     for (int t = 0; t < TRACKS; t++) {
@@ -447,14 +621,15 @@ static void fire_step(gb_model_t* m, const morph_w_t* w) {
         const int   deg = (int)(tn + (tn < 0.0f ? -0.5f : 0.5f));
 
         switch (t) {
-        case T_KICK:  trig_kick (m, vel, c, node_char(m->npit[buf], w, t),
-                                             node_char(m->ndec[buf], w, t)); break;
+        case T_KICK:  trig_kick (m, vel, c, tone, node_char(m->npit[buf], w, t),
+                                                 node_char(m->ndec[buf], w, t)); break;
         case T_SNARE: trig_snare(m, vel, c, tone, node_char(m->npit[buf], w, t),
                                                  node_char(m->ndec[buf], w, t)); break;
         case T_HAT:   trig_hat  (m, vel, c, acc, tone, node_char(m->npit[buf], w, t),
                                                        node_char(m->ndec[buf], w, t)); break;
         case T_BASS:  trig_bass (m, root + deg2semi(sc, deg), acc, tone,
-                                 node_char(m->npit[buf], w, t), node_char(m->ndec[buf], w, t)); break;
+                                 node_char(m->npit[buf], w, t), node_char(m->ndec[buf], w, t),
+                                 (float)steps_to_next(m, w, t, m->tstep[t]) * step_ms); break;
         case T_LEAD:  trig_lead (m, root + 19 + deg2semi(sc, deg), acc, m->l_prev != 0, tone,
                                  node_char(m->npit[buf], w, t), node_char(m->ndec[buf], w, t));
                       m->l_prev = 1; break;
@@ -485,8 +660,8 @@ static void clock_next(gb_model_t* m, uint32_t spf_q8, int32_t sw_q8,
 
     if (m->step == 0) relen(m);
 
-    m->morph = (uint16_t)(m->morph + drift);
-    morph_weights(m->morph, w);
+    m->morph_drift = (uint16_t)(m->morph_drift + drift);
+    morph_weights(m, morph_phase(m), w);
 
     const uint32_t tot = spf_q8 + (uint32_t)((m->step & 1) ? -sw_q8 : sw_q8) + m->frac_q8;
     m->samp_left = tot >> 8;
@@ -504,19 +679,33 @@ static void clock_next(gb_model_t* m, uint32_t spf_q8, int32_t sw_q8,
 }
 
 // ----------------------------------------------------------------------------
-// Audio: generate into out_bus
+// Audio: generate into in_bus — the decks record it, MixerInputVolParam applies
 // ----------------------------------------------------------------------------
 static void gb_process(engine_t* engine, mixer_t* mix) {
     gb_model_t* m = engine_get_ctx(engine);
     if (!m) return;
-    float* out = mixer_get_out(mix);
-    if (!out) return;
-    const uint32_t fs = mixer_get_fs(mix);
+    float* const bus = mixer_get_in(mix);   // the 48k record bus
+    if (!bus) return;
+    const uint32_t fs = mixer_get_fs(mix);  // 48k samples (L+R)
+    /* We render at 24k into our own scratch: half as many samples, and the
+     * upsampler doubles them back into the bus at the end. */
+    uint32_t n24 = fs >> 1;
+    if (n24 > GB_SCRATCH24) n24 = GB_SCRATCH24;
+    float* const out = m->scratch24;
 
-    if (!m->playing) { for (uint32_t i = 0; i < fs; i++) out[i] = 0.f; return; }
+    if (!m->playing) return;
+
+    float* const sends = mixer_get_fx(mix);
+    if (sends) {
+        for (uint32_t i = 0; i < fs; i++) { bus[i] += sends[i]; sends[i] = 0.f; }
+    }
+
+    /* Input + sends down to our working rate, BEFORE anything writes the bus.
+     * Pass n24 * 2 rather than fs so the n24 clamp above also bounds this write. */
+    dec2x_f32(&m->dec, bus, m->in24, n24 * 2);
 
     // ---- block-rate constants -------------------------------------------
-    const float tone = clampf(m->tone, 0.f, 1.f);
+    const float tone = clampf(gb_prm[ENC_TONE].val, 0.f, 1.f);
     const float kcd  = decay_coef(2.5f);    // kick click
     const float kpd  = decay_coef(10.f);    // kick pitch sweep
     const float sdt  = decay_coef(90.f);    // snare tone
@@ -524,19 +713,32 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
     const float bfd  = decay_coef(90.f);    // bass filter
     const float b_f0 = svf_f(70.0f + 180.0f * tone);
 
-    const uint32_t spf_q8   = (uint32_t)(SR * 60.0f * 256.0f / (m->bpm * 4.0f));
-    const float    sw_amt   = clampf(MIX_SWING + m->drift * 0.15f, 0.f, 1.f);
+    const float    drf      = gb_prm[ENC_DRIFT].val;
+    const uint32_t spf_q8   = (uint32_t)(SR * 60.0f * 256.0f / (gb_prm[ENC_TEMPO].val * 4.0f));
+    const float    sw_amt   = clampf(MIX_SWING + drf * 0.15f, 0.f, 1.f);
     const int32_t  sw_q8    = (int32_t)(sw_amt * 0.33f * (float)spf_q8);
-    const uint16_t drift    = (uint16_t)(m->drift * m->drift * 4096.0f);
+    const uint16_t drift    = (uint16_t)(drf * drf * 4096.0f);
 
-    const float g_k = LVL[T_KICK], g_s = LVL[T_SNARE];
-    const float g_h = LVL[T_HAT],  g_b = LVL[T_BASS];
-    const float g_l = LVL[T_LEAD], g_p = LVL[T_PAD];
+    /* Voice count: 1 = bare kick, 6 = everything, added in T_ order. Gating the
+     * gains (not fire_step) keeps every muted track's polymeter running, so
+     * unmuting drops back in on the grid. Block-rate — free in the inner loop. */
+    const int nt = (int)(gb_prm[ENC_TRACKS].val + 0.5f);
+    const float g_k = (nt > T_KICK)  ? LVL[T_KICK]  : 0.f;
+    const float g_s = (nt > T_SNARE) ? LVL[T_SNARE] : 0.f;
+    const float g_h = (nt > T_HAT)   ? LVL[T_HAT]   : 0.f;
+    const float g_b = (nt > T_BASS)  ? LVL[T_BASS]  : 0.f;
+    const float g_l = (nt > T_LEAD)  ? LVL[T_LEAD]  : 0.f;
+    const float g_p = (nt > T_PAD)   ? LVL[T_PAD]   : 0.f;
+    const float pmp   = clampf(gb_prm[ENC_PUMP].val, 0.f, 1.f);
+    const float d_in  = 2.6f * pmp;            // 0 .. 2.6 (pins at SC_FLOOR past 1)
+    const float d_pad = fmaxf(0.55f, d_in);    // 0.55 .. 2.6
+    const float d_bas = fmaxf(0.25f, d_in);    // 0.25 .. 2.6
+    m->sc_dec = decay_coef(180.0f + 80.0f * pmp);
 
-    morph_w_t w; morph_weights(m->morph, &w);
+    morph_w_t w; morph_weights(m, morph_phase(m), &w);
 
-    const uint32_t frames = fs >> 1;
-    m->p_lfo += (uint32_t)(frames * 9838u);                 // ~0.11 Hz
+    const uint32_t frames = n24 >> 1;
+    m->p_lfo += (uint32_t)(frames * 19676u);                // ~0.11 Hz
     const float lfo = fsin_i32((int32_t)m->p_lfo) * 0.5f + 0.5f;
     m->p_fc = svf_f(900.0f + 700.0f * lfo + 500.0f * tone + 600.0f * m->p_bright);
     m->p_ac = (m->p_gate > m->p_env) ? m->p_atk : m->p_rel;
@@ -554,7 +756,7 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
         m->p_rinc[2 * v + 1] = m->p_inc[2 * v + 1] ? 1.0f / (float)m->p_inc[2 * v + 1] : 0.0f;
     }
 
-    for (uint32_t i = 0; i < fs; i += 2) {
+    for (uint32_t i = 0; i < n24; i += 2) {
         // ---- clock: step + ratchet sub-hits ----
         if (--m->samp_left == 0) {
             clock_next(m, spf_q8, sw_q8, drift, &w);
@@ -574,8 +776,8 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
                 const int rb = m->live;
                 const float rp = (float)m->ratchet_dir * (float)m->ratchet_sub * 0.55f;  // ~4 semitones a repeat
                 if (m->last_fire & (1u << T_KICK))
-                    trig_kick(m, 0.8f, 0.0f, node_char(m->npit[rb], &w, T_KICK) + rp,
-                                             node_char(m->ndec[rb], &w, T_KICK));
+                    trig_kick(m, 0.8f, 0.0f, tone, node_char(m->npit[rb], &w, T_KICK) + rp,
+                                                   node_char(m->ndec[rb], &w, T_KICK));
                 if (m->last_fire & (1u << T_SNARE))
                     trig_snare(m, 0.8f, 0.0f, tone, node_char(m->npit[rb], &w, T_SNARE) + rp,
                                                     node_char(m->ndec[rb], &w, T_SNARE));
@@ -587,12 +789,17 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
 
         // ---- KICK ----
         m->k_f  = m->k_f0 + (m->k_f - m->k_f0) * kpd;
-        m->k_ph += (uint32_t)(m->k_f * 89478.485f);
-        float kick = fsin_i32((int32_t)m->k_ph) * m->k_env;
+        m->k_ph += HZ2INC(m->k_f);
+        float kick = fsin_i32((int32_t)m->k_ph)
+                   + fsin_i32((int32_t)(m->k_ph << 1)) * m->k_h2
+                   + fsin_i32((int32_t)(m->k_ph << 2)) * m->k_h4;
+        kick *= m->k_nrm * m->k_env;
         kick += nrand(m) * m->k_click;
-        kick  = sat1(kick * 1.7f);                     
-        const float duck  = 1.0f - 0.55f * m->k_env;   
-        const float duckb = 1.0f - 0.25f * m->k_env;
+        kick  = sat1(kick * m->k_drv);
+        m->sc_env *= m->sc_dec;
+        const float sc    = m->sc_env;
+        const float duck  = fmaxf(1.0f - d_pad * sc, SC_FLOOR);
+        const float duckb = fmaxf(1.0f - d_bas * sc, SC_FLOOR);
         m->k_env *= m->k_dec;  m->k_click *= kcd;
 
         // ---- SNARE ----
@@ -616,7 +823,7 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
         m->b_ph  += m->b_inc;
         m->b_sph += m->b_sinc;
         const float bsaw = saw_u32(m->b_ph) - blep_u32(m->b_ph, m->b_inc, m->b_rinc);
-        const float bx   = bsaw + fsin_i32((int32_t)m->b_sph) * 0.5f;
+        const float bx   = bsaw + fsin_i32((int32_t)m->b_sph) * m->b_sub;
         SVF(bx, m->b_lp, m->b_bp, fminf(b_f0 + m->b_fenv * m->b_fd, 1.2f), m->b_q);
         const float bass = sat1(m->b_lp * m->b_env * m->b_amp * 1.35f);
         m->b_env *= m->b_dec;  m->b_fenv *= bfd;
@@ -653,14 +860,26 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
         float l = mid - side + g_p * padl;
         float r = mid + side + g_p * padr;
 
+        // DC pole kept from the 48k version — cutoff doubles to ~24 Hz at 24k, fine.
         const float yl = l - m->dcx_l + 0.99843f * m->dcy_l; m->dcx_l = l; m->dcy_l = yl; l = yl;
         const float yr = r - m->dcx_r + 0.99843f * m->dcy_r; m->dcx_r = r; m->dcy_r = yr; r = yr;
+        const float g_in = fmaxf(1.0f - d_in * sc, SC_FLOOR);
+        l += m->in24[i]     * g_in;
+        r += m->in24[i + 1] * g_in;
 
         out[i]     = fminf(fmaxf(sat1(l * BUS_TRIM), -1.0f), 1.0f);
         out[i + 1] = fminf(fmaxf(sat1(r * BUS_TRIM), -1.0f), 1.0f);
     }
 
+    /* 24k -> 48k into the record bus. ups2x_f32_add ACCUMULATES and we own the
+     * bus, so clear it first — the live input is NOT lost by this: it was
+     * decimated into in24 at the top of the block and is already mixed (ducked)
+     * into the 24k sum being upsampled here. */
+    for (uint32_t i = 0; i < fs; i++) bus[i] = 0.f;
+    ups2x_f32_add(&m->ups, out, bus, n24);
 
+
+    m->sc_env = dnz(m->sc_env);
     m->k_env = dnz(m->k_env);   m->k_click = dnz(m->k_click);
     m->s_nenv = dnz(m->s_nenv); m->s_tenv = dnz(m->s_tenv); m->s_tr = dnz(m->s_tr);
     m->s_lp = dnz(m->s_lp);     m->s_bp = dnz(m->s_bp);
@@ -687,6 +906,7 @@ static void voices_silence(gb_model_t* m) {
     m->p_env = 0.f; m->p_gate = 0.f;
     m->p_lpL = m->p_bpL = m->p_lpR = m->p_bpR = m->p_hpL = m->p_hpR = 0.f;
     m->dcx_l = m->dcy_l = m->dcx_r = m->dcy_r = 0.f;
+    m->sc_env = 0.f;
 }
 
 static void gb_set_playing(gb_model_t* m, bool state) {
@@ -715,10 +935,13 @@ static const engine_callbacks_t gb_engine = {
 #define ROW_PIT   CELL_PIT
 #define GRID_Y0   (238 - (5 * ROW_PIT + ROW_H))
 
+static void gb_params_draw(gfx_t* gfx, gb_model_t* m);
+
 static void gb_redraw(gfx_t* gfx, const os_app_t* app) {
     gb_model_t* m = os_app_get_model(app);
-    morph_w_t w; morph_weights(m->morph, &w);
+    morph_w_t w; morph_weights(m, morph_phase(m), &w);
     const int buf = m->live;
+    const int nt = (int)(gb_prm[ENC_TRACKS].val + 0.5f);
 
     // ---- step matrix ----
     for (int row = 0; row < TRACKS; row++) {
@@ -742,27 +965,33 @@ static void gb_redraw(gfx_t* gfx, const os_app_t* app) {
         }
         if (m->playing) {   // XOR playhead
             gfx_set_color(gfx, 2);
-            gfx_draw_rect_fill(gfx, GRID_X0 + m->tstep[row] * CELL_PIT, gy, CELL_W, ROW_H);
+            const int px = GRID_X0 + m->tstep[row] * CELL_PIT;
+            if (row >= nt)
+                gfx_fill_rect_dithered(gfx, px, gy, CELL_W, ROW_H, UI_HALFTONE);
+            else
+                gfx_draw_rect_fill(gfx, px, gy, CELL_W, ROW_H);
             gfx_set_color(gfx, 1);
         }
     }
 
     gfx_set_color(gfx, 1);
-    for (int i = 0; i < m->path_n; i++) {
-        const int j = (i + 1 == m->path_n) ? 0 : i + 1;
-        gfx_draw_line_thick(gfx, (gfx_uint_t)(INF_X + m->path_x[i]),
-                                 (gfx_uint_t)(INF_Y + m->path_y[i]),
-                                 (gfx_uint_t)(INF_X + m->path_x[j]),
-                                 (gfx_uint_t)(INF_Y + m->path_y[j]), INF_TH);
-    }
+    gb_blit(gfx, m->fig_base);
 
     gfx_set_color(gfx, 0);
     gfx_fill_rect_dithered(gfx, INF_X - INF_PAD, INF_Y - INF_PAD,
                            INF_SX + 2 * INF_PAD + 1, INF_SY + 2 * INF_PAD + 1, UI_HALFTONE+1);
     gfx_set_color(gfx, 1);
 
+    if (m->enc_target == ENC_MORPH) {
+        gfx_set_color(gfx, 0);
+        gb_blit(gfx, m->fig_fat);
+        gfx_set_color(gfx, 1);
+        gb_blit(gfx, m->fig_base);
+    }
+
     {
-        float nx, ny; morph_xy(m->morph, &nx, &ny);
+        float nx, ny;
+        morph_xy_raw(morph_arc(m, morph_phase(m)), &nx, &ny);
         const gfx_uint_t mx = (gfx_uint_t)(INF_X + (int)(nx * INF_SX + 0.5f));
         const gfx_uint_t my = (gfx_uint_t)(INF_Y + (int)(ny * INF_SY + 0.5f));
         gfx_set_color(gfx, 1);
@@ -771,18 +1000,16 @@ static void gb_redraw(gfx_t* gfx, const os_app_t* app) {
         gfx_draw_disc(gfx, mx, my, INF_DOT_R, 0x0F);
         gfx_set_color(gfx, 1);
     }
+
+    gb_params_draw(gfx, m);
 }
 
 // ----------------------------------------------------------------------------
-// Statusbar items
+// Param panel — metronome and stuff
 // ----------------------------------------------------------------------------
-#define SB_W      240
-#define SB_GAP     16
-#define SB_X_METRO (2 + 13 + SB_GAP)
-#define SB_X_BPM  (SB_X_METRO + 15 + 8)
-#define SB_BAR_H   14
-#define SB_BAR_MAX 64
-#define SB_BAR_MIN 20
+#define VAL_X     199                           
+#define VAL_W     93
+#define VAL_Y     26
 
 static void draw_tri(gfx_t* g, int x, int y, int h, int w) {
     for (int i = 0; i < h; i++) {
@@ -801,77 +1028,55 @@ static void draw_tri_up(gfx_t* g, int cx, int y, int h, int w, int wt) {
 
 static void draw_metro(gfx_t* gfx, int cx, int y, bool playing, float bpm) {
     gfx_set_color(gfx, 1);
-    draw_tri_up(gfx, cx, y + 2, 14, 15, 3);
+    draw_tri_up(gfx, cx, y + 4, 28, 29, 5);
     gfx_set_color(gfx, 0);
-    draw_tri_up(gfx, cx, y + 6, 8, 7, 3);
-    gfx_fill_rect_dithered(gfx, (gfx_uint_t)(cx - 8), (gfx_uint_t)y, 17, 17, UI_HALFTONE+2);
+    draw_tri_up(gfx, cx, y + 12, 16, 13, 5);
+    gfx_fill_rect_dithered(gfx, (gfx_uint_t)(cx - 16), (gfx_uint_t)y, 33, 33, UI_HALFTONE+2);
     gfx_set_color(gfx, 1);
 
-    int dx = -3;
+    int dx = -6;
     if (playing) {
         const uint32_t per = (uint32_t)(60000.0f / (bpm > 1.f ? bpm : 1.f));
         const uint32_t p   = per ? (os_tick_get() % per) : 0u;
         const uint32_t ph  = ((p << 16) / (per ? per : 1u)) << 16;
-        dx = (int)(fsin_i32((int32_t)ph) * 4.5f);
+        dx = (int)(fsin_i32((int32_t)ph) * 9.0f);
     }
-    gfx_draw_line_thick(gfx, (gfx_uint_t)cx, (gfx_uint_t)(y + 13),
-                             (gfx_uint_t)(cx + dx), (gfx_uint_t)(y + 3), 3);
+    gfx_draw_line_thick(gfx, (gfx_uint_t)cx, (gfx_uint_t)(y + 26),
+                             (gfx_uint_t)(cx + dx), (gfx_uint_t)(y + 6), 4);
 }
 
-static void gb_statusbar(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, void* user) {
-    (void)w;
-    gb_model_t* m = (gb_model_t*)user;
-    if (!m) return;
-    gfx_set_color(gfx, 1);
-    if (m->playing) draw_tri(gfx, x + 2, y + 2, 15, 13);
-    else            gfx_draw_rect_fill(gfx, x + 2, y + 3, 13, 13);
-    draw_metro(gfx, x + SB_X_METRO + 7, y, m->playing, m->bpm);
-
-    float ev = 0.f;
-    switch (m->enc_target) {
-    case ENC_MORPH: ev = m->morph * (1.0f / 65535.0f); break;
-    case ENC_DRIFT: ev = m->drift; break;
-    case ENC_TEMPO: ev = (m->bpm - 60.f) * (1.0f / 140.f); break;
-    case ENC_DENS:  ev = m->dens[T_KICK]; break;
-    case ENC_TONE:  ev = m->tone; break;
-    case ENC_KEY:   ev = (m->root - 24.f) * (1.0f / 24.f); break;
-    default: break;
-    }
-
+/* Value text, CENTERED under the BTN3 cell. The roll is right-aligned, so the
+ * centered right edge comes from the settled string's width. */
+static void gb_val_text(gfx_t* gfx, gb_model_t* m, const char* s) {
     gfx_set_font(gfx, gfx_nunito_semibold_14);
+    const gfx_uint_t sw = gfx_get_str_width(gfx, s);
+    ui_roll_text_draw(gfx, (gfx_uint_t)(VAL_X + (VAL_W + sw) / 2), VAL_Y + 17, &m->val_roll, s);
+}
 
-    if (!m->sb_bar_w) {
-        gfx_uint_t wid = 0;
-        for (int i = 0; i < ENC_TOTAL; i++) {
-            const gfx_uint_t nw = gfx_get_str_width(gfx, ENC_NAME[i]);
-            if (nw > wid) wid = nw;
-        }
-        m->sb_enc_x = (uint16_t)(SB_X_BPM + gfx_get_str_width(gfx, "200") + SB_GAP);
-        m->sb_bar_x = (uint16_t)(m->sb_enc_x + wid + SB_GAP);
-        int avail = SB_W - 2 - (int)m->sb_bar_x;
-        if (avail > SB_BAR_MAX) avail = SB_BAR_MAX;
-        m->sb_bar_w = (uint16_t)(avail > SB_BAR_MIN ? avail : SB_BAR_MIN);
+static void gb_params_draw(gfx_t* gfx, gb_model_t* m) {
+    params_t* const p = &gb_prm[m->enc_target];
+    gfx_set_color(gfx, 1);
+    draw_metro(gfx, 26, 32, m->playing, gb_prm[ENC_TEMPO].val);
+    gfx_set_font(gfx, gfx_nunito_semibold_14);
+    {
+        const int bpm = (int)(gb_prm[ENC_TEMPO].val + 0.5f);
+        const gfx_uint_t bw = gfx_get_str_width(gfx, bpm > 99 ? "000" : "00");
+        gfx_draw_strf(gfx, (gfx_uint_t)(26 - bw / 2), 85, "%d", bpm); // metro ends y67 + 4px pad
     }
-
-    gfx_draw_strf(gfx, (gfx_uint_t)(x + SB_X_BPM), (gfx_uint_t)(y + 15), "%d",
-                  (int)(m->bpm + 0.5f));
-
-    gfx_draw_str(gfx, (gfx_uint_t)(x + m->sb_enc_x), (gfx_uint_t)(y + 15), ENC_NAME[m->enc_target]);
 
     if (m->enc_target == ENC_MORPH) {
-        /* No bar: the figure-8 on the panel goes solid instead (see gb_redraw). */
-    } else if (m->enc_target == ENC_KEY || m->enc_target == ENC_SCALE) {
-        const int mid = (int)m->root;
-        if (m->enc_target == ENC_KEY)
-            gfx_draw_strf(gfx, (gfx_uint_t)(x + m->sb_bar_x), (gfx_uint_t)(y + 15), "%s%d",
-                          NOTE_NAME[mid % 12], mid / 12 - 1);
-        else
-            gfx_draw_str(gfx, (gfx_uint_t)(x + m->sb_bar_x), (gfx_uint_t)(y + 15),
-                         SCALE_NAME[m->scale & 3]);
+        ui_roll_text_snap(&m->val_roll, "");
+    } else if (m->enc_target == ENC_KEY) {
+        const int mid = (int)p->val;
+        snprintf(m->key_txt, sizeof(m->key_txt), "%s%d", NOTE_NAME[mid % 12], mid / 12 - 1);
+        gb_val_text(gfx, m, m->key_txt);
+    } else if (m->enc_target == ENC_SCALE) {
+        gb_val_text(gfx, m, p->option_name[(int)p->val & 3]);
     } else {
-        ui_draw_value_bar(gfx, (gfx_uint_t)(x + m->sb_bar_x), (gfx_uint_t)(y + 2),
-                          m->sb_bar_w, SB_BAR_H,
-                          (uint32_t)(clampf(ev, 0.f, 1.f) * 1000.f), 0, 1000);
+        ui_roll_text_snap(&m->val_roll, "");
+        const float span = p->max - p->min;
+        const uint32_t pc = (span > 0.f) ? (uint32_t)((p->val - p->min) / span * 1000.f) : 0u;
+        ui_draw_value_bar(gfx, VAL_X, VAL_Y + 4, VAL_W, 14, pc, 0, 1000);
     }
 }
 
@@ -879,32 +1084,55 @@ static void gb_statusbar(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, v
 // Encoder
 // ----------------------------------------------------------------------------
 static void gb_enc_apply(gb_model_t* m, int32_t d) {
-    switch (m->enc_target) {
-    // No clamp: the path is a closed loop, so the knob wraps with it.
-    case ENC_MORPH: m->morph = (uint16_t)(m->morph + (uint16_t)(d * 512)); break;
-    case ENC_DRIFT: m->drift = clampf(m->drift + (float)d * 0.02f, 0.f, 1.f); break;
-    case ENC_TEMPO: m->bpm = clampf(m->bpm + (float)d, 60.f, 200.f); break;
-    case ENC_DENS: {
-        const float s = (float)d * 0.02f;
-        for (int t = 0; t < TRACKS; t++) m->dens[t] = clampf(m->dens[t] + s, 0.f, 1.f);
-    } break;
-    case ENC_TONE:  m->tone = clampf(m->tone + (float)d * 0.02f, 0.f, 1.f); break;
-    case ENC_KEY:   m->root = clampf(m->root + (float)d, 24.f, 48.f); break;
-    case ENC_SCALE: m->scale = (uint8_t)((m->scale + (d > 0 ? 1u : 3u)) & 3u); break;
-    default: break;
+    if (m->enc_target == ENC_MORPH) {
+        /* Fine steps, but WRAP instead of clamping at 0/1 — the path is a
+         * closed loop. On a seam crossing shift target AND val together by a
+         * full turn so any pending ease survives it. */
+        params_t* p = &gb_prm[ENC_MORPH];
+        p->target += p->fine * (float)d;
+        if (p->target >= 1.0f)     { p->target -= 1.0f; p->val -= 1.0f; }
+        else if (p->target < 0.0f) { p->target += 1.0f; p->val += 1.0f; }
+        return;
     }
+    param_write_delta_val(&gb_prm[m->enc_target], d);
 }
 
 // ----------------------------------------------------------------------------
 // Hints
 // ----------------------------------------------------------------------------
+static void gb_hint_transport(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, void* user) {
+    (void)w;
+    gb_model_t* m = (gb_model_t*)user;
+    if (!m) return;
+    gfx_set_color(gfx, m->playing ? 0 : 1);
+    const int gy = (int)y + 11;
+    if (m->playing) draw_tri(gfx, (int)x + 8, gy - 6, 13, 11);
+    else            gfx_draw_rect_fill(gfx, (gfx_uint_t)(x + 8), (gfx_uint_t)(gy - 5), 10, 10);
+    gfx_set_font(gfx, gfx_nunito_semibold_14); // cb contract: set your own font for text
+    gfx_draw_str(gfx, (gfx_uint_t)(x + 34), (gfx_uint_t)(y + 17), m->playing ? "stop" : "play");
+    gfx_set_color(gfx, 1);
+}
+
+
+static void gb_hint_param(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, void* user) {
+    gb_model_t* m = (gb_model_t*)user;
+    if (!m) return;
+    gfx_set_color(gfx, 1);
+    gfx_set_font(gfx, gfx_nunito_semibold_14); // cb contract: set your own font for text
+    const char* const nm = gb_prm[m->enc_target].name;
+    const gfx_uint_t sw = gfx_get_str_width(gfx, nm);
+    ui_roll_text_draw(gfx, (gfx_uint_t)(x + (w + sw) / 2), (gfx_uint_t)(y + 17), &m->enc_roll, nm);
+}
+
 static void gb_hints(gb_model_t* m) {
     static tapp_hint_pair_t hints[5];
-    hints[0] = (tapp_hint_pair_t){ m->playing ? "stop" : "play", "hints" };
-    hints[1] = (tapp_hint_pair_t){ 0, 0 };
-    hints[2] = (tapp_hint_pair_t){ 0, 0 };
-    hints[3] = (tapp_hint_pair_t){ "< enc", "exit" };
-    hints[4] = (tapp_hint_pair_t){ "enc >", "rnd" };
+    hints[0] = (tapp_hint_pair_t){ "", 0 };         // custom-drawn (gb_hint_transport)
+    hints[1] = (tapp_hint_pair_t){ "shuffle", 0 };
+    hints[2] = (tapp_hint_pair_t){ "", 0 };         // custom-drawn (gb_hint_param)
+    /* BTN4/5: both rows are SYSTEM-owned for input tapps (fx-menu prev/next +
+     * back/exit icons) — labels here are ignored. */
+    hints[3] = (tapp_hint_pair_t){ 0, 0 };
+    hints[4] = (tapp_hint_pair_t){ 0, 0 };
     ui_hints_set_labels(hints);
 }
 
@@ -915,6 +1143,17 @@ static bool gb_tick(os_app_t* app) {
     gb_model_t* m = os_app_get_model(app);
     const int32_t d = os_controls_encoder_get_delta();
     if (d) gb_enc_apply(m, d);
+    param_update_val(&gb_prm[m->enc_target]);   // menu parity: ease val toward target
+
+    /* dens is a MACRO over the per-track array (each track keeps its own
+     * default): spread the param's movement as a delta, clamped per track. */
+    static float dens_prev = 0.85f;             // == gb_prm[ENC_DENS].dflt
+    const float dv = gb_prm[ENC_DENS].val;
+    if (dv != dens_prev) {
+        const float s = dv - dens_prev;
+        for (int t = 0; t < TRACKS; t++) m->dens[t] = clampf(m->dens[t] + s, 0.f, 1.f);
+        dens_prev = dv;
+    }
 
     return true;
 }
@@ -925,32 +1164,22 @@ static bool gb_tick(os_app_t* app) {
 static void gb_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
     gb_model_t* m = os_app_get_model(app);
     if (btn >= 5) return;
-    const uint8_t bit = (uint8_t)(1u << btn);
 
-    if (st == KEY_STATE_HOLD) {
-        m->held_mask |= bit;
-        switch (btn) {
-        case 0: ui_hints_show(true); break;
-        case 3: os_app_exit(); break;
-        case 4:
-            gb_regen(m, os_tick_get() ^ (uint32_t)(uintptr_t)m);
-            m->morph = (uint16_t)(m->morph + (uint16_t)urand(m));
-            break;
-        default: break;
-        }
+    if (btn == 1) {
+        if (st != KEY_STATE_PRESSED) return;
+        gb_regen(m, os_tick_get() ^ (uint32_t)(uintptr_t)m);
+        ui_statusbar_hint_event(HintPress2);
         return;
     }
 
     if (st != KEY_STATE_RELEASED) return;
 
-    if (m->held_mask & bit) {
-        m->held_mask &= (uint8_t)~bit;
-        if (btn == 0) ui_hints_show(false);
-        return;
-    }
-
     switch (btn) {
-    case 0: gb_set_playing(m, !m->playing); gb_hints(m); break;
+    case 0:
+        engine_set_active(!m->playing);
+        ui_hints_set_active(HintPress1, m->playing); // lit plate while playing
+        break;
+    /* BTN2 handled above; BTN3 is a readout cell, not a button. */
     case 3: m->enc_target = (uint8_t)((m->enc_target + ENC_TOTAL - 1) % ENC_TOTAL); break;
     case 4: m->enc_target = (uint8_t)((m->enc_target + 1) % ENC_TOTAL); break;
     default: break;
@@ -967,12 +1196,9 @@ static bool gb_init(os_app_t* app, va_list args) {
     g_model = m; // audio callbacks reach the model through this
 
     m->xs = 0x9e3779b9u;
-    m->morph = 0x2000;
-    m->playing = true;
+    m->playing = false;
 
-    m->bpm = 112.f; m->root = 33.f; m->tone = 0.45f; m->drift = 0.f;
     for (int t = 0; t < TRACKS; t++) m->dens[t] = DENS_DFLT[t];
-
 
     gb_regen(m, os_tick_get() ^ (uint32_t)(uintptr_t)m);
     m->live ^= 1u; m->regen_req = 0;
@@ -990,29 +1216,47 @@ static bool gb_init(os_app_t* app, va_list args) {
     for (int v = 0; v < 3; v++) m->p_f[v] = m->p_tgt[v];
     m->p_gate = 1.0f;
     {
-        int n = 0, lx = -99, ly = -99;
-        for (int i = 0; i < 4096 && n < PATH_N; i++) {
-            float nx, ny; morph_xy((uint16_t)(i * 16), &nx, &ny);
-            const int px = (int)(nx * INF_SX + 0.5f);
-            const int py = (int)(ny * INF_SY + 0.5f);
-            const int dx = px - lx, dy = py - ly;
-            if (dx * dx + dy * dy < PATH_GAP2) continue;
-            m->path_x[n] = (uint8_t)px; m->path_y[n] = (uint8_t)py; n++;
-            lx = px; ly = py;
+        float px, py, L = 0.f;
+        morph_xy_raw(0, &px, &py);
+        for (int i = 1; i <= 4096; i++) {
+            float nx, ny; morph_xy_raw((uint16_t)(i * 16), &nx, &ny);
+            const float dx = (nx - px) * INF_SX, dy = (ny - py) * INF_SY;
+            L += sqrtf(dx * dx + dy * dy);
+            px = nx; py = ny;
         }
-        m->path_n = (uint8_t)n;
+        float acc = 0.f;
+        int k = 0;
+        m->arc_lut[0] = 0;
+        morph_xy_raw(0, &px, &py);
+        for (int i = 1; i <= 4096 && k < 255; i++) {
+            float nx, ny; morph_xy_raw((uint16_t)(i * 16), &nx, &ny);
+            const float dx = (nx - px) * INF_SX, dy = (ny - py) * INF_SY;
+            acc += sqrtf(dx * dx + dy * dy);
+            px = nx; py = ny;
+            while (k < 255 && acc >= L * (float)(k + 1) * (1.0f / 256.0f))
+                m->arc_lut[++k] = (uint16_t)(i * 16);
+        }
+        while (k < 255) m->arc_lut[++k] = 0xFFF0;
     }
+
+    gb_bake_fig(m);
 
     m->enc_target = ENC_MORPH;
     m->samp_left = 1; m->sub_len = 0xFFFFFFFFu; m->sub_left = 0xFFFFFFFFu;
-    { morph_w_t w; morph_weights(m->morph, &w); fire_step(m, &w); }
+    { morph_w_t w; morph_weights(m, morph_phase(m), &w); fire_step(m, &w); }
 
-    ui_statusbar_show(true);
-    ui_statusbar_set_gfx_cb(gb_statusbar, SB_W, m);
     gb_hints(m);
-    ui_hints_show(false);
+    ui_hints_set_gfx_cb(HintPress1, gb_hint_transport, m);
+    ui_hints_set_gfx_cb(HintPress3, gb_hint_param, m);
+    ui_hints_show(true);
     engine_set_callbacks(app, m);
     engine_set_active(true);
+    /* engine_set_active() dispatches our .active callback (gb_eng_active), which
+     * would START the transport. Land stopped instead: the engine slot stays
+     * installed and dispatching, and gb_process renders silence while stopped —
+     * the same state a BTN1 stop leaves behind. */
+    gb_set_playing(m, false);
+    ui_hints_set_active(HintPress1, false);     // plate lights only while playing
     return true;
 }
 
@@ -1020,7 +1264,6 @@ static bool gb_deinit(os_app_t* app) {
     gb_model_t* m = os_app_get_model(app);
     g_model = 0;
     m->playing = false;
-    ui_statusbar_set_gfx_cb(0, 0, 0);
     engine_set_active(false);
     engine_clear_callbacks(&gb_engine);
     return true;
@@ -1031,7 +1274,7 @@ static os_app_data_t gb_data = {
 };
 
 static os_app_t gb_app = {
-    .name = "Infinigroove",
+    .name = "grooves",
     .type = AppFullscreenType,
     .data = &gb_data,
     .redraw = (os_app_redraw)gb_redraw,

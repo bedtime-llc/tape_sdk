@@ -165,6 +165,14 @@ for TAPP in "$@"; do
             done
             name=$(printf '%b' "$esc")
             echo -e "  ${GREEN}✓${NC} manifest present, app name: \"${name}\""
+            # app_type u16 LE at byte 14 (hex char 28) — tapp_app_type_t. Display only, never a failure.
+            case $(( 0x${hex:30:2}${hex:28:2} )) in
+                0) atype="standalone" ;;
+                1) atype="src" ;;
+                # 2..4 were the retired Input24/InputFx roles — the device refuses them now.
+                *) atype="unknown ($(( 0x${hex:30:2}${hex:28:2} ))) - rebuild against AppTypeSrc" ;;
+            esac
+            echo "  app type: $atype"
         else
             echo -e "  ${RED}✗${NC} .tapp_manifest has wrong magic (got ${hex:0:8}, want 54415050)"; ok=0
         fi

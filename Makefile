@@ -139,15 +139,34 @@ clean:
 	@echo "Cleaning build artifacts..."
 	@rm -f *.tapp
 	@rm -f examples/*.tapp
+	@# Folder-style examples build their .tapp inside the folder, which the */*.tapp below does not
+	@# reach — that glob is relative to the sdk root, so examples/leds/leds.tapp survived every
+	@# clean there has ever been.
+	@rm -f examples/*/*.tapp
 	@# Scaffolded apps build into their own folder. Only ever removes .tapp outputs, never sources.
 	@rm -f */*.tapp
 	@echo "✓ Clean complete"
 
-# Build all examples
+# Build all examples.
+#
+# Both shapes, discovered — never a list. An example is a flat examples/<name>.c or a folder
+# examples/<name>/ that tapp-build takes whole. This globbed only examples/*.c and so quietly built
+# 5 of the 9, calling it "all"; the same walk in .github/workflows/build.yml is the one to keep
+# this in step with.
 all: check
 	@echo "Building all examples..."
-	@for example in examples/*.c; do \
+	@set -e; n=0; \
+	for example in examples/*.c; do \
+		[ -e "$$example" ] || continue; \
 		echo "Building $$example..."; \
-		./tapp-build $$example; \
-	done
-	@echo "✓ All examples built"
+		./tapp-build "$$example"; \
+		n=$$((n+1)); \
+	done; \
+	for dir in examples/*/; do \
+		ls "$$dir"*.c >/dev/null 2>&1 || { echo "Skipping $$dir (no .c)"; continue; }; \
+		echo "Building $$dir..."; \
+		./tapp-build "$$dir"; \
+		n=$$((n+1)); \
+	done; \
+	[ "$$n" -gt 0 ] || { echo "✗ no examples found under examples/" >&2; exit 1; }; \
+	echo "✓ All $$n examples built"

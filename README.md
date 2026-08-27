@@ -153,12 +153,14 @@ sdk/
 │   ├── api_exports.py      # What tapp_api.h exports; verify-tapp.sh's import gate reads it
 │   ├── tapp_skeleton.c.in  # Template `make init` copies (@NAME@ is substituted)
 │   └── discard.ld          # Linker script; drops clang's .ARM.exidx (the loader rejects it)
-├── examples/
+├── examples/           # A flat <name>.c, or a <name>/ folder — tapp-build takes either
 │   ├── simple_app.c    # Minimal example (gfx + input)
 │   ├── my_app.c        # Audio synthesis + MIDI example
 │   ├── tuner.c         # Chromatic tuner + circle of fifths
-│   ├── infinigroove.c  # Morphing 6-track generative groovebox
 │   ├── chopper.c       # Tape-marks cutup composer
+│   ├── recorder.c      # Recording to tape + live waveform
+│   ├── grooves/        # Morphing 6-track generative groovebox (an audio source)
+│   ├── leds/           # LED patterns (multi-file)
 │   ├── persistence/    # Saving settings with a .proto schema
 │   └── demo/           # Assets demo (sprites + animation)
 └── README.md           # This file
@@ -337,7 +339,10 @@ Real-time audio processing for TAPPs.
 ### Architecture
 
 - **Sample rate**: 48kHz
-- **Block size**: 64 frames (128 samples stereo, interleaved L/R)
+- **Buffers**: interleaved stereo (L, R, L, R, ...)
+- **Block size**: a build-time constant — take it from `mixer_get_fs(mix)` on every
+  block and never hardcode a number. `fs` is the count of *samples* in the buffer
+  (L+R combined), so a stereo loop steps `i += 2` and runs `fs / 2` frames.
 
 ### Setting Up Audio
 
@@ -359,15 +364,25 @@ static engine_callbacks_t my_engine = {
 
 static os_app_t my_app = {
     .name = "Synth",
-    .engine_cb = &my_engine,  // Engine callbacks auto-registered on launch
+    .engine_cb = &my_engine,  // that's it — auto-registered with your model as context
     // ...
 };
+```
 
-// Engine callbacks are auto-registered using model as context
-// No need to call engine_set_callbacks() manually
+Setting `.engine_cb` is enough: the firmware registers your callbacks (with the model
+as context) once your `init()` returns, and `process()` starts running. Call
+`engine_set_callbacks(app, ctx)` yourself only when you need one of two things:
 
-// Optional: activate engine for playback
-engine_set_active(true);
+- **a different context** than the model — e.g. a sub-struct of it, or
+- **to call `engine_set_active()` from inside `init()`** — auto-registration lands
+  *after* `init()` returns, and a `set_active` with nothing installed yet is dropped
+  (it logs a warning to the console rather than failing silently).
+
+In that case the order is install first, activate second:
+
+```c
+engine_set_callbacks(app, model);   // first
+engine_set_active(true);            // then
 ```
 
 ### Mixer Buffers
@@ -378,6 +393,244 @@ float* mixer_get_out(mixer_t* m);  // Output buffer (write here!)
 float* mixer_get_fx(mixer_t* m);   // FX send buffer
 uint32_t mixer_get_fs(mixer_t* m); // Frame size
 ```
+
+## Source tapps
+
+A standalone tapp *takes over* the tape engine while it runs: it owns the audio path.
+
+Add one line at file scope and your tapp becomes a **source** instead: a source tapp can be loaded instead of fx or radido.
+The tapedecks keep running underneath you, your audio lands on the record path, and can be recorded straight to tape, process
+WET input and tapehead sends.
+
+```c
+#include "tapp_api.h"
+
+TAPP_DECLARE_TYPE(AppTypeSrc);   // <- the entire opt-in
+```
+
+No declaration at all means `AppTypeStandalone` — the classic engine-replacing tapp.
+
+### Writing the audio
+
+```c
+static void my_process(engine_t* engine, mixer_t* mix) {
+    my_model_t* m = engine_get_ctx(engine);
+    if (!m) return;
+
+    float* out = mixer_get_in(mix);          // the INPUT bus — what the decks record
+    const uint32_t fs = mixer_get_fs(mix);
+
+    for (uint32_t i = 0; i < fs; i += 2) {
+        const float s = next_sample(m);
+        out[i]     = s;                      // overwrite; don't +=
+        out[i + 1] = s;
+    }
+}
+```
+
+Three rules, and they are the whole difference from a standalone tapp:
+
+1. **Write `mixer_get_in()`**, not `mixer_get_out()`. That is the bus the tapedecks
+   record from.
+2. **Fetch the pointer and `fs` inside `process()`, every block** rather than
+   caching them at init — the mixer owns those buffers, not you.
+3. **Overwrite the whole buffer**, don't accumulate into it. On entry it holds zeros
+   — unless the user has WET on, in which case it holds the live input at full rate,
+   ready for you to transform in place.
+
+The device's input-level knob scales what you produce, exactly as it does the radio.
+
+### The decks' FX sends
+
+`mixer_get_fx()` hands you whatever the four tapedecks are feeding their **Send**
+into — one block behind (2.667 ms), and all zeros when no deck has Send up.
+It is a separate buffer from `mixer_get_in()`, so you can treat the live input and
+the tape sends differently: duck one with the other, reverb only the sends, or
+ignore them entirely.
+
+You **own** that buffer for the length of your `process()` call, exactly as the
+built-in FX chain does, and whatever you leave in it is what the user hears:
+
+| what you do | what the user hears |
+|---|---|
+| nothing | the sends pass through dry — ignoring them doesn't mute them |
+| overwrite it | your processed version, instead of the dry sends |
+| mix it into your output, then zero it | heard once, through you |
+| mix it in and *don't* zero it | heard twice |
+
+One hazard: mixing the sends into `mixer_get_in()` closes a real feedback loop —
+sends → you → `in_bus` → recorded to tape → played back → sends. Route them to
+your output, or use them as a control signal, but think before folding them into
+the signal the decks are recording.
+
+### Working at 24 kHz (or 12 kHz)
+
+You always get the real 48 kHz bus — the firmware does no rate conversion for you.
+Halving your own rate halves your per-block DSP budget, which is what the built-in
+radio does and a good default for a synth or groovebox. Render into your own
+half-length scratch and convert on the way out:
+
+```c
+typedef struct {
+    float       scratch[256];   // 24 kHz render, L,R interleaved
+    ups2x_f32_t ups;            // upsampler state — persists across blocks
+    /* ... */
+} my_model_t;
+
+static void my_process(engine_t* engine, mixer_t* mix) {
+    my_model_t* m = engine_get_ctx(engine);
+    float* const bus = mixer_get_in(mix);
+    const uint32_t fs = mixer_get_fs(mix);
+    const uint32_t n24 = fs >> 1;               // half as many samples at 24 kHz
+
+    for (uint32_t i = 0; i < n24; i += 2) {     // render at 24 kHz
+        const float s = next_sample(m);
+        m->scratch[i] = s;
+        m->scratch[i + 1] = s;
+    }
+
+    for (uint32_t i = 0; i < fs; i++) bus[i] = 0.f;   // ups2x ADDS — clear to replace
+    ups2x_f32_add(&m->ups, m->scratch, bus, n24);
+}
+```
+
+Keep the `ups2x_f32_t` in your model and pass the same one every block — it carries
+the interpolator across the block seam. For **12 kHz**, cascade two stages through a
+24 kHz intermediate (two states, two calls). Going to PROCESS the live input at your
+lower rate? `dec2x_f32()` is the matching decimator.
+
+Both directions cost top end: a 24 kHz render dulls above roughly 10 kHz, and
+cascaded from 12 kHz it starts around 2.5 kHz — so treat 12 kHz as a lo-fi/pad rate,
+and stay at 48 kHz when sparkle matters.
+
+### Play and stop
+
+Drive your transport through the engine, never through a private flag:
+
+```c
+static void my_active(engine_t* e, bool on)   { (void)e; if (g_model) g_model->playing = on; }
+static uint_fast8_t my_is_active(engine_t* e) { (void)e; return (g_model && g_model->playing) ? 1 : 0; }
+
+// in your button handler:
+engine_set_active(!m->playing);        // NOT m->playing = !m->playing
+```
+
+`engine_set_active()` calls your own `.active` callback, so the behaviour is
+identical — but it also tells the firmware, which is the part that matters. Flipping
+only your own flag leaves the engine's view of you stale, and playback can stop
+responding until the tapp is reloaded.
+
+Your callbacks are auto-registered after `init()` returns, so if you want to set the
+transport state *during* `init()` you must install them yourself first — a
+`set_active` that arrives before anything is installed is dropped (with a console
+warning):
+
+```c
+engine_set_callbacks(app, m);   // first
+engine_set_active(false);       // then (or true to come up playing)
+```
+
+### You keep playing in the background
+
+Leaving your screen does **not** stop an input tapp: the user's exit gesture just
+puts your UI away while you stay loaded, sounding and recordable — that is the whole
+point. So do not copy the standalone habit of calling `engine_set_active(false)` from
+`on_pause`; for an input tapp that silences you the moment the user steps out to the
+menu. The user unloads you from the input-source picker when they are done.
+
+### The UI you get
+
+The firmware enforces a house style for source tapps, so you can rely on it:
+
+- **No statusbar.** `ui_statusbar_*` calls are inert for the session.
+- **The hint band is always visible** — `ui_hints_show(false)` is refused.
+- **BTN4 / BTN5 *hold* belong to the system**: back to the menu, and out to the main
+  screen. Don't assign them; put your actions on BTN1–BTN3 and on the encoder.
+
+### How someone runs your tapp
+
+From the main menu, on the source slot: **hold the `switch` hint**. The picker that
+opens lists *fx* (the plain input path), *radio*, and every input tapp on the card —
+pick yours and it loads. Source tapps deliberately do **not** appear in the regular
+app launcher; the source picker is their home. Your `assets/app_icon.png` shows there
+and in the menu slot (see [App icon](#app-icon) — 76x76, animation allowed).
+
+### MIDI
+
+Declare any `midi_*` handler in your `engine_callbacks_t` and channel-voice MIDI
+(notes, CC, pitch bend, aftertouch, program change) is routed to you while you are
+loaded. MIDI clock and transport always stay with the tapedecks, so the tape remains
+DAW-syncable. Declare nothing and the decks keep all of it. See `tapp_api.h` for the
+handler signatures.
+
+### A complete minimal input tapp
+
+```c
+#include "tapp_api.h"
+
+TAPP_DECLARE_TYPE(AppTypeSrc);                  // audio source
+
+typedef struct {
+    volatile bool playing;                      // written from both contexts
+    uint32_t phase;
+} my_model_t;
+
+static my_model_t* g_model;                     // audio callbacks reach the model through this
+
+static void my_process(engine_t* engine, mixer_t* mix) {
+    my_model_t* m = engine_get_ctx(engine);
+    if (!m) return;
+    float* out = mixer_get_in(mix);
+    const uint32_t fs = mixer_get_fs(mix);
+    for (uint32_t i = 0; i < fs; i += 2) {
+        m->phase += 178956971u;                 // ~1 kHz at 24 kHz: f * 2^32 / SR
+        const float s = (m->phase < 2147483648u) ? 0.2f : -0.2f;   // square
+        out[i] = s;
+        out[i + 1] = s;
+    }
+}
+
+static void my_active(engine_t* e, bool on)   { (void)e; if (g_model) g_model->playing = on; }
+static uint_fast8_t my_is_active(engine_t* e) { (void)e; return (g_model && g_model->playing) ? 1 : 0; }
+
+static const engine_callbacks_t my_engine = {
+    .process = my_process, .active = my_active, .is_active = my_is_active,
+};
+
+static bool my_init(os_app_t* app, va_list args) {
+    (void)args;
+    g_model = os_app_get_model(app);
+    engine_set_callbacks(app, g_model);         // install...
+    engine_set_active(true);                    // ...then start sounding
+    return true;
+}
+
+static bool my_deinit(os_app_t* app) { (void)app; g_model = 0; return true; }
+
+static void my_redraw(gfx_t* gfx, const os_app_t* app) {
+    const my_model_t* m = os_app_get_model((os_app_t*)app);
+    gfx_set_color(gfx, 1);
+    gfx_draw_str(gfx, 20, 120, (m && m->playing) ? "sounding" : "stopped");
+}
+
+static os_app_data_t my_data = {
+    .model = NULL, .model_size = sizeof(my_model_t),
+    .init = my_init, .deinit = my_deinit,
+};
+
+static os_app_t my_app = {
+    .name = "My Source",
+    .type = AppFullscreenType,
+    .data = &my_data,
+    .redraw = (os_app_redraw)my_redraw,
+    .engine_cb = &my_engine,
+};
+
+os_app_t* tapp_get_descriptor(void) { return &my_app; }
+```
+
+`examples/grooves/` is the full-size version of this: a generative groovebox that
+renders six voices into the input bus at 24 kHz.
 
 ## Using Assets (Images)
 
@@ -412,6 +665,36 @@ static void my_redraw(gfx_t* gfx, const os_app_t* app) {
 Asset naming:
 - `assets/my_image.png` → `asset_my_image`
 - `assets/cool-sprite.png` → `asset_cool_sprite`
+
+### App icon
+
+Provide `assets/app_icon.png` or `app_icon.gif` (animated). tapp-build converts it to a
+1-bit asset whose name starts with `asset_app_icon`, which the firmware reads for menus.
+
+Any `app_icon*` basename works — `app_icon_76_76_53.gif` is the same icon, and the
+`<w>_<h>_<frames>` tail is a naming convention the build ignores (the real width, height
+and frame count always come from the image itself). If you ship more than one `app_icon*`
+asset, the shortest name wins.
+
+Size: **exactly 76x76 px**, matching the built-in menu icons. Color images are dithered to
+mono; animated GIFs up to **64 frames** (760 B/frame — a 53-frame icon is about 40 KB of
+heap for as long as the menu holds it).
+
+Shown full-size in the main-menu cell, looping while your tapp is the active source.
+
+### List icon
+
+Provide `assets/mini_app_icon.png` (or `.gif` — frame 0 is used) for the **16x16** icon
+beside your tapp's name in the input-source list.
+
+This is a **separate drawing**, not a scaled copy: the list used to downscale the big icon,
+and 76x76 art sampled down to row height came out as mush, so a row now shows an icon only
+when you drew one at that size. Without it the row is simply text, which is the better of
+the two looks if you have nothing legible to put in 16x16.
+
+The name is `mini_app_icon`, not `app_icon_mini`, so that neither asset's name is a prefix
+of the other — the firmware matches both by prefix, and an `app_icon_mini` would be a
+candidate for the big icon too.
 
 ## App Structure Requirements
 
@@ -493,29 +776,34 @@ version it actually provides. (This line used to name a number, and sat at 1.0 f
   `init()`, saves in `deinit()`, versions the blob and clamps everything it reads back. The
   reference for the "Persisting settings" section above.
 
-Three larger, musically-substantial, **system-integrated** examples - each uses
-the `params_t` + `ui_menu_*` settings pattern, an in-app hint bar, and the audio
-engine; all three are verified against the real firmware before release:
+Three larger, musically-substantial, **system-integrated** examples - each uses the
+`params_t` settings pattern, the system UI surfaces and the audio engine; all three
+are verified against the real firmware before release:
 
 - **`examples/tuner.c`** - chromatic tuner. `process()` downmixes `mixer_get_in`
   into a RAM ring; `tick()` runs NSDF pitch detection (no `math.h`); `redraw`
   shows a circle of fifths (`isin`/`icos`) + a big block-font note + a cents
   needle. A `ui_menu` edits the reference-A4 param.
-- **`examples/infinigroove.c`** - generative 6-track groovebox, and the reference
-  for **inline polyphonic synthesis without `math.h`**. ONE morph knob (encoder)
-  walks a **figure-8** across a 4×4 grid of generated 16-step patterns,
-  bilinear-interpolating the four nearest nodes into a live pattern; the knob
-  wraps, because the path is a closed loop. Six distinct voices render in
-  `process()`: swept-sine kick, resonant-BP snare, six-square 808 hat, polyBLEP
-  saw bass, hard-sync lead and a detuned 3-note pad. Patterns carry a per-step
-  `tune` byte alongside intensity — pitch for the melodic tracks, character for
-  the drums, so no two kicks are alike — and tracks run at their own loop
-  lengths (polymeter). Shows the uint32 phase accumulator + polyBLEP + Chamberlin
-  SVF idiom, an integer step clock with a Q8 remainder, and double-buffered
-  pattern tables so UI-thread generation can never tear under `process()`.
-  A `ui_menu` exposes per-track density and level plus the "glitch" params
-  (scale, swing, crush, decimate, ratchet, chaos). No tape involvement — for
-  that, see `recorder.c`.
+- **`examples/grooves/`** - generative 6-track groovebox. The reference for both
+  **[source tapps](#source-tapps)** (`TAPP_DECLARE_TYPE(AppTypeSrc)` — it renders at
+  24 kHz into its own scratch, upsamples into the input bus with `ups2x_f32_add()`,
+  and the tapedecks record it) and **inline polyphonic synthesis
+  without `math.h`**. ONE morph knob (encoder) walks a **figure-8** across a 4×4 grid
+  of generated 16-step patterns, bilinear-interpolating the four nearest nodes into a
+  live pattern; the knob wraps, because the path is a closed loop, and the phase is
+  arc-length-remapped through a LUT baked at init so every detent moves the same
+  distance along the curve. Six distinct voices render in `process()`: swept-sine
+  kick, resonant-BP snare, six-square 808 hat, polyBLEP saw bass, hard-sync lead and
+  a detuned 3-note pad. Patterns carry a per-step `tune` byte alongside intensity —
+  pitch for the melodic tracks, character for the drums, so no two kicks are alike —
+  and tracks run at their own loop lengths (polymeter). Shows the uint32 phase
+  accumulator + polyBLEP + Chamberlin SVF idiom, an integer step clock with a Q8
+  remainder, and double-buffered pattern tables so UI-thread generation can never
+  tear under `process()`. Its settings are a `params_t` per encoder target (morph,
+  drift, tempo, density, tone, key, scale) edited with `.fine` steps — BTN4/BTN5
+  step the target, no menu — and its BTN1/BTN3 hint cells are custom-drawn
+  (`ui_hints_set_gfx_cb`) with a rolling readout. No tape involvement — for that,
+  see `recorder.c`.
 - **`examples/chopper.c`** - tape-marks cutup composer. Reads the current tape's
   recorded-region **marks** (`tape_marks_count`/`tape_marks_get`), chops random
   slices of recorded audio into a RAM pool with `tape_read` (in `tick()`, off
@@ -553,12 +841,30 @@ The menu edits your `params_t.val` live; your `process()`/`redraw` just read it.
 
 ### In-app hint bar
 
-Prefer the system surfaces when they fit: `ui_hints_set_labels()` gives you the real
-button-hint band, and `ui_statusbar_set_gfx_cb(cb, width, ctx)` hands you a
-`width x TAPP_STATUSBAR_H` cell of the system statusbar to draw whatever you like into —
-a transport glyph, a meter, a position indicator — instead of spending a strip of your
-own panel on it (`examples/infinigroove.c` does exactly that). Draw only inside the cell;
-the bar erases each item's own box and nothing else.
+Prefer the system surfaces when they fit — they cost you no panel space and they look
+like the rest of the device.
+
+`ui_hints_set_labels()` gives you the real button-hint band, and each cell can carry
+more than a word:
+
+```c
+ui_hints_set_labels(hints);                        // your five press/hold labels
+ui_hints_set_icon(HintPress2, &asset_my_icon);     // an icon in a label cell
+ui_hints_set_active(HintPress1, m->playing);       // light the cell while a state holds
+ui_hints_set_gfx_cb(HintPress1, my_cell_draw, m);  // or draw the cell yourself
+```
+
+`ui_hints_set_gfx_cb(action, cb, ctx)` hands your callback the cell's rectangle so you
+can draw a transport glyph, a meter, a tiny readout — `examples/grooves/` draws its
+play/stop plate and its parameter readout this way. Draw only inside the cell you were
+given. For text that should *change* rather than blink, `ui_roll_text_draw()` /
+`ui_roll_text_snap()` roll it over mechanically, split-flap style (grooves rolls its
+encoder-target name).
+
+Standalone tapps additionally get `ui_statusbar_set_gfx_cb(cb, width, ctx)` — a
+`width x TAPP_STATUSBAR_H` cell of the system statusbar. Source tapps have no statusbar,
+so that call is inert for them (see [Source tapps](#source-tapps)); the hint band above is
+their surface.
 
 If you do want a self-contained strip anyway, build one from the primitives below:
 

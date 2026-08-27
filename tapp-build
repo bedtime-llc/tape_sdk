@@ -36,6 +36,10 @@ info() {
     echo -e "${BLUE}==>${NC} $1"
 }
 
+warn() {
+    echo -e "${YELLOW}warning:${NC} $1" >&2
+}
+
 success() {
     echo -e "${GREEN}✓${NC} $1"
 }
@@ -305,6 +309,25 @@ if [ -n "$ASSETS_DIR" ]; then
             error "Failed to parse image metadata for $filename"
         fi
 
+        # The menu icon degrades SILENTLY: tapp_peek_icon validates 1..128 px and 1..64
+        # frames and simply returns NULL past that, so an oversized icon is not an error
+        # anywhere — the tapp builds, runs, and quietly shows the stock glyph instead.
+        # Say so here, which is the only place that knows the real dimensions.
+        case "$var_name" in
+            asset_mini_app_icon*)
+                if [ "$width" -ne 16 ] || [ "$height" -ne 16 ]; then
+                    warn "  $filename is ${width}x${height}; the list icon must be 16x16"
+                fi
+                ;;
+            asset_app_icon*)
+                if [ "$width" -gt 128 ] || [ "$height" -gt 128 ] || [ "$frame_count" -gt 64 ]; then
+                    warn "  $filename is ${width}x${height} @ ${frame_count}f — over the icon limit (128x128, 64 frames); the menu will fall back to the stock icon"
+                elif [ "$width" -ne 76 ] || [ "$height" -ne 76 ]; then
+                    warn "  $filename is ${width}x${height}; app icons should be 76x76 to match the built-in menu icons"
+                fi
+                ;;
+        esac
+
         if [ "$frame_count" -eq 1 ]; then
             # Single frame image
             # Strip the braces, do NOT delete whole lines. ImageMagick puts the final data bytes on
@@ -533,6 +556,19 @@ if [ -z "$APP_DISPLAY_NAME" ]; then
 fi
 info "  App name: $APP_DISPLAY_NAME"
 
+# Extract the declared tapp role (TAPP_DECLARE_TYPE marker; default Standalone=0)
+APP_TYPE=0
+for src in "${SOURCE_FILES[@]}"; do
+    _decl=$(grep -o 'TAPP_DECLARE_TYPE([[:space:]]*AppType[A-Za-z0-9]*[[:space:]]*)' "$src" | head -1)
+    case "$_decl" in
+        *AppTypeStandalone*) APP_TYPE=0; break ;;
+        *AppTypeSrc*)        APP_TYPE=1; break ;;
+    esac
+done
+if [ "$APP_TYPE" != "0" ]; then
+    info "  App type: src"
+fi
+
 # Generate manifest automatically
 MANIFEST_C="$BUILD_DIR/${APP_NAME}_manifest.c"
 cat > "$MANIFEST_C" <<EOF
@@ -549,7 +585,7 @@ typedef struct {
     uint16_t api_version_major;
     uint16_t api_version_minor;
     uint16_t hardware_target_id;
-    uint16_t reserved;   // must match lib/tapp/tapp_manifest.h; omitting it only works by padding
+    uint16_t app_type;   // must match lib/tapp/tapp_manifest.h (tapp_app_type_t; was reserved)
 } tapp_manifest_base_t;
 
 typedef struct {
@@ -567,7 +603,7 @@ const tapp_manifest_t __tapp_manifest = {
         .api_version_major = TAPP_API_VERSION_MAJOR,
         .api_version_minor = TAPP_API_VERSION_MINOR,
         .hardware_target_id = 1,
-        .reserved = 0,
+        .app_type = $APP_TYPE,
     },
     .stack_size = 4096,
     .app_version = 1,
