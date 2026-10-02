@@ -166,11 +166,15 @@ for TAPP in "$@"; do
             name=$(printf '%b' "$esc")
             echo -e "  ${GREEN}✓${NC} manifest present, app name: \"${name}\""
             # app_type u16 LE at byte 14 (hex char 28) — tapp_app_type_t. Display only, never a failure.
+            # Ordinals per tapp_app_type_t. 0 is "the author declared nothing", which IS
+            # utility — the field is the old reserved word, so an undeclared tapp and a
+            # deliberate AppTypeUtility emit the same byte and cannot be told apart.
+            # Anything above 2 is refused outright by the device (tapp.c).
             case $(( 0x${hex:30:2}${hex:28:2} )) in
-                0) atype="standalone" ;;
+                0) atype="utility" ;;
                 1) atype="src" ;;
-                # 2..4 were the retired Input24/InputFx roles — the device refuses them now.
-                *) atype="unknown ($(( 0x${hex:30:2}${hex:28:2} ))) - rebuild against AppTypeSrc" ;;
+                2) atype="standalone" ;;
+                *) atype="unknown ($(( 0x${hex:30:2}${hex:28:2} ))) - rebuild against the current SDK" ;;
             esac
             echo "  app type: $atype"
         else
