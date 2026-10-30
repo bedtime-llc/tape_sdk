@@ -14,8 +14,9 @@ lib/tapp/builder/generate_api_table.py to build the on-device symbol table. Shar
 the point: two implementations of "what does the header export" would disagree eventually, and the
 disagreement shows up as a tapp that verifies clean and then fails to load.
 
-The header must be seen exactly as a tapp's compiler sees it — FIRMWARE_BUILD and __cplusplus
-UNDEFINED. Anything else silently adds or drops exports.
+The header is tapp-only and unconditional where it declares exports, so a conditional keeps BOTH
+branches: over-include is caught by the drift check and the linker; under-include would silently
+shrink the published API.
 
 Stdlib only, python3.
 """
@@ -103,11 +104,6 @@ _C_KEYWORDS = {
     'register', 'restrict', 'asm', '_Static_assert', '_Noreturn',
 }
 
-# The tapp compiles with neither defined. Everything else is unknown, and an
-# unknown condition keeps BOTH branches (over-include is caught by the drift
-# check and the linker; under-include would silently shrink the published API).
-_KNOWN_MACROS = {'FIRMWARE_BUILD': False, '__cplusplus': False}
-
 _TRAILING_IDENT = re.compile(r'[A-Za-z_]\w*$')
 
 # `extern const uint8_t gfx_nunito_bold_18[];` — fonts and other read-only blobs.
@@ -144,35 +140,9 @@ def _strip_comments(src: str) -> str:
 
 
 def _preprocess(src: str) -> str:
-    """Remove directives; evaluate only the conditionals whose answer we know."""
-    out, stack = [], []
-    for line in src.split('\n'):
-        t = line.strip()
-        if t.startswith('#'):
-            w = t[1:].strip().split()
-            k = w[0] if w else ''
-            if k in ('ifdef', 'ifndef', 'if'):
-                cond = None
-                if k == 'ifdef' and len(w) > 1:
-                    cond = _KNOWN_MACROS.get(w[1])
-                elif k == 'ifndef' and len(w) > 1:
-                    v = _KNOWN_MACROS.get(w[1])
-                    cond = None if v is None else (not v)
-                elif k == 'if':
-                    m = re.fullmatch(r'defined\s*\(?\s*(\w+)\s*\)?', ' '.join(w[1:]))
-                    if m:
-                        cond = _KNOWN_MACROS.get(m.group(1))
-                stack.append(cond)
-            elif k == 'else' and stack:
-                stack[-1] = None if stack[-1] is None else (not stack[-1])
-            elif k == 'elif' and stack:
-                stack[-1] = None
-            elif k == 'endif' and stack:
-                stack.pop()
-            out.append('')  # a directive never contributes a declarator
-            continue
-        out.append('' if any(c is False for c in stack) else line)
-    return '\n'.join(out)
+    """Blank every directive line (a directive never contributes a declarator); both branches of
+    a conditional are kept."""
+    return '\n'.join('' if l.lstrip().startswith('#') else l for l in src.split('\n'))
 
 
 def _drop_attributes(src: str) -> str:

@@ -5,9 +5,9 @@
  *
  * Two things worth copying out of this file:
  *
- *   1. WHEN to save. A tapp gets no automatic save hook — the .memory_if field of your descriptor
- *      is overwritten by the loader, and its save/load callbacks are NULL. So: load in init(),
- *      save in deinit(). Nothing else runs for you.
+ *   1. WHEN to save. Load in init(), save in deinit(): deinit() runs on every way out. (The
+ *      descriptor's .memory_if hooks also exist — load() right after init(), save() when the
+ *      device flushes settings — but neither runs on close, so deinit() is still the place.)
  *
  *   2. HOW to store it. A packed struct written straight to disk is fine until you add a field,
  *      at which point every previously saved file is garbage. A .proto costs ~4KB of nanopb
@@ -15,6 +15,13 @@
  *
  * Drop persistence.proto next to this file and tapp-build does the rest — protoc + nanopb, then
  * it links the generated descriptors and the nanopb runtime into the .tapp.
+ *
+ * THE UI is the device's own settings menu (a ui_menu_t, the right-docked panel setup → system
+ * uses), so the controls are the standard ones: encoder scrolls, BTN1 selects (toggles a switch,
+ * enters/confirms a value edit, runs an action), BTN4/BTN5 step the cursor, BTN4/BTN5 hold close.
+ * The settings are params_t because the menu edits them in place; their callback only marks
+ * the model dirty. The param TYPE picks the row's look: SelectType over a wide range prints the
+ * integer, ParamValType draws the device's value bar, ToggleType its switch.
  */
 
 #include "tapp_api.h"
@@ -24,35 +31,60 @@
 
 #include "persistence.pb.h"
 
-#define TOP_BAR 60 // the system hint band clears rows 0..59
-
-#define SETTINGS_DIR  "/persistence"
-#define SETTINGS_PATH "/persistence/settings.pb"
+/* Already private: the firmware rewrites this to ".data/persistence/settings.pb" on the
+ * card, so there is no folder to invent and no name to make unique. */
+#define SETTINGS_PATH "/settings.pb"
 
 /* Bump when a field changes meaning. Loads that disagree fall back to defaults rather than
  * reinterpreting old bytes. */
 #define SETTINGS_VER 1
 
+// The info card fills what the menu panel leaves (the panel's own fade takes the last ~18px).
+#define CARD_X 8
+#define CARD_Y (TAPP_CONTENT_Y + 8)
+
+/* The menu panel: setup → system's geometry, the width the device gives rows with an icon, a
+ * name AND a value — narrower and "volume" runs into its bar. Top level with the card, clear
+ * of the hint band. */
+#define MENU_X (SCREEN_WIDTH / 2)
+#define MENU_W (SCREEN_WIDTH / 2 - 10)
+#define CARD_W (MENU_X - 2 * CARD_X - 12)
+#define CARD_H (SCREEN_HEIGHT - CARD_Y - 8)
+
 typedef struct {
-    uint32_t bpm;
-    float volume;
-    bool invert;
+    params_t bpm;
+    params_t volume;
+    params_t invert;
     uint32_t launches;
     char label[sizeof(((PB_PersistSettings*)0)->label)];
 
-    bool loaded;   // false => this run started from defaults
-    bool dirty;    // something changed; worth writing on the way out
-    uint8_t field; // which setting the encoder edits
-    char status[40];
+    ui_menu_t* menu;
+    bool loaded; // false => this run started from defaults
+    bool dirty;  // something changed; worth writing on the way out
 } persist_model_t;
 
+// The menu fires this on every edit, with the ctx given to ui_menu_create — the model.
+static void persist_changed(params_t* p, void* ctx) {
+    (void)p;
+    ((persist_model_t*)ctx)->dirty = true;
+}
+
 static void set_defaults(persist_model_t* m) {
-    m->bpm = 120;
-    m->volume = 0.8f;
-    m->invert = false;
+    /* max >= 16 with no option names: the menu prints the raw integer ("120"). */
+    m->bpm = (params_t){.name = "bpm", .type = ParamValSelectType, .val = 120, .target = 120,
+                        .dflt = 120, .min = 40, .max = 300, .coarse = 1, .fine = 1};
+    m->volume = (params_t)PARAM_RANGE("volume", 0.8f, 0.f, 1.f, 0.01f);
+    m->volume.type = ParamValType;
+    m->invert = (params_t){.name = "invert", .type = ParamValToggleType, .max = 1};
+    m->bpm.callback = m->volume.callback = m->invert.callback = persist_changed;
     m->launches = 0;
     strncpy(m->label, "untitled", sizeof(m->label) - 1);
     m->label[sizeof(m->label) - 1] = '\0';
+}
+
+// Set a param from a loaded value, clamped to its own range.
+static void param_load(params_t* p, float v) {
+    p->val = p->target = clampf(v, p->min, p->max);
 }
 
 // ============================================================================
@@ -75,10 +107,11 @@ static bool settings_load(persist_model_t* m) {
     if(pb.ver != SETTINGS_VER) return false;
 
     /* Clamp EVERYTHING. The file is on a removable card that a host can edit; a decode success
-     * only says the bytes were well-formed protobuf, not that the values are sane. */
-    m->bpm = pb.bpm < 40u ? 40u : (pb.bpm > 300u ? 300u : pb.bpm);
-    m->volume = pb.volume < 0.0f ? 0.0f : (pb.volume > 1.0f ? 1.0f : pb.volume);
-    m->invert = pb.invert;
+     * only says the bytes were well-formed protobuf, not that the values are sane. The ranges
+     * are the params' own, so they live in one place. */
+    param_load(&m->bpm, (float)pb.bpm);
+    param_load(&m->volume, pb.volume);
+    param_load(&m->invert, pb.invert ? 1.f : 0.f);
     m->launches = pb.launches;
 
     /* nanopb null-terminates a bounded string field, but the struct is only as big as max_size —
@@ -91,9 +124,9 @@ static bool settings_load(persist_model_t* m) {
 static bool settings_save(const persist_model_t* m) {
     PB_PersistSettings pb = PB_PersistSettings_init_zero;
     pb.ver = SETTINGS_VER;
-    pb.bpm = m->bpm;
-    pb.volume = m->volume;
-    pb.invert = m->invert;
+    pb.bpm = (uint32_t)m->bpm.val;
+    pb.volume = m->volume.val;
+    pb.invert = m->invert.val > 0.5f;
     pb.launches = m->launches;
     strncpy(pb.label, m->label, sizeof(pb.label) - 1);
 
@@ -101,142 +134,109 @@ static bool settings_save(const persist_model_t* m) {
     pb_ostream_t out = pb_ostream_from_buffer(buf, sizeof(buf));
     if(!pb_encode(&out, PB_PersistSettings_fields, &pb)) return false;
 
-    storage_mkdir(SETTINGS_DIR); // no-op if it already exists
-
     /* Test > 0, never == bytes_count: on device this returns the byte count, but the desktop
      * emulator returns 1 for success. Only "did anything get written" is portable. */
     return storage_write_file(SETTINGS_PATH, buf, out.bytes_written) > 0;
 }
 
 // ============================================================================
+// Menu
+// ============================================================================
+
+/* Saving here as well as in deinit() is deliberate: pulling the battery never reaches
+ * deinit(), so anything you only write on exit is a promise you cannot keep. */
+static void persist_save_action(ui_menu_t* menu, ui_menu_node_t* entry) {
+    (void)entry;
+    persist_model_t* m = ui_menu_ctx(menu);
+    if(settings_save(m)) {
+        m->dirty = false;
+        ui_notify_toast(NotifySuccess, "settings saved", 1500);
+    } else {
+        ui_notify_toast(NotifyError, "save failed", 2000);
+    }
+}
+
+static void persist_menu(ui_menu_t* menu) {
+    persist_model_t* m = ui_menu_ctx(menu);
+    ui_menu_add(menu, (ui_menu_node_t){.name = "bpm", .icon = gfx_icon(GfxIconBpm),
+                                       .type = MenuNodeParam, .param = &m->bpm});
+    ui_menu_add(menu, (ui_menu_node_t){.name = "volume", .icon = gfx_icon(GfxIconVolume),
+                                       .type = MenuNodeParam, .param = &m->volume});
+    ui_menu_add(menu, (ui_menu_node_t){.name = "invert", .icon = gfx_icon(GfxIconSettings),
+                                       .type = MenuNodeSwitch, .param = &m->invert});
+    ui_menu_add(menu, (ui_menu_node_t){.name = "save", .icon = gfx_icon(GfxIconBookmark),
+                                       .type = MenuNodeCustom, .callback = persist_save_action});
+}
+
+/* Closing the menu IS leaving the app; deinit() writes anything still dirty. */
+static void persist_menu_closed(void* ctx, ui_menu_t* menu) {
+    (void)ctx;
+    (void)menu;
+    os_app_exit();
+}
+
+// ============================================================================
 // App
 // ============================================================================
 
-static const char* const FIELD_NAME[3] = {"bpm", "volume", "invert"};
-
+/* Only the info card: the menu paints itself over the right of the screen. "invert" is the
+ * demo setting, so it flips the card — ours to draw, unlike the menu. */
 static void persist_redraw(gfx_t* gfx, const os_app_t* app) {
     persist_model_t* m = os_app_get_model(app);
+    const bool inv = m->invert.val > 0.5f;
+    const gfx_coord_t x = CARD_X + 12;
 
-    gfx_set_color(gfx, m->invert ? 0 : 1);
-    if(m->invert) gfx_draw_rect_fill(gfx, 0, TOP_BAR, SCREEN_WIDTH, SCREEN_HEIGHT - TOP_BAR);
-    gfx_set_color(gfx, m->invert ? 0 : 1);
+    if(inv) gfx_draw_rect_fill_r(gfx, CARD_X, CARD_Y, CARD_W, CARD_H, 5);
+    ui_draw_frame(gfx, CARD_X, CARD_Y, CARD_W, CARD_H, 5, false);
+    gfx_set_color(gfx, inv ? GFX_COLOR_CLEAR : GFX_COLOR_SET);
 
-    gfx_draw_str(gfx, 8, TOP_BAR + 8, m->status);
+    gfx_set_font(gfx, gfx_nunito_bold_18);
+    gfx_draw_str(gfx, x, CARD_Y + 28, m->label);
 
-    for(uint8_t i = 0; i < 3; i++) {
-        const gfx_uint_t y = TOP_BAR + 40 + i * 20;
-        if(i == m->field) gfx_draw_str(gfx, 8, y, ">");
+    gfx_set_font(gfx, gfx_nunito_semibold_14);
+    gfx_draw_strf(gfx, x, CARD_Y + 60, "launch #%u", (unsigned)m->launches);
+    gfx_draw_str(gfx, x, CARD_Y + 80, m->loaded ? "restored from SD" : "defaults, no file");
+    if(m->dirty) gfx_draw_str(gfx, x, CARD_Y + 100, "unsaved changes");
 
-        if(i == 0) gfx_draw_strf(gfx, 26, y, "bpm      %u", (unsigned)m->bpm);
-        else if(i == 1) gfx_draw_strf(gfx, 26, y, "volume   %d%%", (int)(m->volume * 100.0f));
-        else gfx_draw_strf(gfx, 26, y, "invert   %s", m->invert ? "on" : "off");
-    }
-
-    gfx_draw_strf(gfx, 26, TOP_BAR + 100, "label    %s", m->label);
-
-    gfx_draw_strf(gfx,
-                  8,
-                  TOP_BAR + 130,
-                  "launch #%u  %s",
-                  (unsigned)m->launches,
-                  m->loaded ? "restored from SD" : "defaults (no file yet)");
-    gfx_draw_str(gfx, 8, TOP_BAR + 150, SETTINGS_PATH);
+    gfx_set_font(gfx, DepartureMono_Regular_10);
+    gfx_draw_str(gfx, x, CARD_Y + CARD_H - 14, SETTINGS_PATH);
 }
 
-static bool persist_tick(os_app_t* app) {
-    (void)app;
-    return false; // nothing animates; repaint only on input
-}
-
-static void persist_input(os_app_t* app, uint8_t btn, KeyStateEnum state) {
-    persist_model_t* m = os_app_get_model(app);
-
-    if(state != KEY_STATE_PRESSED && state != KEY_STATE_HOLD) return;
-
-    if(btn == 0 && state == KEY_STATE_PRESSED) {
-        m->field = (uint8_t)((m->field + 1u) % 3u);
-        return;
-    }
-
-    if((btn == 1 || btn == 2) && state == KEY_STATE_PRESSED) {
-        const int dir = (btn == 2) ? 1 : -1;
-        switch(m->field) {
-        case 0: {
-            int v = (int)m->bpm + dir * 5;
-            m->bpm = (uint32_t)(v < 40 ? 40 : (v > 300 ? 300 : v));
-            break;
-        }
-        case 1: {
-            float v = m->volume + (float)dir * 0.05f;
-            m->volume = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            break;
-        }
-        default: m->invert = !m->invert; break;
-        }
-        m->dirty = true;
-        return;
-    }
-
-    /* Saving here as well as in deinit() is deliberate: pulling the battery never reaches
-     * deinit(), so anything you only write on exit is a promise you cannot keep. */
-    if(btn == 3 && state == KEY_STATE_PRESSED) {
-        const bool ok = settings_save(m);
-        if(ok) m->dirty = false;
-        snprintf(m->status, sizeof(m->status), ok ? "saved" : "SAVE FAILED");
-        return;
-    }
-
-    if(btn == 4 && state == KEY_STATE_HOLD) os_app_exit();
-}
-
-static bool persist_init(os_app_t* app, va_list args) {
-    (void)args;
+static bool persist_init(os_app_t* app) {
     persist_model_t* m = os_app_get_model(app);
 
     set_defaults(m);
     m->loaded = settings_load(m);
     m->launches++;
     m->dirty = true; // the bumped launch counter is itself unsaved state
-    m->field = 0;
-    snprintf(m->status,
-             sizeof(m->status),
-             m->loaded ? "loaded %s" : "no file, using defaults",
-             SETTINGS_PATH);
 
-    static const tapp_hint_pair_t hints[5] = {
-        {"field", 0},
-        {"-", 0},
-        {"+", 0},
-        {"save", 0},
-        {0, "exit"},
+    m->menu = ui_menu_create(m, persist_menu);
+    if(m->menu == NULL) return false;
+    ui_menu_set_pos(m->menu, MENU_X, CARD_Y);
+    ui_menu_set_width(m->menu, MENU_W);
+    ui_menu_set_close_cb(m->menu, persist_menu_closed);
+    ui_menu_show(m->menu);
+
+    /* The main menu's own band: the menu widget takes BTN1 (select) and the BTN4/BTN5 presses
+     * (cursor) and holds (close). A utility tapp's hints start hidden, so raise them. */
+    const tapp_hint_cell_t hints[HintsActionsTotal] = {
+        [HintPress1] = {"select", gfx_icon(GfxIconApply)},
+        [HintPress4] = {NULL, gfx_icon(GfxIconPlayRev)},
+        [HintPress5] = {NULL, gfx_icon(GfxIconPlay)},
+        [HintHold4] = {"close", gfx_icon(GfxIconRemove), NULL, HINT_SPAN},
     };
-    ui_hints_set_labels(hints);
+    ui_hints_set(hints);
     ui_hints_show(true);
     return true;
 }
 
-static bool persist_deinit(os_app_t* app) {
+static void persist_deinit(os_app_t* app) {
     persist_model_t* m = os_app_get_model(app);
     if(m->dirty) settings_save(m);
-    return true;
+    if(m->menu != NULL) ui_menu_destroy(m->menu);
 }
 
-static os_app_data_t persist_app_data = {
-    .model = NULL,
-    .model_size = sizeof(persist_model_t),
-    .init = persist_init,
-    .deinit = persist_deinit,
-};
-
-static os_app_t persist_app_descriptor = {
-    .name = "Persistence",
-    .type = AppFullscreenType,
-    .data = &persist_app_data,
-    .redraw = (os_app_redraw)persist_redraw,
-    .tick = persist_tick,
-    .on_input = persist_input,
-};
-
-os_app_t* tapp_get_descriptor(void) {
-    return &persist_app_descriptor;
-}
+/* No on_input and no tick: the menu is modal and takes every button, and the app layer is
+ * repainted under it on every frame the menu changes. */
+TAPP_APP("Persistence", persist_model_t, persist_init, persist_deinit,
+         .redraw = persist_redraw);

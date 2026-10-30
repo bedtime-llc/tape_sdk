@@ -706,15 +706,25 @@ if [ ${#PROTO_FILES[@]} -gt 0 ]; then
     HAS_PROTO=1
 fi
 
-# Extract app name from source (look for app_t structure with .name field)
+# Extract app name from source: TAPP_APP("Name", ...) first, else the .name field near an
+# os_app_t literal (the hand-written descriptor). TAPP_APP wins in ANY file, so a menu entry's
+# .name in a file find lists earlier can never be taken for the app's.
 info "Extracting app metadata..."
 APP_DISPLAY_NAME=""
 for src in "${SOURCE_FILES[@]}"; do
-    APP_DISPLAY_NAME=$(grep -A 10 "app_t.*=" "$src" | grep "\.name.*=" | sed 's/.*"\(.*\)".*/\1/' | head -1)
+    APP_DISPLAY_NAME=$(grep -o 'TAPP_APP[[:space:]]*([[:space:]]*"[^"]*"' "$src" | head -1 | sed 's/.*"\(.*\)"/\1/')
     if [ -n "$APP_DISPLAY_NAME" ]; then
         break
     fi
 done
+if [ -z "$APP_DISPLAY_NAME" ]; then
+    for src in "${SOURCE_FILES[@]}"; do
+        APP_DISPLAY_NAME=$(grep -A 10 "app_t.*=" "$src" | grep "\.name.*=" | sed 's/.*"\(.*\)".*/\1/' | head -1)
+        if [ -n "$APP_DISPLAY_NAME" ]; then
+            break
+        fi
+    done
+fi
 if [ -z "$APP_DISPLAY_NAME" ]; then
     APP_DISPLAY_NAME="$APP_NAME"
 fi
@@ -737,52 +747,6 @@ case "$APP_TYPE" in
     2) info "  App type: standalone" ;;
     *) info "  App type: utility" ;;
 esac
-
-# WINDOW MODE is utility-only, and the firmware enforces that by DERIVING os_app_t.type
-# from the role — a source or standalone that declares a rect simply runs fullscreen and
-# never finds out why. Say so here instead, where the source is in front of us.
-# Heuristic, like the .name extraction above: a 24-line window after the descriptor opens.
-# It cannot prove .type and .win_* belong to the same initializer, so this fails fast with
-# a readable message and the firmware stays the real gate.
-WINDOW_DECL=0
-WINDOW_Y=""
-for src in "${SOURCE_FILES[@]}"; do
-    # `|| true` throughout: set -e is on, and a grep that simply finds nothing is the
-    # NORMAL case here (a multi-file tapp has sources with no descriptor at all).
-    _desc=$(grep -A 24 'os_app_t[^=]*=' "$src" 2>/dev/null || true)
-    echo "$_desc" | grep -qE '\.type[[:space:]]*=[[:space:]]*AppWidgetType' || continue
-    # "not literally 0" rather than "ends in a digit": the rect is usually given as
-    # #define'd names (.win_w = WIN_W), which no digit pattern would match.
-    if echo "$_desc" | grep -qE '\.win_[wh][[:space:]]*=[[:space:]]*[^0,;[:space:]]'; then
-        WINDOW_DECL=1
-        WINDOW_Y=$(echo "$_desc" | grep -oE '\.win_y[[:space:]]*=[[:space:]]*[A-Za-z0-9_]+' \
-                   | sed 's/.*=[[:space:]]*//' | head -1 || true)
-        # Resolve one level of #define so the band check works for the common macro form.
-        case "$WINDOW_Y" in
-            ''|*[!0-9]*)
-                if [ -n "$WINDOW_Y" ]; then
-                    WINDOW_Y=$(grep -hE "^[[:space:]]*#define[[:space:]]+$WINDOW_Y[[:space:]]+[0-9]+" \
-                               "${SOURCE_FILES[@]}" 2>/dev/null | grep -oE '[0-9]+[[:space:]]*$' \
-                               | tr -d ' ' | head -1 || true)
-                fi ;;
-        esac
-        break
-    fi
-    warn "  .type = AppWidgetType with no win_w/win_h — window mode needs a rect; running fullscreen"
-done
-
-if [ "$WINDOW_DECL" = "1" ]; then
-    if [ "$APP_TYPE" != "0" ]; then
-        error "window mode is UTILITY-only: drop TAPP_DECLARE_TYPE, or drop the win_* rect.
-       A source or standalone tapp is always fullscreen — the firmware derives .type
-       from the declared role and will ignore the rect."
-    fi
-    info "  Window mode: ${WINDOW_Y:+y=$WINDOW_Y }rect declared"
-    # The hint band's two rows occupy y 0..48 and belong to whoever owns the band.
-    if [ -n "$WINDOW_Y" ] && [ "$WINDOW_Y" -lt 48 ]; then
-        warn "  win_y=$WINDOW_Y overlaps the hint band (y 0..48) — the firmware will refuse the rect"
-    fi
-fi
 
 # Generate manifest automatically
 MANIFEST_C="$BUILD_DIR/${APP_NAME}_manifest.c"

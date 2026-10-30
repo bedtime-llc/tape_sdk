@@ -5,6 +5,21 @@
  * A tour of the OS LED pattern engine. Scroll the list with the encoder and
  * press to play; the first entry stops everything.
  *
+ * WINDOW MODE: this paints into a rect on top of the still-visible main menu
+ * (os_app_set_window() from init()) rather than taking the screen. Two things that follow from it and that the code below depends on:
+ *
+ *   - redraw() paints the window's own panel first. The framebuffer is
+ *     cleared every dirty frame and the menu paints underneath us, so whatever
+ *     we do not cover shows through as menu pixels.
+ *   - ui_menu_t is a widget of its OWN; the firmware clips redraw() to the
+ *     rect but NOT that menu, so its geometry has to be made to fit by hand.
+ *     It is shown in init(), after os_app_set_window() attached the window, so
+ *     it stacks on top of us and, being modal, takes every button — which is
+ *     what we want here: this tapp needs no on_input() at all.
+ *
+ * BTN4/BTN5 HOLD close the window (the firmware's, in window mode). The menu's
+ * own close row still exits too.
+ *
  * The patterns themselves live in led_patterns.c.
  */
 
@@ -12,13 +27,22 @@
 
 #include "led_patterns.h"
 
-#define MENU_X       14
-#define MENU_Y       74
-#define MENU_W       244
+/* Window rect. y=50 clears the hint band (its hold row ends around y48).
+ * The menu panel is sized to land exactly on our top/left/right edges: a
+ * MenuTypeWidget frame is visible*27 + header 28 + 20, plus the 2px halo the
+ * active frame's nested outlines add — 4*27 + 28 + 20 = 156, +2 each side. */
+#define WIN_X        94
+#define WIN_Y        50
+#define WIN_W        212
+#define WIN_H        186
+
+#define MENU_W       188
+#define MENU_X       106
+#define MENU_Y       62
 #define MENU_VISIBLE 5
 
-#define STATUS_X 278
-#define STATUS_Y 96
+#define STATUS_X     106
+#define STATUS_Y     228   // baseline, in the strip below the menu panel
 
 typedef struct {
     ui_menu_t* menu;
@@ -37,9 +61,7 @@ static void leds_stop(leds_model_t* m) {
 
 static void leds_pick(ui_menu_t* menu, ui_menu_node_t* entry) {
     leds_model_t* m = ui_menu_ctx(menu);
-    if(m == NULL || entry == NULL) return;
-
-    const uint32_t slot = (uint32_t)(uintptr_t)entry->user_data;
+    const uint32_t slot = UI_PICK_IDX(entry);
     if(slot == 0) {
         leds_stop(m);
         return;
@@ -54,20 +76,9 @@ static void leds_pick(ui_menu_t* menu, ui_menu_node_t* entry) {
 }
 
 static void leds_menu_build(ui_menu_t* menu) {
-    if(ui_menu_ctx(menu) == NULL) return;
-
-    ui_menu_add(menu,
-                (ui_menu_node_t){.name = "- off -",
-                                 .type = MenuNodeCustom,
-                                 .callback = leds_pick,
-                                 .user_data = (void*)(uintptr_t)0});
-
+    ui_menu_add(menu, UI_PICK("- off -", leds_pick, 0));
     for(uint16_t i = 0; i < led_demo_count; i++) {
-        ui_menu_add(menu,
-                    (ui_menu_node_t){.name = (char*)led_demos[i].name,
-                                     .type = MenuNodeCustom,
-                                     .callback = leds_pick,
-                                     .user_data = (void*)(uintptr_t)(i + 1)});
+        ui_menu_add(menu, UI_PICK(led_demos[i].name, leds_pick, i + 1));
     }
 }
 
@@ -77,7 +88,9 @@ static void leds_menu_closed(void* ctx, ui_menu_t* menu) {
     os_app_exit();
 }
 
-static bool leds_init(os_app_t* app, va_list args) {
+static bool leds_init(os_app_t* app) {
+
+    os_app_set_window(WIN_X, WIN_Y, WIN_W, WIN_H);
     leds_model_t* m = os_app_get_model(app);
     m->playing = -1;
 
@@ -85,64 +98,42 @@ static bool leds_init(os_app_t* app, va_list args) {
     if(m->menu == NULL) return false;
 
     ui_menu_set_type(m->menu, MenuTypeWidget);
-    ui_menu_set_header(m->menu, true);
-    ui_menu_set_name(m->menu, "led patterns");
-    ui_menu_set_visible(m->menu, MENU_VISIBLE);
+    ui_menu_set_rows(m->menu, MENU_VISIBLE);
     ui_menu_set_pos(m->menu, MENU_X, MENU_Y);
     ui_menu_set_width(m->menu, MENU_W);
     ui_menu_set_close_cb(m->menu, leds_menu_closed);
     ui_menu_show(m->menu);
 
+    const tapp_hint_cell_t hints[HintsActionsTotal] = {
+        [HintPress1] = {"select", gfx_icon(GfxIconApply)},
+        [HintPress4] = {NULL, gfx_icon(GfxIconPlayRev)},
+        [HintPress5] = {NULL, gfx_icon(GfxIconPlay)},
+    };
+    ui_hints_set(hints);
     return true;
 }
 
-static bool leds_deinit(os_app_t* app) {
+static void leds_deinit(os_app_t* app) {
     leds_model_t* m = os_app_get_model(app);
-    leds_stop(m); 
-    if(m->menu != NULL) {
-        ui_menu_destroy(m->menu);
-        m->menu = NULL;
-    }
-    return true;
+    leds_stop(m);
+    if(m->menu != NULL) ui_menu_destroy(m->menu);
 }
 
 static void leds_redraw(gfx_t* gfx, const os_app_t* app) {
     leds_model_t* m = os_app_get_model(app);
 
-    gfx_set_color(gfx, 1);
+    gfx_set_color(gfx, GFX_COLOR_CLEAR);
+    gfx_draw_rect_fill_r(gfx, WIN_X, WIN_Y, WIN_W, WIN_H, 10);
+    gfx_set_color(gfx, GFX_COLOR_SET);
+    gfx_draw_rect_r(gfx, WIN_X, WIN_Y, WIN_W, WIN_H, 10);
+
     if(m->playing >= 0 && m->playing < (int32_t)led_demo_count) {
-        gfx_draw_str(gfx, STATUS_X, STATUS_Y, "playing");
-        gfx_draw_str(gfx, STATUS_X, STATUS_Y + 18, led_demos[m->playing].name);
+        gfx_draw_strf(gfx, STATUS_X, STATUS_Y, "playing: %s", led_demos[m->playing].name);
     } else {
         gfx_draw_str(gfx, STATUS_X, STATUS_Y, "stopped");
     }
 }
 
-static void leds_input(os_app_t* app, uint8_t btn, KeyStateEnum state) {
-    leds_model_t* m = os_app_get_model(app);
-
-    if(m->menu != NULL && ui_menu_is_visible(m->menu)) {
-        ui_menu_input(m->menu, btn, state);
-        return;
-    }
-    if(btn == 3 && state == KEY_STATE_HOLD) os_app_exit();
-}
-
-static os_app_data_t leds_data = {
-    .model = NULL,
-    .model_size = sizeof(leds_model_t),
-    .init = leds_init,
-    .deinit = leds_deinit,
-};
-
-static os_app_t leds_app = {
-    .name = "LEDs",
-    .type = AppFullscreenType,
-    .data = &leds_data,
-    .redraw = (os_app_redraw)leds_redraw,
-    .on_input = leds_input,
-};
-
-os_app_t* tapp_get_descriptor(void) {
-    return &leds_app;
-}
+/* No on_input: the menu is modal and takes every button while it is up, and closing it
+ * exits the app. BTN4/BTN5 HOLD are the firmware's close in window mode. */
+TAPP_APP("LEDs", leds_model_t, leds_init, leds_deinit, .redraw = leds_redraw);

@@ -21,127 +21,72 @@ typedef struct {
     uint8_t mode;
 } SpriteModel;
 
-// Static app data
-static os_app_data_t app_data;
-
 // ============================================================================
 // App Callbacks
 // ============================================================================
 
-static bool sprite_alloc(os_app_t* app, va_list args) {
-    (void)args;
+static bool sprite_init(os_app_t* app) {
     ui_hints_show(false);
 
-    SpriteModel* m = (SpriteModel*)app->data->model;
+    SpriteModel* m = os_app_get_model(app); // zeroed
     m->x = 64;
     m->y = 32;
     m->dx = 1;
     m->dy = 1;
-    m->frame = 0;
-    m->shade = 0;
-    m->mode = 0;
-
-    return true;
-}
-
-static bool sprite_free(os_app_t* app) {
-    // ui_hints_show(true);
     return true;
 }
 
 static bool sprite_tick(os_app_t* app) {
-    SpriteModel* m = (SpriteModel*)app->data->model;
+    SpriteModel* m = os_app_get_model(app);
 
     // Update sprite position
     m->x += m->dx;
     m->y += m->dy;
 
     // Bounce off edges
-    if(m->x <= 0 || m->x >= 400 - asset_dvd_logo.width) {
+    if(m->x <= 0 || m->x >= SCREEN_WIDTH - asset_dvd_logo.width) {
         m->dx = -m->dx;
         m->shade = !m->shade;
     }
-    if(m->y <= 0 || m->y >= 240 - asset_dvd_logo.height) {
+    if(m->y <= 0 || m->y >= SCREEN_HEIGHT - asset_dvd_logo.height) {
         m->dy = -m->dy;
         m->shade = !m->shade;
     }
 
     m->frame++;
-    return false; // Redraw happens continuously
+    // Both the bouncing logo and the dance-party animation move with no input at all, so every
+    // frame is one we need painted. Returning false here would freeze the demo into a still.
+    return true;
 }
 
 static void sprite_redraw(gfx_t* gfx, const os_app_t* app) {
     SpriteModel* m = os_app_get_model(app);
-    gfx_set_color(gfx, 1);
 
     if(!m->mode) {
         ui_draw_img(gfx, m->x, m->y, &asset_dvd_logo);
-        gfx_set_color(gfx, 0);
+        gfx_set_color(gfx, GFX_COLOR_CLEAR);
         gfx_fill_rect_dithered(
             gfx, m->x, m->y, asset_dvd_logo.width, asset_dvd_logo.height, m->shade);
     } else {
-        gfx_set_color(gfx, 1);
         ui_draw_anim(gfx, 100, 20, m->frame / 2, &asset_dance_party);
     }
 }
 
-void sprite_controls(os_app_t* app, uint8_t button_id, KeyStateEnum state) {
-
-    switch(button_id) {
-    case 0:
-        if(state == KEY_STATE_PRESSED) {
-            SpriteModel* m = (SpriteModel*)app->data->model;
-            // Reverse X direction
-            m->dx = -m->dx;
+static void sprite_controls(os_app_t* app, uint8_t button_id, KeyStateEnum state) {
+    SpriteModel* m = os_app_get_model(app);
+    if(state == KEY_STATE_PRESSED) {
+        switch(button_id) {
+        case BTN1: m->dx = -m->dx; break;     // reverse X direction
+        case BTN2: m->dy = -m->dy; break;     // reverse Y direction
+        case BTN3: m->mode = !m->mode; break; // logo / dance party
         }
-        break;
-    case 1:
-        if(state == KEY_STATE_PRESSED) {
-            SpriteModel* m = (SpriteModel*)app->data->model;
-            // Reverse Y direction
-            m->dy = -m->dy;
-        }
-
-        break;
-    case 2:
-        if(state == KEY_STATE_PRESSED) {
-            SpriteModel* m = (SpriteModel*)app->data->model;
-            // Reverse Y direction
-            m->mode = !m->mode;
-        }
-
-        break;
-
-    default:
-        if(state == KEY_STATE_HOLD) {
-            os_app_exit();
-        }
-        break;
     }
+    // We declare no app_type, so we are a "utility" tapp: the firmware claims
+    // none of our buttons and every hold lands here. Bind our own way out.
+    if(button_id == BTN4 && state == KEY_STATE_HOLD) os_app_exit();
 }
 
-// App descriptor (MUST use static initializers!)
-static os_app_t sprite_app_descriptor = {
-    .name = "Demo",
-    .type = AppFullscreenType,
-    .data = &app_data,
-    .redraw = (os_app_redraw)&sprite_redraw,
-    .tick = &sprite_tick,
-    .on_input = &sprite_controls,
-};
-
-// App data (MUST use static initializers!)
-static os_app_data_t app_data = {
-    .model = NULL,
-    .model_size = sizeof(SpriteModel),
-    .init = &sprite_alloc,
-    .deinit = &sprite_free,
-};
-
-// ============================================================================
-// Entry Point (REQUIRED)
-// ============================================================================
-
-os_app_t* tapp_get_descriptor(void) {
-    return &sprite_app_descriptor;
-}
+TAPP_APP("Demo", SpriteModel, sprite_init, NULL,
+         .redraw = sprite_redraw,
+         .tick = sprite_tick,
+         .on_input = sprite_controls);

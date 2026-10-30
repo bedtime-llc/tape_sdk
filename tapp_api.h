@@ -12,59 +12,63 @@
  *
  * @mainpage TAPP SDK API Reference
  *
- * This header provides the complete interface for TAPP (Tape Application) development.
- * Type definitions are binary-compatible with firmware's native types.
+ * This header is the whole interface for TAPP (tape application) development: the C library
+ * subset, the core types and every firmware call a tapp can make.
  *
  * @section arch_sec Architecture
  *
- * - External apps are ELF32 relocatable objects (.tapp files)
- * - Apps are loaded dynamically from SD card at runtime
- * - Symbol resolution is done via firmware's exported symbol table
- * - Apps have restricted access to firmware features (security boundary)
- * - Apps use structures that are binary-compatible with os_app_t
+ * - A .tapp is an ELF32 relocatable object, loaded from the SD card at runtime
+ * - Its imports resolve by name against the firmware's export table, which is exactly what this
+ *   header declares
+ * - The app describes itself with one TAPP_APP() statement
  *
  * @section usage_sec Basic Usage
  *
  * @code{.c}
  * #include "tapp_api.h"
  *
- * // app must export this function
- * os_app_t* tapp_get_descriptor(void) {
- *     static os_app_t my_app = {
- *         .name = "My App",
- *         .type = AppFullscreenType,
- *         // ... other fields
- *     };
- *     return &my_app;
+ * typedef struct { int counter; } my_model_t;
+ *
+ * static void my_redraw(gfx_t* gfx, const os_app_t* app) {
+ *     my_model_t* m = os_app_get_model(app);
+ *     gfx_draw_strf(gfx, 4, TAPP_CONTENT_Y + 20, "counter: %d", m->counter);
  * }
+ *
+ * static void my_input(os_app_t* app, uint8_t btn, KeyStateEnum state) {
+ *     my_model_t* m = os_app_get_model(app);
+ *     if(btn == BTN1 && state == KEY_STATE_PRESSED) m->counter++;
+ *     if(btn == BTN4 && state == KEY_STATE_HOLD) os_app_exit();
+ * }
+ *
+ * TAPP_APP("My App", my_model_t, NULL, NULL, .redraw = my_redraw, .on_input = my_input);
  * @endcode
  *
  * @section api_categories API Categories
  *
- * - @ref grp_memory - Memory allocation
  * - @ref grp_graphics - Drawing primitives
- * - @ref grp_ui - Buttons, meters, frames, images
- * - @ref grp_app - Application lifecycle
+ * - @ref grp_ui - Buttons, meters, frames, images, rolling text
+ * - @ref grp_memory - Memory allocation
+ * - @ref grp_app - Application lifecycle, window mode, timing
  * - @ref grp_led - RGB LEDs
- * - @ref grp_storage - File I/O
+ * - @ref grp_storage - File I/O and the file browser
  * - @ref grp_persist - Saving settings and app data
- * - @ref grp_menu - Menu system
- * - @ref grp_audio - Audio processing
  * - @ref grp_math - Math utilities
+ * - @ref grp_menu - Menu system
+ * - @ref grp_hints - Button hints and the statusbar
+ * - @ref grp_params - Parameters
+ * - @ref grp_notify - Notifications
+ * - @ref grp_audio - Audio processing and MIDI
  * - @ref grp_input - Input handling
+ * - @ref grp_tape - Tape access
+ * - @ref grp_timeline - The tape timeline strip
  */
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdarg.h>
-
-#ifdef FIRMWARE_BUILD
-#include <string.h>
-#else
 
 // ============================================================================
-// Freestanding C library subset  (external tapp builds only)
+// C library subset
 // ============================================================================
 /*
  * There is no libc to link against. A .tapp is a relocatable object whose undefined symbols are
@@ -84,83 +88,51 @@
  *   static inline - NOT exported, but FPv5 has a single instruction for it, so the builtin expands
  *                   in place and costs no import. Verified with llvm-nm that none emit a libcall.
  * Moving one of the inlines to extern silently creates an unresolvable import.
+ *
+ * Memory comes from os_malloc()/os_free() (see the Memory group): there is no malloc, free or
+ * realloc, and nothing here allocates.
  */
-#ifdef __cplusplus
-extern "C" {
-#endif
 
-/* ---- string / memory (exported) ----------------------------------------------------------
- * Absent on purpose: strcat, strncat, strdup, strtok, strcasecmp, strspn, strcspn, strpbrk,
- * memccpy - none are exported. */
-void* memchr(const void* s, int c, size_t n);
-int memcmp(const void* a, const void* b, size_t n);
+/* ---- memory and strings --------------------------------------------------------------------
+ * Absent on purpose: strcat, strncat, strdup, strndup, strtok, strcasecmp, strspn, strcspn,
+ * strpbrk, memchr, memccpy. */
 void* memcpy(void* dst, const void* src, size_t n);
 void* memmove(void* dst, const void* src, size_t n);
 void* memset(void* s, int c, size_t n);
+int memcmp(const void* a, const void* b, size_t n);
 
-char* strchr(const char* s, int c);
-int strcmp(const char* a, const char* b);
-char* strcpy(char* dst, const char* src);
 size_t strlen(const char* s);
-int strncasecmp(const char* a, const char* b, size_t n);
+int strcmp(const char* a, const char* b);
 int strncmp(const char* a, const char* b, size_t n);
+char* strcpy(char* dst, const char* src);
 char* strncpy(char* dst, const char* src, size_t n);
-char* strndup(const char* s, size_t n);
-size_t strnlen(const char* s, size_t n);
+char* strchr(const char* s, int c);
 char* strrchr(const char* s, int c);
 char* strstr(const char* hay, const char* needle);
 
-/* ---- formatting (exported) ----------------------------------------------------------------
+/* ---- formatting, parsing, random -----------------------------------------------------------
  * snprintf is the ONLY formatting entry point. printf / sprintf / vsnprintf / puts / fprintf /
  * fopen are not exported - a tapp calling them links fine and then fails to load. File I/O goes
- * through the storage_* API further down this header. */
+ * through the storage_* API further down this header. Numbers parse with strtol / strtof
+ * (base 10 is strtol(s, NULL, 10)). */
 int snprintf(char* buf, size_t n, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
-
-/* ---- stdlib (exported) ---------------------------------------------------------------------
- * Prefer os_malloc/os_free below - they are tracked against the app's budget. Absent on purpose:
- * calloc, exit, abort, atof, atol, bsearch, getenv, system. */
-void* malloc(size_t n);
-void free(void* p);
-void* realloc(void* p, size_t n);
-void qsort(void* base, size_t n, size_t size, int (*cmp)(const void*, const void*));
-int rand(void);
-long random(void);
-int atoi(const char* s);
-float atoff(const char* s); /* float-returning atof; the double atof is not exported */
 long strtol(const char* s, char** end, int base);
-unsigned long strtoul(const char* s, char** end, int base);
 float strtof(const char* s, char** end);
+int rand(void);
 
-/* ---- math, single precision only (exported) ------------------------------------------------
+/* ---- math, single precision only -----------------------------------------------------------
  * The double entry points (sin, cos, pow, exp, log, sqrt, ...) are not exported - use the `f`
- * variants. Absent on purpose (no export AND no instruction): asinf, acosf, log2f, cbrtf, tanhf,
- * ldexpf, copysignf. logf is derived from the exported log10f below. */
+ * variants. sqrt, abs, rounding and logf are inlines below; atan is atan2f(y, 1.0f) and hypot is
+ * sqrtf(x * x + y * y). */
 float sinf(float x);
 float cosf(float x);
 float tanf(float x);
-float sinhf(float x);
-float coshf(float x);
-float asinhf(float x);
-float atanf(float x);
 float atan2f(float y, float x);
 float expf(float x);
 float exp2f(float x);
-float expm1f(float x);
 float log10f(float x);
-float log1pf(float x);
 float powf(float x, float y);
-float pow10f(float x);
 float fmodf(float x, float y);
-float hypotf(float x, float y);
-float frexpf(float x, int* exp);
-float scalbnf(float x, int n);
-long lrintf(float x);
-int finitef(float x);
-float nanf(const char* tag);
-
-#ifdef __cplusplus
-}
-#endif
 
 /* ---- single FPv5 instruction, no import needed ---------------------------------------------- */
 
@@ -183,6 +155,7 @@ static inline float sqrtf(float x) { return __builtin_sqrtf(x); }
 static inline float fabsf(float x) { return __builtin_fabsf(x); }
 static inline float fminf(float x, float y) { return __builtin_fminf(x, y); }
 static inline float fmaxf(float x, float y) { return __builtin_fmaxf(x, y); }
+static inline float clampf(float v, float lo, float hi) { return fminf(fmaxf(v, lo), hi); }
 static inline float ceilf(float x) { return __builtin_ceilf(x); }
 static inline float floorf(float x) { return __builtin_floorf(x); }
 static inline float roundf(float x) { return __builtin_roundf(x); }
@@ -207,12 +180,9 @@ static inline long labs(long x) { return __builtin_labs(x); }
 #define isnan(x) __builtin_isnan(x)
 #define isinf(x) __builtin_isinf(x)
 #define isfinite(x) __builtin_isfinite(x)
-#define isnormal(x) __builtin_isnormal(x)
-#define signbit(x) __builtin_signbit(x)
 
 #define INFINITY __builtin_inff()
 #define NAN __builtin_nanf("")
-#define HUGE_VALF __builtin_inff()
 
 /*
  * Float-suffixed on purpose: with -Werror=double-promotion a double-typed M_PI would make
@@ -221,68 +191,27 @@ static inline long labs(long x) { return __builtin_labs(x); }
 #define M_PI 3.14159265358979323846f
 #define M_PI_2 1.57079632679489661923f
 #define M_PI_4 0.78539816339744830962f
-#define M_1_PI 0.31830988618379067154f
-#define M_2_PI 0.63661977236758134308f
-#define M_TWOPI 6.28318530717958647692f /* non-standard, kept for existing app code */
 #define M_E 2.71828182845904523536f
-#define M_LOG2E 1.44269504088896340736f
-#define M_LOG10E 0.43429448190325182765f
 #define M_LN2 0.69314718055994530942f
 #define M_LN10 2.30258509299404568402f
 #define M_SQRT2 1.41421356237309504880f
 #define M_SQRT1_2 0.70710678118654752440f
 
-/*
- * struct tm exists only as a TYPE. The firmware exports no time entry point at all - not time(),
- * mktime(), localtime(), gmtime(), difftime(), clock() or strftime() - so none are declared:
- * calling one must be a compile error, not a load-time missing import. Portable emulator cores
- * include <time.h> just to name this in an RTC-setter prototype (e.g. Peanut-GB's gb_set_rtc).
- */
-struct tm {
-    int tm_sec;   /* seconds after the minute [0,60] */
-    int tm_min;   /* minutes after the hour [0,59] */
-    int tm_hour;  /* hours since midnight [0,23] */
-    int tm_mday;  /* day of the month [1,31] */
-    int tm_mon;   /* months since January [0,11] */
-    int tm_year;  /* years since 1900 */
-    int tm_wday;  /* days since Sunday [0,6] */
-    int tm_yday;  /* days since January 1 [0,365] */
-    int tm_isdst; /* daylight saving flag */
-};
-
-#endif /* !FIRMWARE_BUILD */
-
-// When building firmware, use native headers
-// When building external apps, use type definitions below
-#ifdef FIRMWARE_BUILD
-#include "os_app_types.h"
-#include "ui_components.h"
-#include "ui_statusbar.h" /* HintActionType for ui_hints_set_active */
-#include "ui_icons.h" /* gfx_icon_id_t / gfx_icon */
-#include "os_ui.h" /* tapp_statusbar_gfx_cb for tape_timeline_set_gfx_cb */
-#else
 // ============================================================================
-// Type Definitions for External Apps
+// Core types
 // ============================================================================
-// NOTE: These types mirror firmware types in os_app_types.h and ui_components.h
-// They are kept in sync via build-time checks to prevent mismatches
+// The firmware's own definitions of these, re-declared so this header stands alone. The firmware
+// build keeps them identical (check_api_abi.py, tapp_abi_pins.h).
 #define PARAM_MAX_OPT_NAME 16
 
 typedef enum {
     ParamValType,
     ParamValScaledType,
     ParamValExactType,
-    ParamValEDivType,
-    ParamValNegativeType,
     ParamValBlockTimeType,
-    ParamValDataSizeType,
     ParamValDBType,
     ParamValSelectType,
     ParamValToggleType,
-    // filt
-    ParamFilterType,
-    ParamFilterSelectType,
-    ParamFilterFreqType,
     ParamValUITotal,
     ParamValDummy,
 } ParamTypeUI_t;
@@ -291,9 +220,9 @@ typedef struct params params_t;
 
 struct params {
 
-    const uint16_t id;
+    uint16_t id;
     const char* name;
-    const ParamTypeUI_t type;
+    ParamTypeUI_t type;
 
     float val;
     float min;
@@ -307,27 +236,23 @@ struct params {
 
     float target;
 
-
     void (*callback)(params_t* param, void* ctx);
 
     const char* option_name[PARAM_MAX_OPT_NAME];
 
-    /* MUST be true for any param you put in a menu: it gates param_update_fast(),
-     * and without it `val` never follows `target` - the menu draws `val`, so the
-     * number sits frozen while the encoder turns. */
-    const bool refresh;
+    /* Gates param_update_fast(): only when true does it move `val` to `target` and fire the
+     * callback. A menu edits `val` and fires the callback itself either way. PARAM_RANGE sets it. */
+    bool refresh;
     bool text_opt;
-    
 };
 
- 
-
 // Opaque firmware types
-typedef struct gfx_t gfx_t;
-typedef uint16_t gfx_uint_t;
-typedef struct os_core_s os_core_t;
+typedef struct gfx_struct gfx_t;
+typedef int16_t gfx_coord_t; /* signed: a shape may start off the left or top edge */
 typedef struct ui_menu ui_menu_t;
-typedef struct ui_notify ui_notify_t;
+/* Notifications: the one callback shape (see ui_notify_confirm) and the toast kinds. */
+typedef void (*ui_notify_cb_t)(void* ctx, bool confirmed);
+typedef enum { NotifyInfo, NotifySuccess, NotifyWarning, NotifyError } ui_notify_kind_t;
 
 // Graphics image types - opaque; produced by the asset pipeline, see examples/demo/assets/
 //
@@ -335,20 +260,19 @@ typedef struct ui_notify ui_notify_t;
 // converts it to a 1-bit asset whose name starts with asset_app_icon, which the
 // firmware reads for menus. Any app_icon* basename works - app_icon_76_76_53.gif
 // is the same icon, the <w>_<h>_<frames> tail is a naming convention the build
-// ignores. Size: exactly 76x76 px, matching the built-in menu icons; color
+// ignores. Size: exactly 76x76 px; color
 // images are dithered to mono; animated GIFs up to 64 frames (760 B/frame - a
 // 53-frame icon is ~40 KB of heap while the menu holds it). Shown full-size in
-// the main-menu cell, looping while tapp is the active source.
+// the main-menu cell, looping while the tapp is the active source.
 //
 // LIST ICON: provide assets/mini_app_icon.png (or .gif - frame 0 is used) for
-// the 16x16 icon beside tapp's name in the input-source list. Exactly
-// 16x16, and a SEPARATE drawing: the list used to downscale the big icon and
-// 76x76 art sampled to row height came out as mush, so a row shows an icon only
-// when you drew one at this size. Without it the row is simply text.
+// the 16x16 icon beside the tapp's name in the input-source list. Exactly
+// 16x16, and a SEPARATE drawing: downscaling 76x76 art to row height produced
+// an illegible result, so a row shows an icon only when one is drawn at this
+// size. Without it the row is text only.
 // The name is mini_app_icon, not app_icon_mini, so that neither asset's name is
 // a prefix of the other - the firmware matches both by prefix.
 typedef struct gfx_img_t gfx_img_t;
-typedef struct gfx_anim_t gfx_anim_t;
 
 struct gfx_img_t {
     const uint16_t width;
@@ -358,12 +282,6 @@ struct gfx_img_t {
     const uint8_t** frames;
 };
 
-struct gfx_anim_t {
-    const gfx_img_t* img;
-    uint8_t frame;
-    uint32_t tick;
-};
-
 // UI menu types
 typedef enum {
     MenuNodeEntry,
@@ -371,16 +289,13 @@ typedef enum {
     MenuNodeCycle,
     MenuNodeParam,
     MenuNodeCustom,
-    MenuNodeTotalTypes,
 } MenuNodeTypeEnum;
 
+/* How a menu looks (ui_menu_set_type). */
 typedef enum {
-    MenuTypeDefault,
-    MenuTypeLarge,
-    MenuTypeWidget,
-    MenuTypeWidgetGfx,
-    MenuTypeCustom,
-    MenuTotalTypes,
+    MenuTypeDefault = 0, /**< right-docked panel; slides in when opened at the root */
+    MenuTypeWidget = 2,  /**< framed popup placed with ui_menu_set_pos(); the selected entry's
+                          *   ui_gfx_cb paints behind it */
 } MenuTypeEnum;
 
 // Forward declare for menu node
@@ -393,32 +308,32 @@ typedef void (*ui_menu_sub_cb)(ui_menu_t* menu);
 typedef void (*ui_menu_redraw_cb)(gfx_t* gfx, ui_menu_t* menu);
 typedef void (*ui_menu_side_redraw_cb)(gfx_t* gfx, void* ctx);
 
-// Menu node structure (for ui_menu_add)
+/* A menu entry, handed to ui_menu_add() BY VALUE: build it on the stack, the menu keeps a copy.
+ * The pointers in it are not copied - see the *_allocated flags. */
 struct ui_menu_node {
-    char* name;
-    bool name_allocated;
+    const char* name;
     const gfx_img_t* icon;
-    bool icon_allocated;
+    ui_menu_node_action_cb callback;  /* MenuNodeCustom: runs when the entry is selected */
+    ui_menu_side_redraw_cb ui_gfx_cb; /* optional: paints the side panel while this entry is the cursor
+                                       * (MenuTypeWidget); ctx = the menu's app_ctx */
+    ui_menu_sub_cb sub_menu;          /* MenuNodeEntry: builder of the submenu it opens */
+    params_t* param;                  /* MenuNodeParam / Switch / Cycle: the value it edits */
+    void* user_data;                  /* caller-owned; read back from `entry` in callback() */
     MenuNodeTypeEnum type;
-    ui_menu_node_action_cb callback;
-    ui_menu_side_redraw_cb ui_gfx_cb;
-    ui_menu_sub_cb sub_menu;
-    params_t* param;
-    void* user_data;
-    bool user_data_allocated;
+    /* Set when the pointer came from os_malloc(): the menu frees it when its entries are
+     * rebuilt (every open re-runs the builder) and when it is destroyed. Leave false for literals,
+     * firmware assets and anything the caller owns. */
+    bool name_allocated, icon_allocated, user_data_allocated;
 };
 
 // Audio engine types (needed for audio callbacks)
-typedef struct engine_struct engine_t;
 typedef struct mixer_s mixer_t;  // Opaque type - use getters below
 
-#ifndef FIRMWARE_BUILD
 /**
  * @brief 2x upsampler state (24 kHz stereo -> 48 kHz stereo).
  *
- * YOU own the state: zero-initialize once (e.g. a model field) and hand the SAME
- * one to every call, so the interpolator stays continuous across block seams.
- * Binary-compatible with firmware.
+ * The caller owns the state: zero-initialize once (e.g. a model field) and pass the
+ * SAME one to every call, so the interpolator stays continuous across block seams.
  */
 typedef struct {
     float prev_l, prev_r;
@@ -430,29 +345,30 @@ typedef struct {
 typedef struct {
     float prev_l, prev_r;
 } dec2x_f32_t;
-#endif // !FIRMWARE_BUILD
 
 // Mixer buffer accessors - use these instead of direct field access.
 float* mixer_get_in(mixer_t* m);    // Get input buffer pointer
-float* mixer_get_out(mixer_t* m);   // Get output buffer pointer (write audio here!)
+float* mixer_get_out(mixer_t* m);   // Get output buffer pointer (audio is written here)
 float* mixer_get_fx(mixer_t* m);    // Get FX send buffer pointer
-uint32_t mixer_get_fs(mixer_t* m);  // Get frame size (total samples, L+R interleaved)
+uint32_t mixer_get_fs(mixer_t* m);  // Samples per buffer this block: L+R interleaved, 2 per frame
+/** Stereo frames in this block: mixer_get_fs() counts L and R separately. */
+static inline uint32_t mixer_frames(mixer_t* m) { return mixer_get_fs(m) >> 1; }
 
 /**
  * @brief The engine-stage FX SEND accumulator
  *
- * From engine process(), ACCUMULATE (`+=`, never `=`) whatever you want the
- * FX chain to hear: the firmware zeroes this bus at the start of every block and
- * hands the PREVIOUS block's contents to the FX graph, so send arrives one
- * block (~2.7 ms). Write-only for a tapp; reading it back tells you nothing useful.
+ * From engine process(), ACCUMULATE (`+=`, never `=`) the signal the FX chain
+ * should receive: the firmware zeroes this bus at the start of every block and
+ * hands the PREVIOUS block's contents to the FX graph, so the send arrives one
+ * block late (~2.7 ms). Write-only for a tapp; reading it back yields nothing useful.
  */
 float* mixer_get_send(mixer_t* m);
 
 /**
  * @brief THE record tap - the bus the device's record head takes this block
  *
- * Record from this, not from mixer_get_in(), and take follows the device's routing
- * for free: it is the same pointer the built-in decks record from.
+ * Recording from this, not from mixer_get_in(), makes the take follow the device's
+ * routing automatically.
  *
  *   - dry            -> the live input (identical to mixer_get_in())
  *   - WET            -> the FX graph's OUTPUT: the input joined the decks' sends in the
@@ -465,16 +381,16 @@ float* mixer_get_send(mixer_t* m);
 float* mixer_get_record(mixer_t* m);
 
 /**
- * @brief Tell the firmware you USED this block's input - call once per block while you
- * print it or analyse it
+ * @brief Tells the firmware the tapp USED this block's input - call once per block while
+ * the input is printed or analysed
  *
  *   1. A heartbeat, not a latch: the firmware clears it every block, so stopping the
  *      calls releases everything below. Direct-safe, free to call.
  *   2. WET: record tap is the FX graph's OUTPUT, and the send and the tap are the
  *      same bus - so while this is raised the sends are ducked out of the processor,
- *      ramping down over ~11 ms and back over ~64 ms when you stop. That is what keeps a
- *      take from re-recording what you send, the same treatment a deck gets. The flip
- *      side: a tapp that feeds mixer_get_send() AND raises this loses its FX return from
+ *      ramping down over ~11 ms and back over ~64 ms when the calls stop. That keeps a
+ *      take from re-recording what the tapp sends, the same treatment a deck gets. As a
+ *      consequence, a tapp that feeds mixer_get_send() AND raises this loses its FX return from
  *      the monitor for those blocks.
  *   3. Sleep evidence: an app whose output is silent leaves the firmware nothing else to
  *      check, so without this 30 s of silent output puts the device to sleep under it.
@@ -498,8 +414,8 @@ void mixer_rec_active(mixer_t* m);
  * (interpolated sample before the original) - cheap, and it dulls content above
  * ~10 kHz. For 12 kHz, cascade two of these through a 24 kHz intermediate.
  *
- * @warning It ADDS into the destination. Zero the destination first if you mean to
- * replace what is there (with WET on, that is the live input).
+ * @warning It ADDS into the destination. Zero the destination first to replace what
+ * is there (with WET on, that is the live input).
  */
 void ups2x_f32_add(ups2x_f32_t* st, const float* src24, float* dst48, uint32_t n24);
 
@@ -517,39 +433,49 @@ void ups2x_f32_add(ups2x_f32_t* st, const float* src24, float* dst48, uint32_t n
 void dec2x_f32(dec2x_f32_t* st, const float* src48, float* dst24, uint32_t n48);
 
 /**
- * @brief The device's INPUT LEVEL param - the same one the built-in apps' "in"
- * volume cell drives. NULL if the mixer is not up.
+ * @brief The device's input level param - the user's **in** level. NULL if the mixer is
+ * not up, or while line in is a MIDI line (settings "line in": TRS A/B), which has no level
+ * then.
  *
  * This is the only knob that moves MONITORING and RECORDING together: it is
  * applied to mixer_get_in() before process() runs, and in mic mode it also
- * sets the codec's dry-monitor gain. A trim of own applied after
- * mixer_get_in() can only change what you record.
+ * sets the codec's dry-monitor gain. A tapp-side trim applied after
+ * mixer_get_in() changes only what is recorded.
  *
  * Hand it straight to ui_hints_set_volume() for an "in" cell, and adjust it with
  * param_write_delta_val() + param_update_fast() so its callback runs (monitor
  * gain, USB, settings save).
  *
  * @warning DEVICE-WIDE and PERSISTENT, like os_audio_switch_input(): this is the
- * user's input setting, saved to settings. Move it in response to a deliberate user action, 
- * not on your own.
+ * user's input setting, saved to settings. Move it only in response to a deliberate user
+ * action, never on the tapp's own initiative.
  */
 params_t* mixer_get_input_vol(mixer_t* m);
 
-/* Engine callbacks structure (must match firmware engine_callbacks_t)
+/**
+ * @brief The app's audio engine, referenced by the descriptor's .engine_cb (see @ref grp_audio).
+ * Every member receives the app model as `ctx`. MIDI and sync are not callbacks: they are read
+ * from the MIDI bus (midi_bus()).
  *
- * ON `is_active` - It is the ONLY thing app
+ *   process      - render one block (see @ref grp_audio for which buffer the app owns)
+ *   tape_changed - the tape was mounted, rebuilt or formatted: re-read tape_size() and
+ *                  anything derived from it. On a mount the app's memory_if.load runs
+ *                  instead, when one is provided.
+ *   active       - engine_set_active() was called: start/stop the app's transport
+ *   is_active    - per block, see below
+ *
+ * ON `is_active` - it is the ONLY input the app
  * contributes to two device-wide decisions: whether the audio DMA parks, and whether the
- * device goes to sleep. It means **"tapp is producing or consuming audio RIGHT NOW"**.
+ * device goes to sleep. It means **"the tapp is producing or consuming audio RIGHT NOW"**.
  *
  *   - A constant `return 1` holds the whole device at full clock - no audio idle, no light
- *     or deep sleep - for as long as app is open. It is not a safe default; it is a
- *     flat battery. (The recorder example shipped exactly that line, which is what prompted
- *     this note.) The firmware now cross-checks a tapp's claim against the mixer output, so
- *     a lie no longer keeps the device awake - but it still keeps the DSP running.
+ *     or deep sleep - for as long as the app is open. It is not a safe default; it drains
+ *     the battery. The firmware cross-checks a tapp's claim against the mixer output, so
+ *     a false claim no longer keeps the device awake - but it still keeps the DSP running.
  *   - Omitting it entirely is read as "always active" for the same reason (the firmware
  *     cannot mute an engine that forgot to declare one), so it has the same cost. Supply it.
- *   - Returning 0 while you ARE sounding is the opposite failure: the DMA parks under you
- *     after a few seconds of silence and process() stops being called.
+ *   - Returning 0 while the tapp IS sounding is the opposite failure: the DMA parks under
+ *     it after a few seconds of silence and process() stops being called.
  *   - An app that only CONSUMES audio leaves nothing on the output to check - raise
  *     mixer_rec_active() on every block whose input it uses (tuner.c does, gated on a
  *     locked note so a hot room floor does not hold the device awake).
@@ -560,62 +486,39 @@ params_t* mixer_get_input_vol(mixer_t* m);
  * the record-tail case.
  */
 typedef struct engine_callbacks_s {
-    void (*init)(os_core_t* core);    /* RESERVED, never called: lifecycle is os_app_data_t's init/deinit */
-    void (*process)(engine_t* restrict engine, mixer_t* restrict mix);
-    void (*defaults)(engine_t* engine);
-    void (*cleanup)(os_core_t* core); /* RESERVED, never called (see init) */
-    void (*active)(engine_t* engine, bool state);
-    uint_fast8_t (*is_active)(engine_t* engine);
-    void (*sync)(engine_t* engine);
-    /* The four below are read only by the tapedecks' own hint code - they are never
-     * reached while a tapp owns the main slot. Leave them NULL. */
-    void (*set_sync)(engine_t* engine, bool state);
-    bool (*is_synced)(engine_t* engine);
-    void (*set_mode)(engine_t* engine, uint_fast8_t mode);
-    uint_fast8_t (*get_mode)(engine_t* engine);
-    void (*midi_cc)(engine_t* engine, uint32_t channel, uint32_t control, uint32_t val);
-    void (*midi_note)(engine_t* engine, uint32_t ch, bool state, uint32_t n, uint32_t vel);
-    void (*midi_pitch_bend)(engine_t* engine, uint32_t channel, int32_t value);
-    void (*midi_aftertouch)(engine_t* engine, uint32_t channel, uint32_t value);
-    void (*midi_prog_change)(engine_t* engine, uint32_t channel, uint32_t program);
-    void (*midi_transport)(engine_t* engine, uint8_t command);
+    void (*process)(void* restrict ctx, mixer_t* restrict mix);
+    void (*tape_changed)(void* ctx);
+    void (*active)(void* ctx, bool state);
+    uint_fast8_t (*is_active)(void* ctx);
 } engine_callbacks_t;
 
-// Key state enum (must match KeyStateEnum in firmware)
+/** on_input()'s button state. */
 typedef enum {
     KEY_STATE_RELEASED = 0,
     KEY_STATE_PRESSED = 1,
-    KEY_STATE_HOLD = 2,
-    KEY_STATE_TOTAL = 3
+    KEY_STATE_HOLD = 2
 } KeyStateEnum;
 
-// App type enum (must match AppTypeEnum in firmware)
-typedef enum {
-    AppWidgetType = 0,
-    AppFullscreenType = 1,
-    AppTypeTotal = 2,
-} AppTypeEnum;
-
 /**
- * @brief Tapp ROLE (independent of the UI AppTypeEnum above). Declared once at
+ * @brief Tapp ROLE. Declared once at
  * file scope with TAPP_DECLARE_TYPE(); tapp-build stamps it into the manifest.
  *
- * UTILITY is the DEFAULT - declare nothing and you get it. A game or tool: you own
- * the whole screen and every button, the firmware reserves no hint cell and imposes
- * no gesture, and you leave by calling os_app_exit() yourself (a BTN4 hold is the
- * convention, but nothing forces it - bind those holds to own controls if your
- * app needs them and offer an exit somewhere else).
+ * UTILITY is the DEFAULT - a tapp that declares nothing gets it. A game or tool: the
+ * tapp owns the whole screen and every button, the firmware reserves no hint cell and
+ * imposes no gesture, and the tapp exits by calling os_app_exit() itself (a BTN4 hold is
+ * the convention, but nothing enforces it - an app that needs those holds may bind them
+ * to its own controls and offer an exit elsewhere).
  *
  * AppTypeStandalone must be DECLARED. It replaces the tape engine as the main app:
  * the firmware owns BTN4/BTN5 holds (quick hints, and the main menu opens OVER
- * you), and you keep drawing underneath it.
+ * the app), and the app keeps drawing underneath it.
  *
  * AppTypeSrc is an audio SOURCE: the firmware keeps the current app running
  * and mixes process() output into the record path.
  *
- * ONE source role, deliberately. Samplerate is NOT part of it - you always
- * get the real 48 kHz bus and, if you work internally at 24 kHz or 12 kHz, you
- * convert own render with ups2x_f32_add() (see @ref grp_audio).
+ * ONE source role, deliberately. Samplerate is NOT part of it - a source always
+ * gets the real 48 kHz bus and, if it works internally at 24 kHz or 12 kHz, it
+ * converts its own render with ups2x_f32_add() (see @ref grp_audio).
  */
 typedef enum {
     AppTypeUtility = 0,    /**< default: owns its screen and buttons, exits itself */
@@ -627,31 +530,26 @@ typedef enum {
  * Expands to a harmless marker typedef; tapp-build greps it into the manifest. */
 #define TAPP_DECLARE_TYPE(t) typedef int __tapp_declare_type_##t
 
-
 // Forward declare app types
 typedef struct os_app os_app_t;
 typedef struct os_app_data os_app_data_t;
 
-// Callback function typedefs (must match firmware)
-typedef bool (*os_app_model_init)(os_app_t* app, va_list args);
-typedef bool (*os_app_model_deinit)(os_app_t* app);
-typedef bool (*os_app_tick)(os_app_t* app);
+/* Descriptor callbacks (struct os_app). */
+typedef bool (*os_app_model_init)(os_app_t* app);  /* return false to abort the launch */
+typedef void (*os_app_model_deinit)(os_app_t* app);
+typedef bool (*os_app_tick)(os_app_t* app);         /* return true to be redrawn */
 typedef void (*os_app_redraw)(gfx_t* gfx, const os_app_t* app);
+typedef void (*on_pause_cb)(os_app_t* app);
+typedef void (*on_resume_cb)(os_app_t* app);
 typedef void (*os_app_storage_mem_cb)(os_app_t* app);
-typedef bool (*os_app_storage_file_cb)(const char* full_path);
-typedef bool (*on_pause_cb)(os_app_t* app);
-typedef bool (*on_resume_cb)(os_app_t* app);
 
-// Memory interface structure (must match os_app_memory_if_t in firmware)
+/* Persistence hooks, see os_app.memory_if below. */
 typedef struct {
     os_app_storage_mem_cb save;
     os_app_storage_mem_cb load;
-    os_app_storage_file_cb open;
-    char* ext;
 } os_app_memory_if_t;
 
-// App data structure (must match os_app_data in firmware)
-// IMPORTANT: Field names changed from alloc/free to init/deinit
+/* The model and its init/deinit: os_app.data, filled in by TAPP_APP(). */
 struct os_app_data {
     void* model;
     /* Firmware allocates + zeroes model_size bytes from fast internal RAM at
@@ -664,120 +562,64 @@ struct os_app_data {
     os_app_model_deinit deinit;  // Deinit called before model deallocation
 };
 
-// Input callback typedef (new unified API)
+// Input callback typedef
 typedef void (*os_app_input_cb)(os_app_t* app, uint8_t button_id, KeyStateEnum state);
 
-// App structure (must match os_app_t in firmware)
-// IMPORTANT: This must match the exact memory layout of firmware's os_app_t
+/* The app descriptor. The firmware copies it ONCE at load; the `app` every callback (init()
+ * included) receives is that copy, stable for the life of the app - compare `app->data`,
+ * never `app == &my_app`. To repaint, return true from tick(); input and focus changes are
+ * granted a frame by the firmware. */
 struct os_app {
-    // Core fields
     char* name;
-    AppTypeEnum type;
     os_app_data_t* data;
     os_app_redraw redraw;
     os_app_tick tick;
-
-    // Input handling
-    os_app_input_cb on_input;              // Recommended: single input handler
-    
+    os_app_input_cb on_input;
     on_pause_cb on_pause;
     on_resume_cb on_resume;
-    void* on_shutdown;    // on_shutdown_cb - firmware-only, keeps the layout aligned
-
-    // Runtime context (managed by firmware)
-    void* ctx;            // App context (not accessible to external apps)
-    bool active;
-    /* Firmware's, not yours: it ORs your tick() return into this every frame, grants one on
-     * input / focus change / an animating menu or popup, and clears it after the paint.
-     * Ask for a repaint by returning true from tick(), not by writing here. */
-    bool needs_redraw;
-    bool service;         // written by firmware
-
-    // Extended features (optional)
-    const gfx_img_t* icon; // for menus, ship assets/app_icon.png|gif instead - see gfx_img_t above
+    /* Optional persistence hooks: load() runs after the app's init() at launch, save() when the
+     * device flushes settings and when the tape is swapped while the app owns the engine. Not
+     * on close - save what matters in deinit(). */
     const os_app_memory_if_t* memory_if;
-    const engine_callbacks_t* engine_cb;
-    void* engine_ctx;
-    /* console_command_t* - the DEBUG-only dev console, firmware-only. Present
-     * unconditionally so the tapp ABI is identical in DEBUG and release builds:
-     * app_menu below sits after these, and gating them would move it. */
-    const void* commands;
-    size_t commands_size;
-    /* Reserved - ignored by the firmware. The per-app row under setup it once
-     * fed is gone; the slot stays so the ABI does not move. Open your own menu
-     * with ui_menu_show() instead. */
-    const ui_menu_node_t* app_menu;
-    /** @name Window mode
-     *  Paint into a RECT on top of the main menu instead of taking the screen -
-     *  the browser-window look. UTILITY tapps only (the default role).
-     *
-     *  Set all four together with `.type = AppWidgetType`. Leave them zero (or
-     *  omit them) to be a normal fullscreen app.
-     *
-     *  @code
-     *  static os_app_t my_app = {
-     *      .name = "notes",
-     *      .type = AppWidgetType,
-     *      .win_x = 100, .win_y = 60, .win_w = 200, .win_h = 170,
-     *      .redraw = my_draw, .tick = my_tick, .on_input = my_input,
-     *  };
-     *  @endcode
-     *
-     *  redraw() is CLIPPED to the rect, **BTN4 and BTN5 HOLD close the window.**
-     *
-     *  @{ */
-    uint16_t win_x, win_y, win_w, win_h;
-    /** @} */
+    const engine_callbacks_t* engine_cb; /* the app's audio engine; its members get the model */
 };
-#endif // !FIRMWARE_BUILD
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 // ============================================================================
-// External App Data Initialization Helper
+// Declaring the app, and the numbers every app needs
 // ============================================================================
 
 /**
- * @brief Initialize os_app_data_t structure for external apps
+ * @brief Declares the whole app in one statement: its name (the launcher's, and the manifest's),
+ *        its model type, init/deinit (NULL when not needed), then any other descriptor field
  *
- * This inline function ensures external apps always provide model_size correctly.
- * It's type-safe and provides compile-time checking.
- *
- * Usage in external app:
- *   typedef struct { int counter; } my_model_t;
- *
- *   static os_app_data_t my_data;
- *
- *   void init_app_data(void) {
- *       os_app_data_init(&my_data, sizeof(my_model_t), my_init, my_deinit);
- *   }
- *
- * Or use designated initializers directly:
- *   static os_app_data_t my_data = {
- *       .model = NULL,
- *       .model_size = sizeof(my_model_t),
- *       .init = my_init,
- *       .deinit = my_deinit,
- *   };
- *
- * @param data Pointer to os_app_data_t to initialize
- * @param model_size Size of the model structure
- * @param init_fn Init function (called after allocation)
- * @param deinit_fn Deinit function (called before deallocation)
+ * The firmware allocates the model ZEROED before init() and frees it after deinit(); every
+ * callback reaches it with os_app_get_model(app), and the engine callbacks receive it as `ctx`.
+ * @code{.c}
+ * TAPP_APP("Tuner", tuner_model_t, tuner_init, NULL,
+ *          .redraw = tuner_redraw, .tick = tuner_tick, .on_input = tuner_input,
+ *          .engine_cb = &tuner_engine);
+ * @endcode
+ * It expands to the os_app_data_t, the os_app_t and the tapp_get_descriptor() entry point;
+ * write those three by hand only for something it cannot say (an app with no model).
  */
-static inline void os_app_data_init(
-    os_app_data_t* data,
-    size_t model_size,
-    os_app_model_init init_fn,
-    os_app_model_deinit deinit_fn
-) {
-    data->model = NULL;
-    data->model_size = model_size;
-    data->init = init_fn;
-    data->deinit = deinit_fn;
-}
+#define TAPP_APP(_name, _model_t, _init, _deinit, ...)                                           \
+    static os_app_data_t __tapp_data = {                                                          \
+        .model_size = sizeof(_model_t), .init = (_init), .deinit = (_deinit)};                    \
+    static os_app_t __tapp_app = {.name = (_name), .data = &__tapp_data, __VA_ARGS__};            \
+    os_app_t* tapp_get_descriptor(void) {                                                         \
+        return &__tapp_app;                                                                       \
+    }                                                                                             \
+    typedef int __tapp_app_declared
+
+/** on_input()'s button ids. BTN_ENCODER fires when the encoder TURNS - its state is always
+ * KEY_STATE_RELEASED; read the motion with os_controls_encoder_get_delta(). */
+enum { BTN1 = 0, BTN2 = 1, BTN3 = 2, BTN4 = 3, BTN5 = 4, BTN_ENCODER = 5 };
+
+/** First screen row below the hint band: app content starts at this row. */
+#define TAPP_CONTENT_Y 48
+
+#define TAPP_SAMPLE_RATE 48000u    /**< every audio buffer, every tapp role */
+#define TAPP_BLOCK_FRAMES_MAX 128u /**< a block is at most this many stereo frames (64 or 128) */
 
 // ============================================================================
 // Graphics API - drawing primitives (from gfx.h)
@@ -785,9 +627,9 @@ static inline void os_app_data_init(
 
 /**
  * @defgroup grp_graphics Graphics API
- * @brief Drawing primitives for the 400x240 monochrome display
+ * @brief Drawing primitives
  *
- * Every call takes the `gfx_t*` redraw callback was handed. There is no cursor and no
+ * Every call takes the `gfx_t*` passed to the redraw callback. There is no cursor and no
  * transform stack: each call takes absolute screen coordinates and paints in the current
  * draw colour.
  *
@@ -796,20 +638,22 @@ static inline void os_app_data_init(
  * The panel is 1-bit and the frame starts cleared to black, so drawing means turning pixels
  * *on*. gfx_set_color() selects what a draw call does to the pixels it touches:
  *
- * - `0` - background: clears them (black)
- * - `1` - foreground: sets them (white). This is the normal drawing colour.
- * - `2` - XOR: inverts whatever is already there, which is how you overlay a cursor or a
+ * - `GFX_COLOR_CLEAR` (0) - background: clears them (black)
+ * - `GFX_COLOR_SET` (1) - foreground: sets them (white). This is the normal drawing colour.
+ * - `GFX_COLOR_XOR` (2) - inverts the existing pixels; used to overlay a cursor or a
  *   playhead without erasing what is underneath.
  *
- * The colour is sticky: it persists across calls and into the next frame. If you change it,
- * set it back to 1 before you return.
+ * Every draw callback (redraw, a hint painter, a menu painter...) starts from the same default
+ * state: colour 1, transparent bitmaps, the default font, and the full drawing area (the
+ * screen, or the tapp's window). Any change lasts until that callback returns - nothing needs
+ * to be restored.
  *
  * @section gfx_coords Coordinate system
  *
  * Origin (0,0) is the top-left pixel, x grows right, y grows down, and the screen is
- * ::SCREEN_WIDTH x ::SCREEN_HEIGHT = 400x240. Coordinates are `gfx_uint_t` (uint16_t) and
- * every primitive clips against the display and the clip window, so drawing partly
- * off-screen is safe.
+ * ::SCREEN_WIDTH x ::SCREEN_HEIGHT = 400x240. Coordinates are `gfx_coord_t`, SIGNED: a shape
+ * may start left of or above the panel, and every primitive clips it against the display and
+ * the clip window - partly off-screen draws the visible part.
  *
  * @section gfx_shades Dithering - grey on a 1-bit panel
  *
@@ -829,7 +673,7 @@ static inline void os_app_data_init(
  *
  * @code{.c}
  * static void my_redraw(gfx_t* gfx, const os_app_t* app) {
- *     my_model_t* m = app->data->model;
+ *     my_model_t* m = os_app_get_model(app);
  *
  *     gfx_set_font(gfx, gfx_nunito_bold_18);
  *     gfx_draw_str(gfx, 20, 40, "hello");
@@ -837,16 +681,13 @@ static inline void os_app_data_init(
  *     gfx_fill_rect_dithered(gfx, 20, 60, 360, 20, 3);  // grey bar
  *     gfx_draw_rect_r(gfx, 20, 60, 360, 20, 4);         // outline over it
  *
- *     gfx_set_color(gfx, 2);                            // XOR the playhead in
+ *     gfx_set_color(gfx, GFX_COLOR_XOR);                // XOR the playhead in
  *     gfx_draw_vline(gfx, 20 + m->cursor, 60, 20);
- *     gfx_set_color(gfx, 1);                            // leave it as you found it
  * }
  * @endcode
  *
  * @{
  */
-
-#ifndef FIRMWARE_BUILD
 
 /**
  * @name Screen geometry
@@ -856,18 +697,12 @@ static inline void os_app_data_init(
 #define SCREEN_HEIGHT 240   /**< Display height in pixels */
 #define SCREEN_CENTER_X 200 /**< Horizontal centre */
 #define SCREEN_CENTER_Y 120 /**< Vertical centre */
-
-#define REELS_SCALE 60
-
-#define X_CENTER ((SCREEN_WIDTH >> 2) + 10)
-#define Y_CENTER 95
 /** @} */
 
 /**
  * @name Circle quadrant flags
  *
- * Bitmask for the `opt` argument of gfx_draw_circle(), gfx_draw_disc() and
- * gfx_draw_circle_dotted(). OR them together to draw part of a circle - a rounded corner is
+ * Bitmask for the `opt` argument of gfx_draw_circle() and gfx_draw_disc(). OR them together to draw part of a circle - a rounded corner is
  * one quadrant - or pass ::GFX_DRAW_ALL for the whole thing.
  * @{
  */
@@ -885,7 +720,7 @@ static inline void os_app_data_init(
  * @param x X coordinate
  * @param y Y coordinate
  */
-void gfx_draw_pixel(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y);
+void gfx_draw_pixel(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y);
 
 /**
  * @brief Horizontal line running right from (x, y)
@@ -893,10 +728,10 @@ void gfx_draw_pixel(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y);
  * @param x Left end
  * @param y Row
  * @param w Length in pixels
- * @note This is the fastest primitive there is - it writes whole framebuffer bytes at a
- * time. Building a fill out of hlines beats building it out of pixels by a wide margin.
+ * @note This is the fastest primitive - it writes whole framebuffer bytes at a time. A
+ * fill built from hlines is substantially faster than one built from pixels.
  */
-void gfx_draw_hline(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w);
+void gfx_draw_hline(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w);
 
 /**
  * @brief Vertical line running down from (x, y)
@@ -905,20 +740,7 @@ void gfx_draw_hline(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w);
  * @param y Top end
  * @param h Length in pixels
  */
-void gfx_draw_vline(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t h);
-
-/**
- * @brief Axis-aligned line in one of four directions
- * @param gfx Graphics context
- * @param x Start X
- * @param y Start Y
- * @param len Length in pixels
- * @param dir 0 = right, 1 = down, 2 = left, 3 = up
- * @note `dir` 0 and 1 are gfx_draw_hline() / gfx_draw_vline() exactly; 2 and 3 are the same
- * lines drawn backwards from (x, y). Call the hline/vline pair directly unless the direction
- * is a runtime value.
- */
-void gfx_draw_hvline(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t len, uint8_t dir);
+void gfx_draw_vline(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t h);
 
 /**
  * @brief Line between two arbitrary points (Bresenham)
@@ -928,7 +750,7 @@ void gfx_draw_hvline(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t len, uin
  * @param x2 Second point X
  * @param y2 Second point Y
  */
-void gfx_draw_line(gfx_t* gfx, gfx_uint_t x1, gfx_uint_t y1, gfx_uint_t x2, gfx_uint_t y2);
+void gfx_draw_line(gfx_t* gfx, gfx_coord_t x1, gfx_coord_t y1, gfx_coord_t x2, gfx_coord_t y2);
 
 /**
  * @brief Line with a thickness, drawn as a stack of parallel lines
@@ -939,7 +761,7 @@ void gfx_draw_line(gfx_t* gfx, gfx_uint_t x1, gfx_uint_t y1, gfx_uint_t x2, gfx_
  * @param y2 Second point Y
  * @param thickness Width in pixels; 1 is gfx_draw_line()
  */
-void gfx_draw_line_thick(gfx_t* gfx, gfx_uint_t x1, gfx_uint_t y1, gfx_uint_t x2, gfx_uint_t y2, uint16_t thickness);
+void gfx_draw_line_thick(gfx_t* gfx, gfx_coord_t x1, gfx_coord_t y1, gfx_coord_t x2, gfx_coord_t y2, uint16_t thickness);
 
 /**
  * @brief Quadratic Bezier curve through 16 straight segments
@@ -951,7 +773,7 @@ void gfx_draw_line_thick(gfx_t* gfx, gfx_uint_t x1, gfx_uint_t y1, gfx_uint_t x2
  * @param x2 End X
  * @param y2 End Y
  */
-void gfx_draw_bezier(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t x1, gfx_uint_t y1, gfx_uint_t x2, gfx_uint_t y2);
+void gfx_draw_bezier(gfx_t* gfx, gfx_coord_t x0, gfx_coord_t y0, gfx_coord_t x1, gfx_coord_t y1, gfx_coord_t x2, gfx_coord_t y2);
 
 /**
  * @brief Rectangle outline
@@ -961,7 +783,7 @@ void gfx_draw_bezier(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t x1, gf
  * @param w Width in pixels
  * @param h Height in pixels
  */
-void gfx_draw_rect(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h);
+void gfx_draw_rect(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h);
 
 /**
  * @brief Rectangle outline with rounded corners
@@ -972,7 +794,7 @@ void gfx_draw_rect(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uin
  * @param h Height in pixels
  * @param r Corner radius; must not exceed half the shorter side
  */
-void gfx_draw_rect_r(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, gfx_uint_t r);
+void gfx_draw_rect_r(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h, uint16_t r);
 
 /**
  * @brief Solid rectangle
@@ -981,9 +803,9 @@ void gfx_draw_rect_r(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_u
  * @param y Top edge
  * @param w Width in pixels
  * @param h Height in pixels
- * @note Filling with colour 0 is how you erase a region before redrawing it.
+ * @note Filling with colour 0 erases a region before it is redrawn.
  */
-void gfx_draw_rect_fill(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h);
+void gfx_draw_rect_fill(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h);
 
 /**
  * @brief Solid rectangle with rounded corners
@@ -994,7 +816,7 @@ void gfx_draw_rect_fill(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gf
  * @param h Height in pixels
  * @param r Corner radius; must not exceed half the shorter side
  */
-void gfx_draw_rect_fill_r(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, gfx_uint_t r);
+void gfx_draw_rect_fill_r(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h, uint16_t r);
 
 /**
  * @brief Rectangle filled with a dither pattern instead of solid colour
@@ -1005,7 +827,7 @@ void gfx_draw_rect_fill_r(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, 
  * @param h Height in pixels
  * @param shade 0-7, see @ref gfx_shades - 0 is the sparsest, 7 the densest
  */
-void gfx_fill_rect_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, uint8_t shade);
+void gfx_fill_rect_dithered(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h, uint8_t shade);
 
 /**
  * @brief Dithered horizontal line
@@ -1015,7 +837,7 @@ void gfx_fill_rect_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w
  * @param w Length in pixels
  * @param shade 0-7, see @ref gfx_shades
  */
-void gfx_draw_hline_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, uint8_t shade);
+void gfx_draw_hline_dithered(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, uint8_t shade);
 
 /**
  * @brief Dithered vertical line
@@ -1025,7 +847,7 @@ void gfx_draw_hline_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t 
  * @param h Length in pixels
  * @param shade 0-7, see @ref gfx_shades
  */
-void gfx_draw_vline_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t h, uint8_t shade);
+void gfx_draw_vline_dithered(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t h, uint8_t shade);
 
 /**
  * @brief Dithered filled circle
@@ -1035,7 +857,7 @@ void gfx_draw_vline_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t 
  * @param r Radius in pixels
  * @param shade 0-7, see @ref gfx_shades
  */
-void gfx_fill_circle_dithered(gfx_t* gfx, gfx_uint_t cx, gfx_uint_t cy, gfx_uint_t r, uint8_t shade);
+void gfx_fill_circle_dithered(gfx_t* gfx, gfx_coord_t cx, gfx_coord_t cy, gfx_coord_t r, uint8_t shade);
 
 /**
  * @brief Dithered rounded rectangle
@@ -1047,7 +869,7 @@ void gfx_fill_circle_dithered(gfx_t* gfx, gfx_uint_t cx, gfx_uint_t cy, gfx_uint
  * @param r Corner radius
  * @param shade 0-7, see @ref gfx_shades
  */
-void gfx_fill_rect_r_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, gfx_uint_t r, uint8_t shade);
+void gfx_fill_rect_r_dithered(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h, gfx_coord_t r, uint8_t shade);
 
 /**
  * @brief Rectangle with a vertical dither gradient
@@ -1059,9 +881,9 @@ void gfx_fill_rect_r_dithered(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t
  * @param shade_top Shade at the top row, 0-7
  * @param shade_bottom Shade at the bottom row, 0-7
  * @note Equal top and bottom shades give a flat fill, so this doubles as
- * gfx_fill_rect_dithered() when you are animating a gradient in and out.
+ * gfx_fill_rect_dithered() when a gradient is animated in and out.
  */
-void gfx_fill_rect_gradient_v_dithered_bayer(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, uint8_t shade_top, uint8_t shade_bottom);
+void gfx_fill_rect_gradient_v_dithered_bayer(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h, uint8_t shade_top, uint8_t shade_bottom);
 
 /**
  * @brief Rectangle with a horizontal dither gradient
@@ -1073,7 +895,7 @@ void gfx_fill_rect_gradient_v_dithered_bayer(gfx_t* gfx, gfx_uint_t x, gfx_uint_
  * @param shade_left Shade at the left column, 0-7
  * @param shade_right Shade at the right column, 0-7
  */
-void gfx_fill_rect_gradient_h_dithered_bayer(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, uint8_t shade_left, uint8_t shade_right);
+void gfx_fill_rect_gradient_h_dithered_bayer(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h, uint8_t shade_left, uint8_t shade_right);
 
 /**
  * @brief Circle outline, whole or by quadrant
@@ -1082,9 +904,8 @@ void gfx_fill_rect_gradient_h_dithered_bayer(gfx_t* gfx, gfx_uint_t x, gfx_uint_
  * @param y0 Centre Y
  * @param r Radius in pixels
  * @param opt Quadrant mask - ::GFX_DRAW_ALL, or an OR of the ::GFX_DRAW_* family
- * @note GFX_DRAW_ALL draws full circle and matches ::GFX_DRAW_UPPER_LEFT | GFX_DRAW_UPPER_RIGHT | GFX_DRAW_LOWER_RIGHT | GFX_DRAW_LOWER_LEFT
  */
-void gfx_draw_circle(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uint8_t opt);
+void gfx_draw_circle(gfx_t* gfx, gfx_coord_t x0, gfx_coord_t y0, uint16_t r, uint8_t opt);
 
 /**
  * @brief Filled circle, whole or by quadrant
@@ -1093,26 +914,18 @@ void gfx_draw_circle(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uin
  * @param y0 Centre Y
  * @param r Radius in pixels
  * @param opt Quadrant mask - ::GFX_DRAW_ALL, or an OR of the ::GFX_DRAW_UPPER_RIGHT family
- * @note GFX_DRAW_ALL draws full circle and matches ::GFX_DRAW_UPPER_LEFT | GFX_DRAW_UPPER_RIGHT | GFX_DRAW_LOWER_RIGHT | GFX_DRAW_LOWER_LEFT
  */
-void gfx_draw_disc(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uint8_t opt);
+void gfx_draw_disc(gfx_t* gfx, gfx_coord_t x0, gfx_coord_t y0, uint16_t r, uint8_t opt);
 
-/**
- * @brief Circle outline drawn as a dotted ring
- * @param gfx Graphics context
- * @param x0 Centre X
- * @param y0 Centre Y
- * @param r Radius in pixels
- * @param opt Quadrant mask - ::GFX_DRAW_ALL, or an OR of the ::GFX_DRAW_UPPER_RIGHT family
- * @note GFX_DRAW_ALL draws full circle and matches ::GFX_DRAW_UPPER_LEFT | GFX_DRAW_UPPER_RIGHT | GFX_DRAW_LOWER_RIGHT | GFX_DRAW_LOWER_LEFT
- */
-void gfx_draw_circle_dotted(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t r, uint8_t opt);
+#define GFX_COLOR_CLEAR 0 /**< clear pixels (black) */
+#define GFX_COLOR_SET 1   /**< set pixels (white) - every draw callback starts with this */
+#define GFX_COLOR_XOR 2   /**< invert pixels */
 
 /**
  * @brief Select what subsequent draw calls do to the pixels they touch
  * @param gfx Graphics context
- * @param color 0 = clear (black), 1 = set (white), 2 = XOR
- * @note Sticky - it survives into the next frame. See @ref gfx_color.
+ * @param color GFX_COLOR_CLEAR, GFX_COLOR_SET or GFX_COLOR_XOR
+ * @note Lasts until the draw callback returns; the next one starts at GFX_COLOR_SET.
  */
 void gfx_set_color(gfx_t* gfx, uint8_t color);
 
@@ -1124,7 +937,7 @@ void gfx_set_color(gfx_t* gfx, uint8_t color);
  * @param str NUL-terminated ASCII/UTF-8 string
  * @return Width drawn, in pixels - add it to x to continue on the same line
  */
-gfx_uint_t gfx_draw_str(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, const char* str);
+uint16_t gfx_draw_str(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, const char* str);
 
 /**
  * @brief printf-style gfx_draw_str()
@@ -1135,20 +948,10 @@ gfx_uint_t gfx_draw_str(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, const char* str)
  * @return Width drawn, in pixels
  * @warning The formatted result is built in a shared 128-byte buffer and truncated to fit.
  * Do not call it from an audio or timer callback while the UI thread may also be drawing.
- * @note `%f` costs far more than the integer conversions. For a value you redraw every
- * frame, scale to an int yourself: `gfx_draw_strf(gfx, x, y, "%d%%", (int)(v * 100))`.
+ * @note `%f` costs far more than the integer conversions. For a value redrawn every
+ * frame, scale to an int explicitly: `gfx_draw_strf(gfx, x, y, "%d%%", (int)(v * 100))`.
  */
-gfx_uint_t gfx_draw_strf(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, const char* fmt, ...);
-
-/**
- * @brief Draw one glyph by character code
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Baseline
- * @param encoding Character code (ASCII, or a Unicode code point in a font that has it)
- * @return Advance width of that glyph in pixels
- */
-uint16_t gfx_draw_glyph(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, uint16_t encoding);
+uint16_t gfx_draw_strf(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, const char* fmt, ...);
 
 /**
  * @brief Select the font for subsequent text calls
@@ -1167,11 +970,11 @@ void gfx_set_font(gfx_t* gfx, const uint8_t* font);
  * @return Width in pixels
  * @code{.c}
  * // centre a label
- * const gfx_uint_t w = gfx_get_str_width(gfx, label);
+ * const uint16_t w = gfx_get_str_width(gfx, label);
  * gfx_draw_str(gfx, SCREEN_CENTER_X - (w >> 1), 120, label);
  * @endcode
  */
-gfx_uint_t gfx_get_str_width(gfx_t* gfx, const char* str);
+uint16_t gfx_get_str_width(gfx_t* gfx, const char* str);
 
 /**
  * @brief Blit a 1-bit XBM bitmap
@@ -1181,42 +984,21 @@ gfx_uint_t gfx_get_str_width(gfx_t* gfx, const char* str);
  * @param w Bitmap width in pixels
  * @param h Bitmap height in pixels
  * @param bitmap XBM data: one bit per pixel, LSB first, each row padded to a whole byte
- * @note The blit is opaque - 0 bits are painted in the opposite colour, so the bitmap's
- * bounding box is fully overwritten. Prefer ui_draw_img(), which takes a ::gfx_img_t from
- * the asset pipeline and knows its own dimensions.
+ * @note TRANSPARENT by default: 1 bits are painted in the current colour, 0 bits are left
+ * alone. gfx_set_bitmap_mode(gfx, false) makes blits opaque (0 bits in the opposite colour)
+ * for the rest of the callback. For assets, prefer ui_draw_img(), which takes a ::gfx_img_t
+ * from the asset pipeline and knows its own dimensions; this is the blit for a bitmap
+ * built at runtime.
  */
-void gfx_draw_xbm(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, const uint8_t* bitmap);
+void gfx_draw_xbm(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h, const uint8_t* bitmap);
 
 /**
- * @brief Blit a bitmap rotated about its own centre
+ * @brief Transparent (default) or opaque bitmap blits, until the draw callback returns
  * @param gfx Graphics context
- * @param x Left edge of the unrotated bounding box
- * @param y Top edge of the unrotated bounding box
- * @param w Bitmap width in pixels
- * @param h Bitmap height in pixels
- * @param bitmap XBM data
- * @param angle Rotation in radians, clockwise
- * @note Per-pixel and transparent, unlike gfx_draw_xbm(): only set bits are painted, and
- * corners can spill outside the original w x h box.
- * @warning This variant reads the bitmap MSB first - the opposite of gfx_draw_xbm() and
- * gfx_draw_xbm_scaled(). Asset-pipeline bitmaps come out mirrored within each byte, so check
- * on device before you build a UI on it.
+ * @param is_transparent true: 0 bits are left alone; false: they are painted in the opposite
+ *        colour, overwriting the bitmap's whole bounding box
  */
-void gfx_draw_xbm_rotated(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, gfx_uint_t h, const uint8_t* bitmap, float angle);
-
-/**
- * @brief Blit a bitmap shrunk by an integer factor
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param bitmap XBM data - note this comes *before* the dimensions here, unlike gfx_draw_xbm()
- * @param w Source bitmap width in pixels
- * @param h Source bitmap height in pixels
- * @param scale Divisor: 2 draws at half size, 3 at a third. 1 is 1:1.
- * @warning `scale` shrinks, it does not magnify - there is no scale-up entry point in the
- * TAPP API. Sampling is nearest-neighbour, so thin 1px features can vanish entirely.
- */
-void gfx_draw_xbm_scaled(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, const uint8_t* bitmap, gfx_uint_t w, gfx_uint_t h, gfx_uint_t scale);
+void gfx_set_bitmap_mode(gfx_t* gfx, uint8_t is_transparent);
 
 /**
  * @brief Restrict drawing to a rectangular window
@@ -1225,32 +1007,28 @@ void gfx_draw_xbm_scaled(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, const uint8_t* 
  * @param y0 Top edge of the window
  * @param x1 Right edge of the window (a coordinate, not a width)
  * @param y1 Bottom edge of the window (a coordinate, not a height)
- * @note Corner-to-corner, not x/y/w/h. The window is sticky and applies to every primitive,
- * so a forgotten clip makes the rest of your UI silently disappear - always pair it with
- * gfx_clip_reset().
+ * @note Corner-to-corner, not x/y/w/h. It narrows the callback's drawing area (the screen,
+ * or the tapp's window/cell - it can never widen it) and lasts until gfx_clip_reset() or
+ * the callback's return.
  * @code{.c}
  * gfx_set_clip(gfx, 10, 40, 390, 200);   // scrolling list body
  * draw_rows(gfx, m);
  * gfx_clip_reset(gfx);
  * @endcode
  */
-void gfx_set_clip(gfx_t* gfx, gfx_uint_t x0, gfx_uint_t y0, gfx_uint_t x1, gfx_uint_t y1);
+void gfx_set_clip(gfx_t* gfx, gfx_coord_t x0, gfx_coord_t y0, gfx_coord_t x1, gfx_coord_t y1);
 
 /**
- * @brief Drop the clip window and draw to the whole screen again
+ * @brief Remove the clip window: restore the whole area this callback draws into (the
+ *        screen, or the tapp's window / hint cell - never beyond it)
  * @param gfx Graphics context
  */
 void gfx_clip_reset(gfx_t* gfx);
-
-#endif // !FIRMWARE_BUILD
 
 /**
  * @brief How many frames have been PAINTED
  * @param gfx Graphics context
  * @return Frame counter, incremented once per frame actually pushed to the display
- * @code{.c}
- * ui_draw_anim(gfx, x, y, (uint16_t)(os_tick_get() / 80), &my_anim); // 80ms per frame
- * @endcode
  */
 uint32_t ui_get_frame(gfx_t* gfx);
 
@@ -1258,14 +1036,14 @@ uint32_t ui_get_frame(gfx_t* gfx);
  * @name Fonts
  * The fonts the firmware exports. Pass one to gfx_set_font().
  *
- * These three are the firmware's own working set (proportional regular, proportional bold,
- * monospace), and they cost tapp nothing - they are already in the firmware image.
+ * Three fonts (proportional regular, proportional bold, monospace). They cost a tapp
+ * nothing: they are already in the firmware.
  *
- * @section own_fonts Shipping own font
+ * @section own_fonts Shipping a custom font
  *
- * Drop a `.ttf`, `.otf` or `.bdf` in `assets/` and the build converts it to a font array your
+ * Drop a `.ttf`, `.otf` or `.bdf` in `assets/` and the build converts it to a font array the
  * tapp can pass straight to gfx_set_font(). The point size comes from the filename - each
- * trailing `_<digits>` group is one size, the same convention the firmware's own fonts use:
+ * trailing `_<digits>` group is one size:
  *
  * @code{.c}
  * // assets/mono_12.ttf      -> asset_mono_12
@@ -1291,44 +1069,42 @@ extern const uint8_t DepartureMono_Regular_10[]; /**< Monospace - counters, nume
  * @defgroup grp_ui UI Components
  * @brief Ready-made widgets - buttons, meters, frames, images - drawn in the firmware's style
  *
- * These sit one level above @ref grp_graphics: each is a small pile of primitives the
- * firmware's own screens use, exported so a tapp looks like it belongs on the device.
- * They take the same `gfx_t*` and obey the same colour and clip state.
+ * These sit one level above @ref grp_graphics: each is a small pile of primitives, so a
+ * tapp looks like it belongs on the device.
+ * They take the same `gfx_t*` and obey the same clip state; ui_draw_frame() and
+ * ui_draw_scrollbar() draw in colour 1 regardless of the current colour.
  *
- * Sizes are mostly fixed by the design rather than by arguments - ui_draw_button() is
- * always 24px tall, ui_draw_scrollbar()'s track always 8px wide - so `x`/`y` place a known
- * shape rather than defining one. Where a widget does take `w`/`h`, they are the outer bounds.
+ * Sizes are mostly fixed by the design rather than by arguments - ui_draw_scrollbar()'s track
+ * is always 8px wide - so `x`/`y` place a known shape rather than defining one. Where a widget
+ * does take `w`/`h`, they are the outer bounds.
  *
  * @section ui_images Images and animations
  *
- * ::gfx_img_t comes out of the asset pipeline: drop a PNG or GIF in tapp's `assets/`
+ * ::gfx_img_t comes out of the asset pipeline: drop a PNG or GIF in the tapp's `assets/`
  * folder and `tapp-build` compiles it into a `gfx_img_t` plus an `extern` declaration in
  * the generated assets header. A GIF becomes a multi-frame image; ui_draw_anim() takes the
- * frame index directly and wraps it, so drive it from os_tick_get() divided down to the frame
- * rate you want - and return `true` from tick() while the animation is playing, or you get no
- * frames to draw it on. (Not ui_get_frame(): that counts paints, so it stalls the moment you
- * stop asking - see its @warning.)
- *
+ * frame index directly and wraps it, so drive it from os_tick_get() divided down to the
+ * desired frame rate - and return `true` from tick() while the animation is playing;
+ * otherwise no frames are scheduled for it. (Not ui_get_frame(): that counts paints, so it
+ * stalls as soon as frames stop being requested.)
  *
  * @code{.c}
  * ui_draw_img(gfx, 20, 20, &asset_logo);
  * ui_draw_anim(gfx, 120, 60, (uint16_t)(os_tick_get() / 80), &asset_dance_party);
- * ui_hints_set_icon(HintPress1, gfx_icon(GfxIconPlay));
+ * ui_hints_set((const tapp_hint_cell_t[HintsActionsTotal]){[HintPress1] = {"play", gfx_icon(GfxIconPlay)}});
  * @endcode
  *
  * @{
  */
 
-#ifndef FIRMWARE_BUILD
-
 /**
- * The device's own glyphs.
+ * System glyphs.
  */
 typedef enum {
-    GfxIconPlay = 0,   /**< play triangle - also what a ">" volume-cell label resolves to */
+    GfxIconPlay = 0,   /**< play triangle */
     GfxIconPause,      /**< pause bars */
     GfxIconRec,        /**< record dot */
-    GfxIconPlayRev,    /**< reverse play - the device's own "previous" arrow */
+    GfxIconPlayRev,    /**< reverse play */
     GfxIconRewind,     /**< rewind, double chevron */
     GfxIconFwd,        /**< fast forward */
     GfxIconRev,        /**< fast reverse */
@@ -1336,18 +1112,18 @@ typedef enum {
     GfxIconLoopEnd,    /**< loop out point */
     GfxIconVolume,     /**< speaker */
     GfxIconVolumeMute, /**< speaker, muted */
-    GfxIconSos,        /**< sound-on-sound / feedback - tapedecks' "fb" cell */
-    GfxIconMic,        /**< microphone - the input glyph when mic is selected */
-    GfxIconJack,       /**< line jack - the input glyph when line is selected */
-    GfxIconFx,         /**< effects (16x16, wider than the rest) */
-    GfxIconWet,        /**< wet / processed signal */
+    GfxIconSos,        /**< sound-on-sound  */
+    GfxIconMic,        /**< microphone */
+    GfxIconJack,       /**< line jack  */
+    GfxIconFx,         /**< effects  */
+    GfxIconWet,        /**< wet */
     GfxIconSpeed,      /**< varispeed */
-    GfxIconChain,      /**< link / sync */
+    GfxIconChain,      /**< link  */
     GfxIconBpm,        /**< tempo */
-    GfxIconApply,      /**< tick - confirm, or the "dry" half of a dry/wet switch */
-    GfxIconBack,       /**< back arrow - also undo */
+    GfxIconApply,      /**< tick  */
+    GfxIconBack,       /**< back arrow */
     GfxIconAdd,        /**< plus */
-    GfxIconRemove,     /**< cross - the device's close glyph */
+    GfxIconRemove,     /**< cross  */
     GfxIconErase,      /**< erase */
     GfxIconEdit,       /**< edit */
     GfxIconCut,        /**< cut */
@@ -1356,14 +1132,15 @@ typedef enum {
     GfxIconSplit,      /**< split */
     GfxIconBookmark,   /**< mark / save */
     GfxIconRedo,       /**< redo */
-    GfxIconMenu,       /**< hamburger - the main menu */
+    GfxIconMenu,       /**< hamburger */
     GfxIconSettings,   /**< cog */
     GfxIconPower,      /**< power */
+    GfxIconRandom,     /**< random */
     GfxIconTotal
 } gfx_icon_id_t;
 
 /**
- * @brief One of the device's own glyphs
+ * @brief One of the system glyphs
  * @param id Which glyph
  * @return A firmware image, or NULL for an id this firmware does not know
  *
@@ -1371,10 +1148,10 @@ typedef enum {
 const gfx_img_t* gfx_icon(gfx_icon_id_t id);
 
 /**
- * The device's own ANIMATIONS.
+ * System animations.
  */
 typedef enum {
-    /** 33x18, 24 frames - the loop badge from the device's own statusbar. Drive the
+    /** 33x18, 24 frames - the statusbar's loop badge. Drive the
      *  index up from 0 and restart it on each loop wrap; the far end of the morph is
      *  where it settles, and ui_draw_anim() wraps, so parking above the count is safe. */
     GfxAnimLoopToPlay = 0,
@@ -1382,7 +1159,7 @@ typedef enum {
 } gfx_anim_id_t;
 
 /**
- * @brief One of the device's own animations
+ * @brief One of the system animations
  * @param id Which animation
  * @return A firmware image with `frame_count > 1`, or NULL for an id this firmware
  *         does not know
@@ -1399,9 +1176,10 @@ const gfx_img_t* gfx_anim(gfx_anim_id_t id);
  * @param x Left edge
  * @param y Top edge
  * @param img Image from the asset pipeline
- * @note Opaque, like gfx_draw_xbm(): the image's whole bounding box is overwritten.
+ * @note Transparent like gfx_draw_xbm(): 1 bits in the current colour, 0 bits left alone
+ *       (gfx_set_bitmap_mode() makes it opaque).
  */
-void ui_draw_img(gfx_t* gfx, uint16_t x, uint16_t y, const gfx_img_t* img);
+void ui_draw_img(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, const gfx_img_t* img);
 
 /**
  * @brief Draw one frame of a multi-frame image
@@ -1412,70 +1190,7 @@ void ui_draw_img(gfx_t* gfx, uint16_t x, uint16_t y, const gfx_img_t* img);
  *              counter is fine
  * @param img Image from the asset pipeline
  */
-void ui_draw_anim(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t frame, const gfx_img_t* img);
-
-/**
- * @brief Draw an image shrunk by an integer factor
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param img Image from the asset pipeline
- * @param scale Divisor: 2 is half size, 3 a third. 1 is 1:1.
- * @warning Shrinks only - see gfx_draw_xbm_scaled(), which this wraps.
- */
-void ui_draw_img_scaled(gfx_t* gfx, uint16_t x, uint16_t y, const gfx_img_t* img, uint16_t scale);
-
-/**
- * @brief Render a pre-encoded QR code
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param size Pixels per QR module - the code ends up `size * modules` square
- * @param qr Buffer in qrcodegen format
- * @warning The encoder is not part of the TAPP API: only this renderer is exported, so you
- * have to produce the qrcodegen buffer yourself (bundle the encoder in your tapp) or bake
- * it in as a constant.
- */
-void ui_draw_qrcode(gfx_t* restrict gfx, uint16_t x, uint16_t y, uint16_t size, const uint8_t* qr);
-
-/**
- * @brief Draw an indexed duration row - "3  1m 24s", or "3  <1s"
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Text baseline
- * @param len Duration in seconds
- * @param idx_l Index printed before the duration
- */
-void ui_draw_time_entry(gfx_t* gfx, uint16_t x, uint16_t y, float len, uint16_t idx_l);
-
-/**
- * @brief Move a position half-way toward a target - one step of an ease-out
- * @param pos Position to advance, updated in place
- * @param target Where it is heading
- * @return true once `*pos` has arrived (and nothing was changed)
- * @note Call it once per frame from tick() and return true while it returns false - that is
- * what keeps the frames coming until it lands. Integer halving, so it lands exactly rather
- * than creeping.
- * @code{.c}
- * static bool my_tick(os_app_t* app) {
- *     my_model_t* m = os_app_get_model(app);
- *     return !ui_ease_position(&m->scroll_y, m->scroll_target); // repaint until it arrives
- * }
- * @endcode
- */
-bool ui_ease_position(uint16_t* pos, uint16_t target);
-
-/**
- * @brief ui_ease_position() with an adjustable step
- * @param pos Position to advance, updated in place
- * @param target Where it is heading
- * @param mod Fraction of the half-step to take: 1.0 matches ui_ease_position(), smaller is
- *            slower. Progress of at least one unit per call is guaranteed.
- * @return true once `*pos` has arrived
- * @note Same contract as ui_ease_position(): drive it from tick() and return true while it
- * still returns false, or it stops part-way.
- */
-bool ui_ease_position_mod(uint16_t* pos, uint16_t target, float mod);
+void ui_draw_anim(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, uint16_t frame, const gfx_img_t* img);
 
 /**
  * @brief Vertical scrollbar with a proportional thumb
@@ -1486,18 +1201,7 @@ bool ui_ease_position_mod(uint16_t* pos, uint16_t target, float mod);
  * @param pos Zero-based index of the selected item
  * @param total Number of items; 0 draws the empty track
  */
-void ui_draw_scrollbar(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t height, uint16_t pos, uint16_t total);
-
-/**
- * @brief Draw a dot positioned around a circle - a knob indicator
- * @param gfx Graphics context
- * @param x Centre X of the circle
- * @param y Centre Y of the circle
- * @param value Position around the circle, 0.0-1.0
- * @param scale Radius the dot orbits at
- * @param size Radius of the dot itself
- */
-void ui_draw_on_circle(gfx_t* gfx, uint16_t x, uint16_t y, float value, uint_fast8_t scale, uint_fast8_t size);
+void ui_draw_scrollbar(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, uint16_t height, uint16_t pos, uint16_t total);
 
 /**
  * @brief Rounded outline, with a double ring when selected
@@ -1510,86 +1214,7 @@ void ui_draw_on_circle(gfx_t* gfx, uint16_t x, uint16_t y, float value, uint_fas
  * @param active true adds two outer rings - the firmware's selection cue. They grow
  *               *outward*, so leave 2px of margin around the frame.
  */
-void ui_draw_frame(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t r, bool active);
-
-/**
- * @brief Button-hint row: a label with a press/hold marker to its left
- * @param gfx Graphics context
- * @param x Left edge of the label
- * @param y Text baseline
- * @param hold true draws the "hold" bar, false the "press" dot
- * @param name Label text
- */
-void ui_draw_action(gfx_t* gfx, uint16_t x, uint16_t y, bool hold, const char* name);
-
-/**
- * @brief ui_draw_action() that can render selected, and reports its width
- * @param gfx Graphics context
- * @param x Left edge of the label
- * @param y Text baseline
- * @param hold true draws the "hold" bar, false the "press" dot
- * @param name Label text
- * @param active true fills a rounded plate behind it and inverts the contents
- * @param tall true makes the plate 22px taller, for two-line rows
- * @return Width of the label text in pixels - use it to lay the next action out
- */
-uint16_t ui_draw_action_act(gfx_t* gfx, uint16_t x, uint16_t y, bool hold, const char* name, bool active, bool tall);
-
-/**
- * @brief Fill a region with random pixels - TV static
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param w Width in pixels
- * @param h Height in pixels
- * @param pixel_size Vertical step between noise rows; 1 is every row
- * @warning Currently draws nothing: the firmware offsets x by the display width, putting
- * every pixel outside the clip window. Build static out of gfx_draw_pixel() until that is
- * fixed.
- */
-void ui_draw_noise_zone(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint_fast8_t pixel_size);
-
-/**
- * @brief Plot a float buffer as a dotted waveform
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param width Plot width in pixels; the buffer is resampled to fit
- * @param height Plot height in pixels - also sets the amplitude scale
- * @param buffer Sample values, roughly -1.0 to 1.0. NULL is ignored.
- * @param size Number of samples in the buffer
- */
-void ui_draw_buffer_dots(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t width, uint16_t height, const float* buffer, size_t size);
-
-/**
- * @brief Copy a string to upper case
- * @param original_str Source string
- * @param uppper Destination buffer
- * @param len Size of the destination buffer including the terminator
- */
-void ui_string_upper(const char* original_str, char* uppper, int8_t len);
-
-/**
- * @brief Copy a string to lower case
- * @param original_str Source string
- * @param upper Destination buffer
- * @param len Size of the destination buffer including the terminator
- */
-void ui_string_lower(const char* original_str, char* upper, int8_t len);
-
-/**
- * @brief ui_draw_frame() over a cleared background - an opaque panel
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param w Width in pixels
- * @param h Height in pixels
- * @param r Corner radius
- * @param active true adds the outer selection rings
- * @note Use this for anything floating over other content; ui_draw_frame() alone leaves
- * whatever was underneath showing through.
- */
-void ui_draw_frame_wback(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t r, bool active);
+void ui_draw_frame(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, uint16_t w, uint16_t h, uint16_t r, bool active);
 
 /**
  * @brief Horizontal bar meter over an integer range
@@ -1602,7 +1227,7 @@ void ui_draw_frame_wback(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_
  * @param min Range minimum
  * @param max Range maximum
  */
-void ui_draw_value_bar(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t val, uint32_t min, uint32_t max);
+void ui_draw_value_bar(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, uint16_t w, uint16_t h, uint32_t val, uint32_t min, uint32_t max);
 
 /**
  * @brief Slim float bar meter, drawn in the lower half of its box
@@ -1615,200 +1240,45 @@ void ui_draw_value_bar(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t 
  * @param min Range minimum
  * @param max Range maximum
  */
-void ui_draw_value_bar_smallf(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, float val, float min, float max);
+void ui_draw_value_bar_smallf(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, uint16_t w, uint16_t h, float val, float min, float max);
+
+/* ---- Mechanical rolling text ------------------------------------------------ */
+
+/** Max animated characters per ui_roll_text_t. */
+#define UI_ROLL_TEXT_MAX 16
 
 /**
- * @brief Rounded box with a black / white / black border stack
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param w Width in pixels
- * @param h Height in pixels
- * @param round Corner radius
- * @note Leaves the draw colour at 1.
+ * @brief Mechanical rolling-TEXT state - split-flap style label animation.
+ *
+ * When the target string changes, each changed character rolls vertically through
+ * a short glyph sequence into place, like a mechanical split-flap display. Cells
+ * are right-indexed (a trailing char keeps its identity as length changes); the
+ * label is right-aligned. The caller owns the state: zero-initialize once (e.g. a
+ * model field) and pass it to every draw call.
  */
-void ui_draw_3layer_box(gfx_t* restrict gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t round);
+typedef struct {
+    char from[UI_ROLL_TEXT_MAX];
+    char tgt[UI_ROLL_TEXT_MAX];
+    float phase[UI_ROLL_TEXT_MAX];
+    uint8_t len;
+    uint8_t inited;
+} ui_roll_text_t;
 
 /**
- * @brief Draw an icon offset by half its own size
- * @param gfx Graphics context
- * @param x Reference X
- * @param y Reference Y
- * @param icon Image to draw; NULL is ignored
- * @note The offset is added, not subtracted: the icon lands with its top-left half a
- * width/height *past* (x, y). Pass the top-left of the box you want it centred in.
+ * @brief Draw a rolling label, right edge at @p x_right, baseline at @p y
+ * @return true while any character is still rolling
+ *
+ * Uses the CURRENTLY-SET gfx font and color. Self-clocked: call once per frame
+ * from redraw() with the desired string - changed characters roll toward it,
+ * mid-flight changes re-aim without a jump. The first-ever draw seeds silently.
+ *
+ * @note This call advances the roll as it paints, so it only moves on painted frames -
+ * tick() must keep returning true until it reports false.
  */
-void ui_draw_icon_centered(gfx_t* restrict gfx, uint16_t x, uint16_t y, const gfx_img_t* icon);
+bool ui_roll_text_draw(gfx_t* gfx, gfx_coord_t x_right, gfx_coord_t y, ui_roll_text_t* c, const char* value);
 
-/**
- * @brief Draw a string centred on the screen, nudged right if it has an icon
- * @param gfx Graphics context
- * @param y Text baseline
- * @param text Label text
- * @param icon Icon that will sit to the left of the text; NULL for text alone
- * @return X the text was drawn at - draw the icon relative to it
- */
-uint16_t ui_draw_text_centered_with_icon(gfx_t* restrict gfx, uint16_t y, const char* text, const gfx_img_t* icon);
-
-/** @brief Output style for ui_format_time() */
-typedef enum {
-    TIME_FORMAT_COMPACT,     /**< "MM:SS.ss" or "HH:MM:SS.ss" - timeline readouts */
-    TIME_FORMAT_VERBOSE,     /**< "Xh Ym Zs" - menu labels */
-} TimeFormatStyle;
-
-/**
- * @brief Format a tape position as a time string
- * @param buff Destination buffer
- * @param size Size of the destination buffer
- * @param val Position in tape positions (SD sectors), as tape_get_position() / 64 returns
- * @param style ::TIME_FORMAT_COMPACT or ::TIME_FORMAT_VERBOSE
- * @note Compact output drops leading zero fields - a sub-minute value comes out "SS.ss".
- */
-void ui_format_time(char* restrict buff, uint32_t size, float val, TimeFormatStyle style);
-
-/** @brief Fill texture for ui_draw_shade_pattern() */
-typedef enum {
-    UI_SHADE_VLINES = 1,          /**< Vertical stripes */
-    UI_SHADE_HLINES,              /**< Horizontal stripes */
-    UI_SHADE_CROSSHATCH,          /**< Horizontals and verticals */
-    UI_SHADE_CHECKER,             /**< Checkerboard */
-    UI_SHADE_DOTS,                /**< Dot grid */
-    UI_SHADE_DIAGONAL,            /**< Diagonals, 45° down-right */
-    UI_SHADE_DIAGONAL_X,          /**< Diagonals both ways */
-    UI_SHADE_CROSSHATCH_FINE,     /**< Cross-hatch at half the spacing */
-    UI_SHADE_CHECKER_LARGE,       /**< Checkerboard in bigger, sparser blocks */
-    UI_SHADE_DOTS_OFFSET,         /**< Staggered dots - a softer grid */
-    UI_SHADE_VDASH,               /**< Vertical dashes */
-    UI_SHADE_HDASH,               /**< Horizontal dashes */
-    UI_SHADE_DOTS_DENSE,          /**< Dots on every other row */
-    UI_SHADE_STIPPLE,             /**< Alternating filled and sparse rows */
-    UI_SHADE_SOLID,               /**< Filled rectangle */
-} ui_shade_pattern_t;
-
-/**
- * @brief Fill a rectangle with a line/dot texture instead of a dither pattern
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param w Width in pixels
- * @param h Height in pixels
- * @param pattern Which texture - see ::ui_shade_pattern_t
- * @param density 1-14, spacing between texture elements - bigger is tighter. 0 draws
- *                nothing at all.
- * @note Distinct from the dithered fills: this is a geometric texture at your chosen
- * spacing, not a grey level. Clipped to the screen internally.
- * @note A pattern outside the enum - 0 included - fills solid.
- */
-void ui_draw_shade_pattern(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui_shade_pattern_t pattern, uint_fast8_t density);
-
-/**
- * @brief Single horizontal level bar
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param width Full-scale width in pixels
- * @param height Box height; the bar is half of it
- * @param values Two floats 0.0-1.0; the louder of the two is drawn
- * @param frame Unused, kept for symmetry with ui_draw_volume_stereo()
- */
-void ui_draw_volume_mono(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t width, uint16_t height, const float* values, bool frame);
-
-/**
- * @brief Two stacked level bars, left over right
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param width Full-scale width in pixels
- * @param height Box height; each bar is a third of it
- * @param values Two floats 0.0-1.0 - `values[0]` left, `values[1]` right
- * @param frame true clears a backing plate first, so the meter stays legible over content
- */
-void ui_draw_volume_stereo(gfx_t* gfx, uint16_t x, uint16_t y, uint16_t width, uint16_t height, const float* values, bool frame);
-
-/**
- * @brief Draw word-wrapped text
- * @param gfx Graphics context
- * @param str Text to draw; "\n" forces a break
- * @param max_chr_per_line Wrap width in characters
- * @param x Left edge
- * @param y Baseline of the first line
- * @return Baseline y of the last line drawn
- * @note Wraps on character count, not pixel width, so pick the limit for the font you have
- * selected.
- * @warning `max_chr_per_line` must stay at or below 100 - the firmware assembles each line in
- * a 101-byte stack buffer and does not bounds-check the limit you pass.
- */
-uint32_t ui_draw_str_multi_line(gfx_t* restrict gfx, const char *str, uint_fast8_t max_chr_per_line, uint32_t x, uint32_t y);
-
-/**
- * @brief Count the lines ui_draw_str_multi_line() would produce
- * @param str Text to measure
- * @param max_chr_per_line Wrap width in characters
- * @return Number of lines
- * @note Use it to size a panel before you draw the text into it.
- */
-uint32_t ui_count_string_lines(const char* str, uint_fast8_t max_chr_per_line);
-
-/**
- * @brief Word-wrapped text revealed a character at a time - the typewriter effect
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Baseline of the first line
- * @param count How many characters to reveal; raise it each frame to type the text out -
- *              and return true from tick() while it is still typing, or the reveal stalls
- *              at whatever character the last painted frame reached
- * @param max_chars_per_line Wrap width in characters
- * @param text Text to draw
- */
-void ui_draw_dialogue_multiline_string(gfx_t* restrict gfx, uint_fast8_t x, uint_fast8_t y, uint16_t count, uint16_t max_chars_per_line, const char* restrict text);
-
-/**
- * @brief Draw an empty speech bubble - rounded panel plus a tail below it
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param width Bubble width in pixels
- * @param height Bubble height in pixels; the tail hangs about 15px below that
- * @note Draws the container only. Follow it with ui_draw_dialogue_multiline_string() for
- * the text.
- */
-void ui_draw_dialogue(gfx_t* restrict gfx, uint16_t x, uint16_t y, uint16_t width, uint16_t height);
-
-/**
- * @brief Filled button, 24px tall, with centred text or an icon
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param w Button width in pixels
- * @param text Label, centred; ignored when `icon` is non-NULL
- * @param icon Icon to draw instead of the label, or NULL
- * @param pressed true shifts the face 2px up-left for the pressed look
- */
-void ui_draw_button(gfx_t* restrict gfx, const uint16_t x, const uint16_t y, const uint16_t w, const char* text, const gfx_img_t* icon, const bool pressed);
-
-/**
- * @brief ui_draw_button() with the fill and outline swapped
- * @param gfx Graphics context
- * @param x Left edge
- * @param y Top edge
- * @param w Button width in pixels
- * @param text Label, centred; ignored when `icon` is non-NULL
- * @param icon Icon to draw instead of the label, or NULL
- * @param pressed true shifts the face 2px up-left for the pressed look
- */
-void ui_draw_button_inverted(gfx_t* restrict gfx, const uint16_t x, const uint16_t y, const uint16_t w, const char* text, const gfx_img_t* icon, const bool pressed);
-
-/**
- * @brief On/off toggle
- * @param gfx Graphics context
- * @param x Reference X - the switch body starts 25px to the right of it
- * @param y Reference Y - the body sits *above* it, from y-17 to y+2
- * @param val Switch state
- * @param detailed true marks the body O for off and I for on
- */
-void ui_draw_switch(gfx_t* restrict gfx, uint16_t x, uint16_t y, bool val, bool detailed);
-
-#endif // !FIRMWARE_BUILD
+/** Set the label instantly, no roll (e.g. when the thing being named changes identity). */
+void ui_roll_text_snap(ui_roll_text_t* c, const char* value);
 
 /** @} */ // end of grp_ui
 
@@ -1829,7 +1299,7 @@ void ui_draw_switch(gfx_t* restrict gfx, uint16_t x, uint16_t y, bool val, bool 
  * @note Memory is limited - always check return values
  * @note Large blocks may be served from external PSRAM, which is write-back cached and
  *       fine to use at audio rate (delay lines, sample buffers). Internal RAM still has
- *       the lowest worst-case latency, so keep your very hottest per-sample state small -
+ *       the lowest worst-case latency, so keep the hottest per-sample state small -
  *       smaller blocks are more likely to land internal.
  *
  * @code{.c}
@@ -1856,78 +1326,47 @@ void os_free(void* ptr);
 
 /**
  * @defgroup grp_app Application Control
- * @brief Application lifecycle management
- *
- * These functions control the application lifecycle and provide access
- * to the application's data model.
+ * @brief Lifecycle, the app's model, window mode and the clock
  *
  * @section app_lifecycle Lifecycle
- * 1. Firmware allocates memory for model (model_size bytes)
- * 2. init() callback is called if provided
- * 3. App runs: tick() every frame; redraw() only on frames tick() returned true for, plus
- *    the ones firmware grants (input, focus change, an animating menu or popup)
- * 4. deinit() callback is called before exit
- * 5. Firmware frees model memory
  *
- * @section Display
+ * - **Launch:** the model is allocated and zeroed, then `init()` runs, then the app's
+ *   `memory_if.load()`. If `init()` returns false the launch stops and `deinit()` is not called.
+ * - **Running:** `tick()` runs every frame. `redraw()` runs on frames where `tick()` returned
+ *   true, and on input, focus changes and menu animations. `on_pause()` / `on_resume()` bracket
+ *   the main menu opening over the app.
+ * - **Close:** the app's engine is stopped, `deinit()` runs, the model is freed.
  *
- * The firmware derives the statusbar, the hints and the tape timeline from your
- * ROLE
+ * A source app loads in the background and comes on screen when its main menu cell is pressed.
  *
- * | role       | statusbar | hints        | timeline | BTN4/BTN5 holds |
- * |------------|-----------|------------------|----------|-----------------|
- * | utility    | on        | hidden           | off      | yours           |
- * | utility, window mode | menu's | menu's, unless you claim it | menu's | close the window |
- * | standalone | on        | hidden until a hold | off   | firmware's (quick hints / menu) |
- * | source     | off       | shown, unlatched | off      | firmware's (prev/next, back/exit) |
+ * @section app_display Screen defaults per app type
  *
- * Those are DEFAULTS, not prohibitions. ui_hints_show(), ui_statusbar_show() and
- * tape_timeline_show() each override one of them, and **your call is remembered**:
- * the firmware records it against your image and replays it every time it re-derives
- * the screen, so one call in init() holds for the whole session. You do not need an
- * on_resume() to nurse it.
+ * | type             | statusbar  | hints              | BTN4 / BTN5 hold         |
+ * |------------------|------------|--------------------|--------------------------|
+ * | utility          | shown      | hidden             | sent to the app          |
+ * | utility (window) | the menu's | the menu's         | close the window         |
+ * | standalone       | shown      | shown on a hold    | quick hints / main menu  |
+ * | source           | hidden     | shown              | main menu / tape screen  |
  *
- * Recommendations, in the order they usually matter:
+ * Full-screen apps start with the tape timeline off.
  *
- * - **Reserve the top 60px.** The band lives there whenever it is up, including when
- *   a hold reveals it over you. Draw below it, or hide it and mean it.
- * - **Say what you want once, in init().** The exception is a SOURCE tapp, whose
- *   init() runs off-screen - say it from your first tick() or on_resume() instead.
- * - **Rebuild your labels on every state change**, not once. Icons
- *   (ui_hints_set_icon), switches (ui_hints_set_switch) and cell painters
- *   (ui_hints_set_gfx_cb) all survive a ui_hints_set_labels() rebuild, so the
- *   rebuild-per-press idiom is cheap and is what the examples do.
- * - **Do not draw your own hint bar.** The band is a real widget with a slide
- *   animation, press feedback and the system's two hold cells; a hand-drawn strip
- *   gets painted over by it the moment anything reveals it.
- * - **The timeline is opt-in and per-image.** tape_timeline_show(true) is remembered
- *   against you, so it survives a menu round-trip; a menu SUBMENU still hides it,
- *   because a submenu takes the screen rather than overlaying it.
- * - **A window-mode tapp owns none of it by default** - the menu underneath does. Never
- *   call ui_statusbar_show() from one. The hints is the one surface you may take, and
- *   you take it PER CELL: ui_hints_set_labels() claims only the slots you name, while every
- *   slot left NULL or "" keeps the menu's own label, drawn dimmed. So name the buttons you
- *   handle - one is fine. A window with no controls at all should say nothing.
+ * To change a default, call ui_statusbar_show(), ui_hints_show() or tape_timeline_show() once,
+ * in `init()`. The firmware remembers the call for the rest of the session. A source app's
+ * `init()` runs off-screen, so make these calls from its first `tick()` instead.
  *
- * @section window_mode Window mode - painting over the main menu
+ * - **Draw from TAPP_CONTENT_Y down.** The hint band sits above that line whenever it is up.
+ * - **Call ui_hints_set() whenever the app's state changes.** It sets the whole band and is cheap.
+ * - **Don't draw your own hint bar.** The real band slides over it as soon as a hold reveals it.
  *
- * A UTILITY tapp can paint into a RECT on top of the still-visible main menu instead
- * of taking the screen - the browser-window look. Declare a rect on your descriptor
- * together with AppWidgetType; that is the whole opt-in.
+ * @section window_mode Window mode
  *
- * @code{.c}
- * static os_app_t my_app = {
- *     .name  = "notes",
- *     .type  = AppWidgetType,
- *     .win_x = 100, .win_y = 60, .win_w = 200, .win_h = 170,
- *     .data = &my_data, .redraw = my_draw, .tick = my_tick, .on_input = my_input,
- * };
- * @endcode
+ * A utility app can draw in a rectangle over the main menu instead of taking the whole screen:
+ * call os_app_set_window() first thing in `init()`. The menu underneath keeps its statusbar and
+ * hint band. The app may label single hint cells with ui_hints_set(); cells it leaves empty
+ * keep the menu's label, dimmed. A window must not call ui_statusbar_show().
  *
- * AppWidgetType alone is not enough, and a zero-size rect means fullscreen.
- *
- * examples/leds/ is a window whose whole UI is its own ui_menu_t, 
- * and examples/tuner.c claims exactly one - BTN1, switching the input between line and mics.
+ * Examples: `examples/leds/` (a window with its own menu) and `examples/tuner.c` (one hint
+ * cell, BTN1).
  *
  * @{
  */
@@ -1935,10 +1374,31 @@ void os_free(void* ptr);
 /**
  * @brief Exit the current app programmatically
  *
- * Call this to cleanly exit your application. The deinit() callback
- * will be called before the app is unloaded.
+ * Closes the app. `deinit()` runs before it is unloaded.
  */
 void os_app_exit(void);
+
+/**
+ * @brief Draw in a rectangle over the main menu instead of the whole screen. Utility apps only.
+ * @param x Left edge, in pixels.
+ * @param y Top edge, in pixels. 48 or more, below the hint band.
+ * @param w Width, at least 40 pixels.
+ * @param h Height, at least 24 pixels.
+ *
+ * Call it first in `init()`, before any `ui_hints_*` call. The rectangle must fit on screen. A
+ * refused call is logged and the app runs full screen.
+ *
+ * `redraw()` is clipped to the rectangle. Holding BTN4 or BTN5 closes the window; presses still
+ * reach the app.
+ *
+ * @code{.c}
+ * static bool my_init(os_app_t* app) {
+ *     os_app_set_window(100, 60, 200, 170);
+ *     return true;
+ * }
+ * @endcode
+ */
+void os_app_set_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
 /**
  * @brief Get app's model data
@@ -1968,9 +1428,9 @@ void* os_app_get_model(const os_app_t* app);
  */
 uint32_t os_tick_get(void);
 
-/* NOTE: os_delay()/os_delay_until() are deliberately not exposed. Your tick(),
+/* NOTE: os_delay()/os_delay_until() are deliberately not exposed. A tapp's tick(),
  * redraw() and on_input() all run on the OS controls task, so blocking inside one
- * freezes buttons and the encoder for the entire device, not just your app. Time
+ * freezes buttons and the encoder for the entire device, not just the app. Time
  * things by comparing os_tick_get() across ticks, as above. */
 
 /** @} */
@@ -1986,7 +1446,7 @@ uint32_t os_tick_get(void);
  * @brief The four RGB LEDs - driven directly, or through the OS pattern engine
  *
  * The device has 4 RGB LEDs, indexed 0-3. The OS runs its own animations on them, so stop
- * whatever is playing before you drive them yourself:
+ * whatever is playing before driving them directly:
  *
  * @code{.c}
  * os_led_stop_current();               // once, in init()
@@ -1995,14 +1455,14 @@ uint32_t os_tick_get(void);
  *
  * @section led_patterns Patterns versus direct writes
  *
- * Writing from tick() is the simple route and costs you nothing but the call. For anything
+ * Writing from tick() is the simple route and costs nothing but the call. For anything
  * that animates on its own clock, hand the OS a ::led_pattern_t instead: the LED task steps
- * it on its own timer, so the animation keeps running at a steady rate even when your tick()
- * is busy, and it survives a frame you skip.
- * Check examples/leds/ for led patterns usage example
+ * it on its own timer, so the animation keeps running at a steady rate even when the app's
+ * tick() is busy, and it survives a skipped frame.
+ * See examples/leds/ for a pattern usage example.
  *
- * @note Nothing restores the OS patterns when your app exits. Put the device back the way you
- * found it in deinit() - either write the LEDs yourself or call os_led_stop_current().
+ * @note When the app exits the firmware blanks the LEDs and re-pushes the pattern that was
+ * running before it - there is nothing to restore in deinit().
  *
  * @{
  */
@@ -2011,9 +1471,8 @@ uint32_t os_tick_get(void);
  * @brief Set one LED's colour
  * @param led_num LED index, 0-3
  * @param red,green,blue 0-255
- * @note The driver latches: an LED keeps its last written colour until you
- * change it. Nothing restores OS patterns when your app exits, so set the LEDs
- * back or call os_led_stop_current() in deinit().
+ * @note The driver latches: an LED keeps its last written colour until it is changed
+ * (or the app exits - the firmware blanks and restores then).
  */
 void hal_led_set_rgb(const uint8_t led_num, const uint8_t red, const uint8_t green,
                      const uint8_t blue);
@@ -2023,11 +1482,10 @@ void hal_led_set_rgb(const uint8_t led_num, const uint8_t red, const uint8_t gre
  */
 void os_led_stop_current(void);
 
-#ifndef FIRMWARE_BUILD
 /* Pattern playback --------------------------------------------------------
- * The same engine the firmware's own LED animations run on. You describe a
- * pattern as a step count plus a callback; the OS LED task advances it on its
- * own timer, so nothing has to happen in your tick().
+ * A pattern is
+ * described as a step count plus a callback; the OS LED task advances it on its
+ * own timer, so nothing has to happen in the app's tick().
  *
  *   static void my_cb(const os_led_t* led, const void* ctx) {
  *       uint8_t s = os_led_get_step(led);
@@ -2043,7 +1501,7 @@ void os_led_stop_current(void);
  *  a tapp can do with the pointer is pass it to os_led_get_step(). */
 typedef struct os_led_t os_led_t;
 
-/** Invoked once per step, on the OS LED task (not your app's task). */
+/** Invoked once per step, on the OS LED task (not the app's task). */
 typedef void (*led_step_callback)(const os_led_t* led, const void* ctx);
 
 typedef struct led_pattern_t led_pattern_t;
@@ -2051,7 +1509,8 @@ typedef struct led_pattern_t led_pattern_t;
 struct led_pattern_t {
     led_step_callback callback; /**< step handler (required) */
     const void* ctx;            /**< passed straight through to the callback */
-    const size_t steps;         /**< steps before the pattern completes */
+    const size_t steps;         /**< steps before the pattern completes - at most 255 (the
+                                 *   step counter is 8-bit; more never completes) */
     uint32_t rate;              /**< ms per step (0 = OS default) */
     led_pattern_t* next;        /**< optional pattern to chain into on completion */
     bool loop;                  /**< restart on completion instead of stopping */
@@ -2064,11 +1523,10 @@ uint8_t os_led_get_step(const os_led_t* led);
 
 /**
  * @brief Start a pattern, replacing whatever is currently playing
- * @param ctx when non-NULL, overrides the pattern's own ctx for this run
+ * @param ctx becomes the pattern's ctx for this run (NULL clears it) - the callback reads it
  * @note The pattern outlives the call - give it static storage, not a local.
  */
 void os_led_set_pattern(led_pattern_t* pattern, const void* ctx);
-#endif /* !FIRMWARE_BUILD */
 
 /** @} */ // end of grp_led
 
@@ -2083,23 +1541,37 @@ void os_led_set_pattern(led_pattern_t* pattern, const void* ctx);
  * The storage API provides file I/O for reading and writing files on the SD card.
  *
  * @section storage_paths Path Format
- * - Paths start with "/" - but that root is YOUR OWN folder, not the card's.
- *   Everything you write goes to `.data/<appname>/` and cannot leave it.
+ * - Paths start with "/" - but that root is the tapp's OWN folder, not the card's.
+ *   Every write goes to `.data/<appname>/` and cannot leave it.
  * - Example: `"/data.bin"` is the card's `.data/<appname>/data.bin`
  * - A leading "/" is optional: `"/save.pb"` and `"save.pb"` are the same file
- * - Maximum path length: about 240 characters (255 minus your folder prefix).
+ * - A write creates the folders it needs; storage_mkdir() is only for an empty folder.
+ * - Maximum path length: about 240 characters (255 minus the tapp's folder prefix).
  *   An over-long path is REFUSED, never silently truncated.
  *
  * @section storage_reads Reads
  *
  * A read (storage_read_file, storage_file_exists, storage_file_size,
- * storage_list_dir) looks in your folder first and falls back to the path as given
- * if nothing is there. That is what lets you load a file the user picked with
- * browser_open, or a ROM/sample/WAV sitting anywhere on the card.
+ * storage_list_dir) looks in the tapp's folder first and falls back to the path as given
+ * if nothing is there. This allows loading a file the user picked with browser_open, or a
+ * ROM/sample/WAV located anywhere on the card. For a folder it is all-or-nothing: once the
+ * tapp's folder has a directory of that name, storage_list_dir lists only that one, never the
+ * card's - so a tapp must not create a folder named like a card folder the user is expected
+ * to fill.
  *
  * Writes have no such fallback: storage_write_file, storage_append_file,
- * storage_delete_file and storage_mkdir always act inside your folder. You cannot
+ * storage_delete_file and storage_mkdir always act inside the tapp's folder. A tapp cannot
  * modify or delete anything belonging to the user or to the firmware.
+ *
+ * @section storage_envelope Safe writes
+ *
+ * storage_write_file() writes ATOMICALLY and wraps the data in a 16-byte integrity envelope
+ * (magic + length + CRC32): the write goes through "<path>.tmp" and the previous version is
+ * kept as "<path>.bak" - those siblings must be left untouched, they provide crash recovery.
+ * storage_read_file() and storage_file_size() strip the envelope, so a write/read round-trip
+ * returns exactly the bytes written, and fall back to the .bak copy if the file is damaged.
+ * Foreign/raw files (assets, ROMs, files not written with storage_write_file()) read
+ * back raw, partial reads allowed.
  *
  * @{
  */
@@ -2134,20 +1606,6 @@ typedef bool (*browser_callback_t)(const char* path);
  */
 bool browser_open(const char* start_path, const char* file_extension, browser_callback_t callback);
 
-// ============================================================================
-// Safe File I/O (Storage API)
-// ============================================================================
-//
-// Files written with storage_write_file() carry a 16-byte integrity envelope
-// (magic + length + CRC32) and are written ATOMICALLY: the previous version is
-// kept as "<path>.bak" and the write goes through "<path>.tmp" - you will see
-// those sibling files next to yours; leave them alone, they are your crash
-// recovery. storage_read_file() and storage_file_size() understand the
-// envelope transparently: a write/read round-trip returns exactly the bytes
-// you wrote, and reads fall back to the .bak copy if your file is damaged.
-// Foreign/raw files (assets, ROMs, files you did not write with
-// storage_write_file) read back raw, partial reads allowed.
-
 /**
  * @brief Read entire file into buffer
  * @param path File path (max 255 chars)
@@ -2155,9 +1613,8 @@ bool browser_open(const char* start_path, const char* file_extension, browser_ca
  * @param buffer_size Size of output buffer
  * @return Number of bytes read, or 0 on error
  *
- * For a file written by storage_write_file() this returns the PAYLOAD (the
- * integrity envelope is verified and stripped, with automatic .bak fallback);
- * any other file returns its raw bytes, truncated to buffer_size if larger.
+ * For a file written by storage_write_file() this returns the PAYLOAD (see
+ * @ref storage_envelope); any other file returns its raw bytes, truncated to buffer_size.
  *
  * @code{.c}
  * uint8_t data[1024];
@@ -2176,9 +1633,8 @@ uint32_t storage_read_file(const char* path, void* buffer, size_t buffer_size);
  * @param size Number of bytes to write (must be > 0)
  * @return Number of bytes written, or 0 on error
  *
- * Atomic + integrity-enveloped: crash-safe, previous version kept as
- * "<path>.bak". Read the file back with storage_read_file() - a raw reader
- * would see the 16-byte envelope prepended.
+ * Atomic and integrity-enveloped (see @ref storage_envelope): read it back with
+ * storage_read_file() - a raw reader would see the 16-byte envelope prepended.
  */
 uint32_t storage_write_file(const char* path, const void* buffer, size_t size);
 
@@ -2201,7 +1657,7 @@ uint32_t storage_append_file(const char* path, const void* buffer, size_t size);
  * @return true on success, false if file doesn't exist or error
  *
  * Deletes only <path> itself - a "<path>.bak" sibling from storage_write_file
- * is left behind (harmless for reads; delete it too if you want no trace).
+ * is left behind (harmless for reads; delete it as well to leave no trace).
  */
 bool storage_delete_file(const char* path);
 
@@ -2245,14 +1701,14 @@ uint32_t storage_file_size(const char* path);
  * @endcode
  *
  *   @note **The order is the filesystem's**, which on FAT is directory-entry order -
- *   arbitrary, and it changes as files are created and deleted. If you index
- *   anything by position (a saved preset pointing at "kit 3", say), SORT the
- *   names first, or that preset will point somewhere else after a copy.
+ *   arbitrary, and it changes as files are created and deleted. If anything is indexed
+ *   by position (a saved preset pointing at "kit 3", for example), SORT the
+ *   names first, or that preset will point elsewhere after a copy.
  *
- *   @note **Your own `.bak` files are already excluded.** storage_write_file() leaves
+ *   @note **The tapp's own `.bak` files are already excluded.** storage_write_file() leaves
  *   `<path>.bak` and `<path>.tmp` beside what it writes; `ext` matches the END
  *   of the name, so ".wav" does not match "kit.wav.bak". Passing NULL for `ext`
- *   turns that off and you will see them.
+ *   turns that off and they are listed.
  *
  *   @note Directories, hidden files and dotfiles never appear. Blocks on the SD card,
  *   so treat it like storage_read_file(): init() or tick(), never process().
@@ -2273,24 +1729,22 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  *
  * There is no settings API - persistence is the @ref grp_storage calls plus a convention. This
  * page is that convention: when to save, where to put the file, and how to lay out its bytes so
- * that shipping a new version of your tapp does not orphan everyone's settings.
+ * that shipping a new version of a tapp does not orphan settings saved by earlier versions.
  *
  * A complete working app is at `examples/persistence/`.
  *
- * @section persist_lifecycle Nothing saves for you
+ * @section persist_lifecycle When to save
  *
- * A tapp gets no automatic save hook. The `memory_if` field of your descriptor looks like one, but
- * the loader overwrites whatever you put there with its own interface, whose save and load
- * callbacks are NULL - so the firmware never asks your tapp to persist anything. That field is how
- * the loader recognises an external app; it is not yours to use.
- *
- * The whole contract is therefore two calls of your own:
+ * The `memory_if` hooks on the descriptor are optional: load() runs after the tapp's init() at
+ * launch, save() when the device flushes its settings and when the tape is swapped while the tapp
+ * owns the engine - never on close. The dependable contract is therefore two calls made by the
+ * tapp itself:
  *
  * - load in `init()`, and fall back to defaults when the file is missing or rejected
  * - save in `deinit()`
  *
  * `deinit()` runs on a normal exit. It does not run if the battery dies, so anything the user
- * would be upset to lose should also be written at the moment it changes - or behind an explicit
+ * would not want to lose should also be written at the moment it changes - or behind an explicit
  * "save" button, which is what the example does.
  *
  * @warning Never touch storage from `process()`. Every call here blocks on the SD card for
@@ -2299,9 +1753,9 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  *
  * @section persist_paths Where to put the file
  *
- * Wherever you like - you get a private folder and every write lands in it. The firmware rewrites
- * your path to `.data/<appname>/<your path>` on the card, where `<appname>` comes from your
- * manifest name. You cannot write outside it:
+ * Any path may be used - each tapp has a private folder and every write lands in it. The firmware
+ * rewrites the path to `.data/<appname>/<path>` on the card, where `<appname>` comes from the
+ * manifest name. Writes cannot reach outside it:
  *
  * @code{.c}
  * #define MY_FILE "/settings.pb"   // -> .data/myapp/settings.pb on the card
@@ -2312,8 +1766,8 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  * `.data/` is hidden but sits at the card root, so a user can still copy a save off over USB.
  *
  * Reading is not restricted the same way: a read falls back to the card when the file is not in
- * your folder, which is what keeps browser_open results and foreign assets (ROMs, samples, WAVs)
- * loadable. See @ref storage_reads.
+ * the tapp's folder, which is what keeps browser_open results and foreign assets (ROMs, samples,
+ * WAVs) loadable. See @ref storage_reads.
  *
  * @section persist_blob The quick way: a fixed struct
  *
@@ -2337,9 +1791,9 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  * }
  * @endcode
  *
- * The catch is that adding a field invalidates every file already written. Bump the magic and old
- * saves are discarded; forget to, and they are misread. That is fine for a high score and painful
- * for a settings page.
+ * The limitation is that adding a field invalidates every file already written. Bumping the magic
+ * discards old saves; omitting the bump makes them misread. That is acceptable for a high score and
+ * costly for a settings page.
  *
  * @note Test the write result as `> 0`, never `== size`. On device `storage_write_file()` returns
  *       the byte count.
@@ -2347,10 +1801,10 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  * @section persist_proto The durable way: a .proto schema
  *
  * Protobuf stores field numbers rather than offsets, so a reader skips fields it does not know and
- * defaults the ones that are absent. Add a field, ship an update, and last week's file still
- * loads. The cost is roughly 4KB of nanopb runtime in your tapp.
+ * defaults the ones that are absent. A field can be added in an update and files written by
+ * earlier versions still load. The cost is roughly 4KB of nanopb runtime in the tapp.
  *
- * Drop a `.proto` next to your `.c` and `tapp-build` does the rest:
+ * Place a `.proto` next to the tapp's `.c`; `tapp-build` handles the rest:
  *
  * @code{.c}
  * // myapp/settings.proto
@@ -2388,9 +1842,9 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  * }
  * @endcode
  *
- * Things worth knowing before you reach for it:
+ * Notes before adopting it:
  *
- * - **nanopb is not bundled.** Add it yourself with
+ * - **nanopb is not bundled.** Add it with
  *   `git submodule add https://github.com/nanopb/nanopb.git nanopb`, or point `NANOPB_DIR` at a
  *   checkout. Its generator needs the `protobuf` and `grpcio-tools` Python packages. Inside the
  *   firmware tree it is found automatically, and the browser builder needs nothing installed at
@@ -2399,8 +1853,8 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  *   `[(nanopb).max_count = N]` on a repeated one. Without a bound nanopb emits a callback field
  *   instead of a plain C member, which is far more code than settings need. A sibling
  *   `<name>.options` file works too, but inline options travel with the schema.
- * - **Only your own directory is on the proto include path**, plus nanopb's. `import
- *   "nanopb.proto"` resolves; importing another project's `.proto` does not.
+ * - **Only the tapp's own directory is on the proto include path**, plus nanopb's.
+ *   `import "nanopb.proto"` resolves; importing another project's `.proto` does not.
  * - **The generated files are temporary.** They are deleted when the build finishes, so there is
  *   nothing to inspect or commit - the `.proto` is the source of truth.
  *
@@ -2411,7 +1865,7 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  * written when field 4 meant something else.
  *
  * A successful decode says the bytes were well-formed, not that the values are usable. Clamp
- * numbers to the range your code assumes and treat every index or enum as hostile - this file is
+ * numbers to the range the code assumes and treat every index or enum as hostile - this file is
  * user-writable over USB, and an out-of-range index read straight into an array subscript is a
  * hard fault:
  *
@@ -2447,32 +1901,13 @@ uint32_t storage_list_dir(const char* path, const char* ext, char* names,
  */
 uint32_t isqrt(uint32_t n);
 
-/**
- * @brief Fast sine approximation
- * @param angle Angle in degrees (0-360)
- * @return Sine value scaled to int16_t range (-32768 to 32767)
- *
- * To convert to float: `float sf = isin(angle) / 32768.0f;`
- */
-int16_t isin(uint16_t angle);
-
-/**
- * @brief Fast cosine approximation
- * @param angle Angle in degrees (0-360)
- * @return Cosine value scaled to int16_t range (-32768 to 32767)
- *
- * To convert to float: `float cf = icos(angle) / 32768.0f;`
- */
-int16_t icos(uint16_t angle);
-
-#ifndef FIRMWARE_BUILD
 /* Q15 lookup-table math ---------------------------------------------------
  * Table-driven fixed-point primitives, the same ones the firmware DSP uses.
  * Cheaper than the float calls above and exact across builds. Q15 means
  * -32768..32767 represents -1.0..+1.0.
  *
- * Unlike isin()/icos(), which take degrees, these take a full-turn phase: the
- * uint16_t wraps naturally at one cycle, so you can just keep adding to it. */
+ * They take a full-turn phase: the uint16_t wraps naturally at one cycle, so a phase accumulator
+ * can keep adding to it indefinitely. */
 
 /** sin(2*pi * phase/65536) in Q15. Interpolated, so smooth at any rate. */
 int16_t lutsin_q15(uint16_t phase);
@@ -2480,12 +1915,11 @@ int16_t lutsin_q15(uint16_t phase);
 /** cos(2*pi * phase/65536) in Q15. */
 int16_t lutcos_q15(uint16_t phase);
 
-/** exp(-x) for x in [0, 32767] -> [32767, 0]. Handy for decay envelopes. */
+/** exp(-x) for x in [0, 32767] -> [32767, 0]. Suitable for decay envelopes. */
 int16_t lutexp_neg_q15(int16_t x);
 
 /** Soft saturation curve - a tanh-like squash of a Q15 value. */
 int16_t lutsat_q15(int16_t x);
-#endif /* !FIRMWARE_BUILD */
 
 /** @} */ // end of grp_math
 
@@ -2504,26 +1938,31 @@ int16_t lutsat_q15(int16_t x);
  * - **Custom** - Action triggered on selection
  * - **Submenu** - Navigate to nested menu
  * - **Param** - Edit a parameter value
+ * Any entry may also carry a `ui_gfx_cb` - a painter for the side panel while it is the cursor.
  *
  * @section menu_example Basic Example
  * @code{.c}
- * static void settings_menu(ui_menu_t* menu) {
- *     ui_menu_add_custom(menu, "Reset", NULL, reset_action, NULL);
+ * static void play_action(ui_menu_t* menu, ui_menu_node_t* entry) {
+ *     my_model_t* m = ui_menu_ctx(menu);   // the ctx passed to ui_menu_create, at any depth
+ *     ...
  * }
- *
- * static void root_menu(ui_menu_t* menu) {
- *     ui_menu_add_custom(menu, "Play", NULL, play_action, NULL);
- *     ui_menu_add_submenu(menu, "Settings", NULL, settings_menu, NULL);
+ * static void root_menu(ui_menu_t* menu) {   // the builder: runs at create and every ui_menu_show
+ *     my_model_t* m = ui_menu_ctx(menu);
+ *     ui_menu_add(menu, UI_ACTION("Play", play_action));
+ *     ui_menu_add(menu, UI_PARAM("Volume", MenuNodeParam, &m->volume));
  * }
- *
- * // In init
- * ui_menu_t* menu = ui_menu_init(app, root_menu);
+ * // init(): m->menu = ui_menu_create(m, root_menu);    a button: ui_menu_show(m->menu);
  * @endcode
+ *
+ * Style a menu once (type, position, width, rows - in any order): a submenu inherits the look
+ * of the level it was entered from and may change it, and "back" restores the parent's. The
+ * menu is modal while shown; BTN4/BTN5 hold go back / close, and closing hides it before the
+ * close callback (ui_menu_set_close_cb) runs - which may destroy it.
+ *
+ * A pick list: UI_PICK(name, callback, index) entries, and UI_PICK_IDX(entry) in the callback.
  *
  * @{
  */
-
-#ifndef FIRMWARE_BUILD
 
 // ============================================================================
 // Menu Convenience Macros
@@ -2533,10 +1972,6 @@ int16_t lutsat_q15(int16_t x);
 #define UI_ENTRY(_n, sub) \
     ((ui_menu_node_t){.name = (_n), .type = MenuNodeEntry, .sub_menu = (sub)})
 
-// Entry with submenu and explicit context (flows to submenu as ctx)
-#define UI_ENTRY_CTX(_n, sub, ctx) \
-    ((ui_menu_node_t){.name = (_n), .type = MenuNodeEntry, .sub_menu = (sub), .user_data = (ctx)})
-
 // Custom action callback
 #define UI_ACTION(_n, cb) \
     ((ui_menu_node_t){.name = (_n), .type = MenuNodeCustom, .callback = (cb)})
@@ -2545,16 +1980,13 @@ int16_t lutsat_q15(int16_t x);
 #define UI_PARAM(_n, ptype, _p) \
     ((ui_menu_node_t){.name = (_n), .type = (ptype), .param = (_p)})
 
-// Variants with icon
-#define UI_ACTION_ICON(_n, _i, _cb) \
-    ((ui_menu_node_t){.name = (_n), .icon = (_i), .type = MenuNodeCustom, .callback = (_cb)})
-
-#define UI_ENTRY_ICON(_n, _i, _sub) \
-    ((ui_menu_node_t){.name = (_n), .icon = (_i), .type = MenuNodeEntry, .sub_menu = (_sub)})
-
 // Attach user_data to any entry
 #define UI_DATA(entry, data) \
     ({ ui_menu_node_t _e = (entry); _e.user_data = (data); _e; })
+
+// Pick list: an action carrying its index; read it back in the callback with UI_PICK_IDX(entry)
+#define UI_PICK(_n, cb, idx) UI_DATA(UI_ACTION(_n, cb), (void*)(uintptr_t)(idx))
+#define UI_PICK_IDX(entry) ((uint16_t)(uintptr_t)(entry)->user_data)
 
 // ============================================================================
 // Menu Core API
@@ -2582,9 +2014,8 @@ void ui_menu_destroy(ui_menu_t* menu);
 void ui_menu_add(ui_menu_t* menu, ui_menu_node_t entry);
 
 /**
- * @brief Get menu context
- * @param menu Menu instance
- * @return Context pointer passed to ui_menu_create
+ * @brief The context passed to ui_menu_create - at every depth (a submenu's own data is its
+ *        entry's user_data)
  */
 void* ui_menu_ctx(ui_menu_t* menu);
 
@@ -2595,16 +2026,8 @@ void* ui_menu_ctx(ui_menu_t* menu);
 void ui_menu_rebuild(ui_menu_t* menu);
 
 /**
- * @brief Unified input handler for menus
- * @param menu Menu instance
- * @param button_id Button ID (0-5)
- * @param state Button state
- */
-void ui_menu_input(ui_menu_t* menu, uint8_t button_id, KeyStateEnum state);
-
-/**
- * @brief Show menu (attach to widget layer)
- * @param menu Menu instance
+ * @brief Show the menu: re-runs the current level's builder (cursor kept) and takes input -
+ *        modal, the app's on_input() receives nothing until it closes
  */
 void ui_menu_show(ui_menu_t* menu);
 
@@ -2629,103 +2052,32 @@ void ui_menu_set_type(ui_menu_t* menu, MenuTypeEnum type);
 void ui_menu_set_close_cb(ui_menu_t* menu, ui_menu_close_callback close_cb);
 void ui_menu_set_redraw_cb(ui_menu_t* menu, ui_menu_redraw_cb redraw);
 void ui_menu_set_header(ui_menu_t* menu, bool enable);
-void ui_menu_set_visible(ui_menu_t* menu, uint16_t count);
+void ui_menu_set_rows(ui_menu_t* menu, uint16_t count); // visible rows
 void ui_menu_set_name(ui_menu_t* menu, const char* name);
 
-// Position and width (wrappers around ui_obj_set_x/y/width on the menu's base obj)
+// Menu position and width, in either order (a menu with no position stays right-docked)
 void ui_menu_set_pos(ui_menu_t* menu, uint16_t x, uint16_t y);
 void ui_menu_set_width(ui_menu_t* menu, uint16_t w);
 
-// Draw the menu (call from your redraw callback when using MenuTypeCustom/WidgetGfx)
-void ui_menu_gfx_redraw(gfx_t* gfx, ui_menu_t* menu);
+/** @} */ // end of grp_menu
 
 // ============================================================================
-// Menu Query
+// Hints and Statusbar
 // ============================================================================
-
-MenuTypeEnum ui_menu_type(ui_menu_t* menu);
-bool ui_menu_is_editing(ui_menu_t* menu);
-bool ui_menu_loading(ui_menu_t* menu);
-
-// ============================================================================
-// Menu Navigation
-// ============================================================================
-
-void ui_menu_pop(ui_menu_t* menu);
-void ui_menu_entry_enter(ui_menu_t* menu, ui_menu_node_t* entry);
-void ui_menu_set_wait(ui_menu_t* menu);
 
 /**
- * @brief One button's hint labels. NULL or "" leaves that action blank.
+ * @defgroup grp_hints Hints and Statusbar
+ * @brief The button-hint band at the top of the screen, and the statusbar it lives in
  *
- * Labels are REFERENCED, not copied - use string literals or storage that
- * outlives the app (e.g. a field of your model).
+ * The defaults for each role are in @ref app_display; the BTN4/BTN5 hold gestures that
+ * reveal and dismiss the band are described under @ref grp_input.
+ *
+ * @{
  */
-typedef struct {
-    const char* press;
-    const char* hold;
-} tapp_hint_pair_t;
 
 /**
- * @brief Install this app's button hints as the system hints.
- * @param labels array of 5, in physical button order BTN1..BTN5
- *
- * The hints render at the TOP of the screen, where the buttons are, with the
- * same styling and slide-in as the built-in apps: press labels on the top row,
- * hold labels on the row beneath. Do not draw your own hint bar - reserve the
- * top 60px instead.
- *
- * Installing labels does NOT change visibility, so re-call this as often as your
- * labels change (typically from on_input, right after the state they describe).
- *
- * The BTN4/BTN5 HOLD cells are the SYSTEM's on every tapp: whatever you pass for
- * those two is ignored and the firmware draws its own - a menu icon on hold-4, a
- * close icon on hold-5 (the quick-hints gestures - see ui_hints_show()).
- *
- * Standalone tapp: the BTN4/BTN5 PRESS cells are YOURS and you may label them,
- * but they are the narrow system columns (50px), so keep those two labels very
- * short - about five characters. BTN1..BTN3 get the wide 100px columns. So you
- * have three wide label columns and two narrow ones, not five wide ones.
- *
- * Source tapp: BOTH rows of BTN4/BTN5 are the firmware's - prev/next icons on
- * press, back/exit icons on hold.
- *
- * @section hint_grid The row grid
- *
- * Every band on the device - yours, tapedecks', the menu's - uses ONE grid, so
- * nothing changes width or position when one replaces another:
- *
- * | columns   | width | notes                                               |
- * |-----------|-------|-----------------------------------------------------|
- * | BTN1-BTN3 | 100px | your wide label columns                             |
- * | BTN4/BTN5 | 50px  | narrow; pinned to the right edge                    |
- *
- * `3 + 3*100 + 2*50 = 403` is the row's nominal end: each cell draws its body
- * 5px narrower than its column, so the last lit pixel is 397 and the trailing
- * margin mirrors the 3px lead.
- *
- * The BTN4/BTN5 pair is RIGHT-PINNED, so those two cells stay under their
- * buttons however wide the columns before them are. You do not have to make your
- * widths add up - but columns that fall short leave a visible gap before the
- * pinned pair, which is why the grid is worth following.
- *
- * 50px is a floor, not a preference: it is the narrowest width the switch pill
- * (ui_hints_set_switch) renders correctly at.
- *
- * Default hints (blank labels + those system cells) are installed before init(),
- * so a tapp that never calls this shows exactly the system cells and nothing
- * stale; each session starts clean, nothing carries over from the app run before
- * yours.
- *
- * The firmware owns the hint objects, so nothing internal crosses the ABI -
- * you only hand over the strings.
- */
-void ui_hints_set_labels(const tapp_hint_pair_t* labels);
-
-#ifndef FIRMWARE_BUILD
-/**
- * One hint cell, interleaved press/hold per physical button - the same
- * enum the firmware's own hint tables use. Values are pinned; do not reorder.
+ * One hint cell, interleaved press/hold per physical button. Values are pinned; do not
+ * reorder.
  */
 typedef enum {
     HintPress1, HintHold1,
@@ -2735,320 +2087,239 @@ typedef enum {
     HintPress5, HintHold5,
     HintsActionsTotal,
 } HintActionType;
-#endif
+
+/** The press / hold cell of an on_input() button id (BTN1..BTN5). */
+static inline HintActionType hint_press(uint8_t btn) { return (HintActionType)(btn * 2u); }
+static inline HintActionType hint_hold(uint8_t btn) { return (HintActionType)(btn * 2u + 1u); }
+
+#define HINT_ACTIVE 0x01u /**< lit plate: a mode that is on */
+#define HINT_LOCKED 0x02u /**< dithered "unavailable" (purely visual); ACTIVE wins — except on a
+                           *   PARAM pill, where lit + locked dithers the whole plate */
+#define HINT_ON 0x04u     /**< a switch, in its ON position */
+#define HINT_WIDE 0x08u   /**< a switch on BTN4/BTN5: the wide 65px cell instead of 50px */
+#define HINT_PARAM 0x10u  /**< BTN1-3 PRESS cell: one tall pill over BOTH rows — a param's name
+                           *   above, the hold cell's content (its value) on the same plate below.
+                           *   Grows/shrinks as the flag comes and goes. Not on a switch. */
+#define HINT_SPAN 0x20u   /**< BTN4 HOLD cell only: one pill across both tail columns - the
+                           *   device's own [close]. Leave HintHold5 empty. */
+
+/** One cell of the tapp's band. A cell exists when it has a label, an icon, a switch or a painter
+ *  (ui_hints_set_gfx_cb); its flags apply to all four. */
+typedef struct {
+    const char* label;        /**< REFERENCED, not copied: a literal or the model's storage */
+    const gfx_img_t* icon;    /**< beside the label, centred alone when the label is empty
+                               *   (~14x14 px); a switch's OFF glyph. gfx_icon() or an app asset */
+    const gfx_img_t* icon_on; /**< non-NULL makes the cell a two-position switch (icons only) */
+    uint8_t flags;            /**< HINT_ACTIVE | HINT_LOCKED | HINT_ON | HINT_WIDE | HINT_PARAM | HINT_SPAN */
+} tapp_hint_cell_t;
 
 /**
- * @brief Highlight a hint cell (solid plate, inverted text)
- * Use it for any on/off mode your button toggles.
+ * @brief Set the tapp's button hints: the whole band, in one call
+ * @param cells HintsActionsTotal cells indexed by HintActionType; NULL = an empty band
  *
- * PRESERVED across ui_hints_set_labels() rebuilds - set it when your mode
- * actually changes; re-calling after a rebuild is harmless. An empty cell is a
- * no-op. Works on every cell EXCEPT HintHold4/HintHold5, the firmware's own
- * gesture cells, where it is refused.
+ * @code{.c}
+ * const tapp_hint_cell_t c[HintsActionsTotal] = {
+ *     [HintPress1] = {"play", gfx_icon(GfxIconPlay), NULL, m->playing ? HINT_ACTIVE : 0},
+ *     [HintHold1]  = {"loop"},
+ *     [HintPress3] = {NULL, gfx_icon(GfxIconJack), gfx_icon(GfxIconMic), m->mic ? HINT_ON : 0},
+ * };
+ * ui_hints_set(c);
+ * @endcode
+ *
+ * Every call states every cell - labels, icons, switches, lit and locked - so call it again
+ * whenever the app state changes (from on_input, right after the change). There is no order
+ * between calls and nothing carries over from the previous band; the firmware keeps the
+ * lit/lock animations running across calls, so re-stating an unchanged band causes no
+ * flicker. It does NOT change visibility - see ui_hints_show().
+ *
+ * The hints render at the TOP of the screen, where the buttons are, with the system
+ * styling and slide-in: press cells on the top row, holds beneath. Draw from TAPP_CONTENT_Y
+ * down; a tapp must never draw its own hint bar.
+ *
+ * Which cells belong to the tapp depends on its role:
+ *   - utility: all ten. In WINDOW mode the cells left empty keep the menu's labels,
+ *     drawn as unavailable - those buttons reach the tapp's window, not the menu.
+ *   - standalone: all but HintHold4/HintHold5, the firmware's menu/close pill. The
+ *     BTN4/BTN5 PRESS cells are the narrow 50px columns: keep those labels to ~5 characters.
+ *   - source: BTN1..BTN3; both BTN4/BTN5 rows are the firmware's prev/next and back/exit.
+ * Content placed on a firmware cell is ignored.
+ *
+ * @section hint_grid The row grid
+ *
+ * Every hint band uses one grid, so
+ * nothing changes width or position when one replaces another:
+ *
+ * | columns   | width | notes                                               |
+ * |-----------|-------|-----------------------------------------------------|
+ * | BTN1-BTN3 | 100px | the tapp's wide label columns                       |
+ * | BTN4/BTN5 | 50px  | narrow; pinned to the right edge                    |
+ *
+ * `3 + 3*100 + 2*50 = 403` is the row's nominal end: each cell draws its body
+ * 5px narrower than its column, so the last lit pixel is 397 and the trailing
+ * margin mirrors the 3px lead.
+ *
+ * The BTN4/BTN5 pair is RIGHT-PINNED, so those two cells stay under their
+ * buttons however wide the columns before them are. The widths need not add up
+ * exactly - but columns that fall short leave a visible gap before the
+ * pinned pair, which is why the grid should be followed.
+ *
+ * 50px is a floor, not a preference: it is the narrowest width the switch pill renders
+ * correctly at.
+ *
+ * Each session starts with an empty band (plus the role's firmware cells): nothing carries
+ * over from the previously run app. The firmware owns the hint objects - only the tapp's cell
+ * array crosses the ABI.
  */
-void ui_hints_set_active(HintActionType action, bool active);
+void ui_hints_set(const tapp_hint_cell_t cells[HintsActionsTotal]);
 
 /**
  * @brief Flash a hint cell the way the device flashes its own - solid plate the
- * instant you call it, 2px depress, fading out on its own after ~240ms.
+ * instant it is called, 2px depress, fading out on its own after ~240ms.
  * Use it for MOMENTARY actions (a shuffle, a retrigger) that have no on/off state.
  *
- * This is what you want for press feedback, NOT ui_hints_set_active: the device
- * emits the PUSH and RELEASE events together at the release edge, so there is no
- * finger-down window for a set_active(true)/set_active(false) pair to cover, and
- * the ACTIVE fill ramps over ~4 UI ticks rather than snapping. set_active is for
- * SUSTAINED state (a mode that stays on); this is for a tap.
+ * This is the mechanism for press feedback, NOT HINT_ACTIVE: the device emits the PUSH
+ * and RELEASE events together at the release edge, so there is no finger-down window for
+ * an on/off pair to cover, and the ACTIVE fill ramps over ~4 UI ticks rather than
+ * snapping. HINT_ACTIVE is for SUSTAINED state (a mode that stays on); this is for a tap.
  *
- * Self-timed, so call it once from your on_input and forget it. Repeat taps
+ * Self-timed: call it once from on_input; no follow-up call is needed. Repeat taps
  * re-flash. A LOCKED cell is skipped, matching the rest of the device.
  */
 void ui_statusbar_hint_event(HintActionType action);
 
-/**
- * @brief Dim a hint cell as UNAVAILABLE (dithered knockout, outline intact) -
- * how the device greys out actions that don't apply, e.g. cut/copy while the
- * deck is playing. Purely visual for a tapp: your on_input still decides.
- *
- * PRESERVED across ui_hints_set_labels() rebuilds - set it when availability
- * actually changes; re-calling after a rebuild is harmless. Active wins over
- * locked visually; do not set both on one cell. An empty cell is a no-op. Works
- * on every cell EXCEPT HintHold4/HintHold5, the firmware's own gesture cells,
- * where it is refused.
- */
-void ui_hints_set_locked(HintActionType action, bool locked);
-
-/**
- * @brief Put your app's text in the system statusbar (left side)
- * @param text string to show; NULL or "" removes the item
- *
- * The pointer is REFERENCED, not copied. Point it at a buffer your app owns and
- * just rewrite that buffer whenever the text changes - the statusbar follows with
- * no further calls. Call this ONCE, in init().
- *
- * The firmware owns the statusbar object, so nothing internal crosses the ABI
- * the item is hidden automatically when your app loses focus and dropped when it
- * exits. The right side is reserved for battery/USB and other system items.
- */
-void ui_statusbar_set_text(const char* text);
-
-/** Height of a statusbar item's drawable cell - the one dimension your callback does
- *  not receive, because it never varies. Taller than the device's own status items:
- *  this is meant to hold a whole app strip (transport, meters, a big readout), not a
- *  single indicator. */
+/** Height of a statusbar item's drawable cell - the one dimension the callback does
+ *  not receive, because it never varies. Tall enough to hold a
+ *  whole app strip (transport, meters, a big readout), not a single indicator. */
 #define TAPP_STATUSBAR_H 32
 
 /**
  * @brief Draw callback for a custom statusbar item
  * @param gfx Graphics context
- * @param x Left edge of YOUR cell on screen
- * @param y Top edge of YOUR cell
- * @param w Cell width - the same number you passed to ui_statusbar_set_gfx_cb()
- * @param user The context pointer you registered
+ * @param x Left edge of the item's cell on screen
+ * @param y Top edge of the item's cell
+ * @param w Cell width - the same number passed to ui_statusbar_set_gfx_cb()
+ * @param user The context pointer registered with the item
  *
  * Five parameters because that is the widest firmware->tapp callback shim there is;
  * the height is ::TAPP_STATUSBAR_H and does not need a slot.
  */
-typedef void (*tapp_statusbar_gfx_cb)(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w,
+typedef void (*tapp_statusbar_gfx_cb)(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w,
                                       void* user);
 
 /**
- * @brief Put your app's own GRAPHICS in the system statusbar (left side)
+ * @brief Put the app's own GRAPHICS in the system statusbar (left side)
  * @param cb Draw callback, or NULL to remove the item
  * @param width Cell width in pixels
  * @param user Context handed back to @p cb
  *
- * The graphical counterpart to ui_statusbar_set_text() - the same custom-item slot the
- * device's own apps use for their indicators, so a tapp's transport icon or meter sits
- * in the bar rather than eating a strip of the app panel.
+ * A tapp's transport icon or meter sits in the bar rather than eating a strip of the app
+ * panel.
  *
- * Draw ONLY inside your `width x ::TAPP_STATUSBAR_H` cell. The bar erases each item's own
+ * Draw ONLY inside the item's `width x ::TAPP_STATUSBAR_H` cell. The bar erases each item's own
  * box right before calling it and nothing else, so anything outside would never be cleared;
  * the call is clipped to the cell, which means overdraw is silently cut off rather than
- * smeared. Nothing sets a font for status items, so call gfx_set_font() if you draw text.
+ * smeared. Nothing sets a font for status items, so call gfx_set_font() before drawing text.
  *
- * Sizing: ~176 px is the width the built-in text item uses and is always safe. The bar is
+ * Sizing: ~176 px is always safe. The bar is
  * 400 px wide with the USB indicator parked at x 332 and battery beyond it, so ~330 is the
- * practical ceiling. Call ONCE, in init(); registering again just updates it.
+ * practical ceiling. Call ONCE, in init(); registering again updates it.
  *
  * This is the surface for a whole app strip. It is ::TAPP_STATUSBAR_H tall - deeper than
- * the bar's own 24 px - so it reaches a little into the panel, and it costs you nothing:
+ * the bar's own 24 px - so it reaches a little into the panel, and it costs the app nothing:
  * the firmware stops drawing status items the moment the hints go up, which is the
- * one thing an app cannot detect for itself. Draw your transport, meters and readouts here
- * rather than on your own canvas and they get out of the hints' way by themselves.
+ * one thing an app cannot detect for itself. Transport, meters and readouts drawn here rather
+ * than on the app's own canvas move out of the hints' way automatically.
  *
- * The callback runs on the UI task during the statusbar's redraw - the same context as your
+ * The callback runs on the UI task during the statusbar's redraw - the same context as the
  * app's redraw(), not the audio thread. Keep it cheap and read a snapshot, do not block.
- * The item is owner-stamped: it hides when your app loses focus and is dropped when it
+ * The item is owner-stamped: it hides when the app loses focus and is dropped when it
  * exits, so deinit() needs no cleanup.
  */
 void ui_statusbar_set_gfx_cb(tapp_statusbar_gfx_cb cb, uint16_t width, void* user);
 
 /**
- * @brief Put an icon INSIDE a hint cell (left of the re-centred label)
- * @param action Which cell (HintPress1..HintHold5)
- * @param icon Your compiled asset, or NULL to clear
- *
- * With an empty label ("") the cell becomes icon-only and the glyph is CENTRED
- * rather than parked at the left edge where a label would sit beside it - which is
- * what the narrow 50px BTN4/BTN5 press cells want, since a word and a glyph crowd
- * each other there. ~14x14 px sits well in the 78x22 cell. PRESERVED across
- * ui_hints_set_labels() rebuilds. The image must
- * outlive the session (a compiled asset or model field - same contract as label
- * text); it is dropped automatically when your app exits. Works on every cell
- * EXCEPT HintHold4/HintHold5, the firmware's own gesture cells, where it is
- * refused.
- */
-void ui_hints_set_icon(HintActionType action, const gfx_img_t* icon);
-
-/**
- * @brief Turn a cell into a two-position SWITCH - the device's own toggle pill
- * @param action Which cell (HintPress1..HintPress5, HintHold1..HintHold3)
- * @param off Glyph for the OFF position, gfx_icon() or your own asset
- * @param on Glyph for the ON position
- * @param state false = off (left), true = on (right)
- * @param wide Give the cell the device's WIDE switch width (65px) instead of the
- *             grid's 50px column. 50 is the narrowest a switch renders correctly at,
- *             which is what the device's own REC switches use, so this is a
- *             roomier look rather than a requirement
- *
- * The same pill the device's REC hints use for line/mic, dry/wet and bounce: an
- * outlined track with a solid half-width knob that slides between the two glyphs,
- * each inverted while the knob is over it.
- *
- * ICONS ONLY, no label - the renderer draws nothing else, so there is no text
- * parameter here rather than one that would silently do nothing. gfx_icon() gives
- * you the device's glyphs without shipping an asset.
- *
- * Sticky, like ui_hints_set_icon(): re-applied automatically after every
- * ui_hints_set_labels() rebuild, so the documented rebuild-on-every-press idiom
- * keeps your switches. Call it again with the new @p state when your button flips
- * the mode. Both glyphs NULL clears the cell. Refused on HintHold4/HintHold5, the
- * firmware's own gesture cells.
- */
-void ui_hints_set_switch(HintActionType action, const gfx_img_t* off, const gfx_img_t* on,
-                         bool state, bool wide);
-
-/**
- * @brief Draw a hint cell's content YOURSELF (procedural graphics in the cell)
+ * @brief Draw a hint cell's content from a tapp callback (procedural graphics in the cell)
  * @param action Which cell (HintPress1..HintHold5)
  * @param cb Draw callback (same shape as the statusbar one), or NULL to restore the label
  * @param user Context handed back to @p cb
  *
  * The firmware still draws the standard framed cell body (and the press animation);
- * your callback draws the content on top and is CLIPPED to the cell interior
+ * the callback draws the content on top and is CLIPPED to the cell interior
  * (`w` x 22 px at the given x/y - overdraw is cut off, not smeared). Runs on the UI
- * task like redraw(); set your font before drawing text. PRESERVED across
- * ui_hints_set_labels() rebuilds; the cell's text/icon are not drawn while a
- * callback is installed. Dropped automatically when your app exits. Works on
- * every cell EXCEPT HintHold4/HintHold5, the firmware's own gesture cells, where
+ * task like redraw(); set the font before drawing text. Stays across ui_hints_set()
+ * calls until NULL is passed, and makes its cell exist; the cell's label/icon are not
+ * drawn while a callback is installed. Dropped automatically when the app exits. Works on
+ * every cell EXCEPT HintHold4/HintHold5, the system's gesture cells, where
  * it is refused.
  */
 void ui_hints_set_gfx_cb(HintActionType action, tapp_statusbar_gfx_cb cb, void* user);
 
-/* ---- Mechanical rolling text ------------------------------------------------ */
-
-/** Max animated characters per ui_roll_text_t. */
-#define UI_ROLL_TEXT_MAX 16
-
 /**
- * @brief Mechanical rolling-TEXT state - split-flap style label animation.
- *
- * When the target string changes, each changed character rolls vertically through
- * a short glyph sequence into place, like a mechanical split-flap display. Cells
- * are right-indexed (a trailing char keeps its identity as length changes); the
- * label is right-aligned. YOU own the state: zero-initialize once (e.g. a model
- * field) and hand it to every draw call. Binary-compatible with firmware.
- */
-typedef struct {
-    char from[UI_ROLL_TEXT_MAX];
-    char tgt[UI_ROLL_TEXT_MAX];
-    float phase[UI_ROLL_TEXT_MAX];
-    uint8_t len;
-    uint8_t inited;
-} ui_roll_text_t;
-
-/**
- * @brief Draw a rolling label, right edge at @p x_right, baseline at @p y
- * @return true while any character is still rolling
- *
- * Uses the CURRENTLY-SET gfx font and color. Self-clocked: call once per frame
- * from redraw() with the desired string - changed characters roll toward it,
- * mid-flight changes re-aim without a jump. The first-ever draw seeds silently.
- *
- * @note This call advances the roll as it paints, so it only moves on frames you painted -
- * meaning your tick() has to keep returning true for the label to land. ::ui_roll_t below
- * does not have that problem and is the better choice for new code.
- */
-bool ui_roll_text_draw(gfx_t* gfx, uint16_t x_right, uint16_t y, ui_roll_text_t* c, const char* value);
-
-/** Set the label instantly, no roll (e.g. when the thing being named changes identity). */
-void ui_roll_text_snap(ui_roll_text_t* c, const char* value);
-
-/**
- * @brief The same rolling label, as a widget - it animates itself.
- *
- * ui_roll_text_draw() above advances the roll while it paints, so "still rolling" is only
- * knowable inside redraw(), and redraw() is scheduled by tick(). You cannot break that circle
- * from the outside; the usual result is a label frozen part-flip.
- *
- * A ui_roll_t is ticked by the firmware every frame whether or not anything painted, and asks
- * for its own repaints. **Your tick() can return false the whole time and the label still
- * lands.** You only draw it.
- *
- * Opaque and firmware-owned, unlike ::ui_roll_text_t. Pass your model (or app context) as
- * @p owner_ctx so it is cleaned up with your app, and destroy it in deinit().
- *
- * @code{.c}
- * // init():    m->name = ui_roll_create(m);
- * // on change: ui_roll_set(m->name, preset_name);
- * // redraw():  ui_roll_draw(gfx, m->name, 380, 60);
- * // deinit():  ui_roll_destroy(m->name);
- * @endcode
- * @{
- */
-typedef struct ui_roll ui_roll_t;
-
-ui_roll_t* ui_roll_create(void* owner_ctx);
-void ui_roll_destroy(ui_roll_t* r);
-void ui_roll_set(ui_roll_t* r, const char* value);
-void ui_roll_snap(ui_roll_t* r, const char* value);
-void ui_roll_draw(gfx_t* gfx, ui_roll_t* r, uint16_t x_right, uint16_t y);
-/** @} */
-
-
-/**
- * @brief Show or hide the hints installed by ui_hints_set_labels()
+ * @brief Show or hide the tapp's hints (ui_hints_set())
  * @param stat true to show hints, false to hide
  *
- * Standalone tapps start with the hints HIDDEN (statusbar on), and the firmware
- * runs the reveal itself: BTN4 or BTN5 hold shows the hints; with them up, BTN4
- * hold opens the main menu over the running tapp (your audio keeps running, your
- * tick() pauses while the menu has focus, on_pause/on_resume bracket it) and BTN5
- * hold puts the hints away - including hints YOU raised with this call; a hold
- * brings them back. A short BTN4/BTN5 press that dismisses system-revealed hints
- * is swallowed and never delivered to you.
+ * The role sets the default (@ref app_display); this overrides it. THE CALL IS REMEMBERED:
+ * the firmware records it against the tapp's image and replays it whenever it re-derives the
+ * screen's chrome - a menu round-trip, a refocus, a co-resident image taking and handing back
+ * the screen. So "always visible" is one call in init(), with nothing to re-assert from
+ * on_resume() or tick(), and a BTN5 hold will not take down a band the tapp requested (see
+ * @ref grp_input). The same applies to ui_statusbar_show().
  *
- * Skip rule: a tapp with NO hints of its own sends that first hold straight to
- * the main menu - showing hints that are only the firmware's own two icons
- * would be pointless ceremony.
+ * Two idioms:
+ *   - always visible: call once with true in init(), then re-call ui_hints_set()
+ *     whenever the app state changes.
+ *   - reveal on one of the tapp's OWN buttons (BTN1..BTN3): true on KEY_STATE_HOLD, false on
+ *     KEY_STATE_RELEASED, from on_input.
  *
- * None of that reaches on_input, so there is nothing to drive. Two idioms remain
- * yours:
- *   - always visible: call once with true in init(), then just re-call
- *     ui_hints_set_labels() whenever a label changes.
- *   - reveal on one of YOUR buttons (BTN1..BTN3): true on BTN_HOLD, false on
- *     BTN_RELEASE, from on_input.
- *
- * YOUR CALL IS REMEMBERED. The firmware records it against your image and replays
- * it whenever it re-derives the screen's chrome - a menu round-trip, a refocus, a
- * co-resident image taking and handing back the screen. So "always visible" really
- * is one call in init(): you do NOT have to re-assert it from on_resume or nurse it
- * from your tick, which is what this API used to require. The same applies to
- * ui_statusbar_show(). A BTN5 hold will not take down a band you asked for.
- *
- * Your role only supplies the DEFAULT - hidden for a standalone tapp, shown for a
- * source tapp - and saying nothing keeps it.
- *
- * SOURCE tapps: init() runs OFF-SCREEN (the picker loads you and backgrounds you
- * immediately), so state your chrome from your first tick or on_resume instead, or
- * you will tear down the chrome of whatever is actually on screen. A STANDALONE
- * tapp is already on screen by init() and can say it there.
+ * SOURCE tapps: init() runs OFF-SCREEN (the picker loads the tapp and backgrounds it
+ * immediately), so state the chrome from the first tick() or on_resume() instead; otherwise
+ * the call tears down the chrome of whatever is actually on screen. A STANDALONE
+ * tapp is already on screen by init() and can state it there.
  */
 void ui_hints_show(bool stat);
 
+/** ui_hints_set_volume()'s icon_id: the cell's glyph AND the bus its meter reads. */
+enum { HintVolOutput = 0, HintVolInput = 1, HintVolFx = 2, HintVolFeedback = 3 };
 
 /**
  * @brief Install one VOLUME cell in the hints - the same cells the device's
  * own hold-PLAY volume hints are made of (icon + name + live VU + cursor, active
  * cell enlarged with the same animation).
  * @param slot Physical button, 1..5 - slots 4 and 5 included. The volume cells
- *             are YOUR OWN array, not the label hints, so the system's BTN4/BTN5
- *             columns do not overwrite it and cells you install there DO render.
+ *             are the tapp's OWN array, not the label hints, so the system's BTN4/BTN5
+ *             columns do not overwrite it and cells installed there DO render.
  *             (The BTN4/BTN5 hold GESTURES are unaffected - they stay the
  *             firmware's, whatever the cell draws.)
  * @param row 0 = press row, 1 = hold row
  * @param name Cell label - REFERENCED, must outlive the app state showing it
- * @param param The params_t this cell displays and whose ->val you adjust
- *              (typically from the encoder in on_input). NULL clears the cell -
+ * @param param The params_t this cell displays and the firmware edits while it is
+ *              selected (encoder, dB taper for ParamValDBType). Its callback fires
+ *              with ctx NULL - reach the model from the param, not from ctx.
+ *              NULL clears the cell -
  *              unless `name` is non-empty, which installs a plain LABEL cell
  *              instead (e.g. "<" / ">" nav arrows on the buttons that switch
- *              your selection, the same affordance the device's own hints have).
+ *              the app's selection).
  *              Use ParamValDBType for gain-style 0..2.0 params - the linear draw
  *              branch assumes 0..1.
- * @param icon_id Icon AND VU source: 0 = output (volume icon, output bus),
- *                1 = input (jack/mic icon following the live source, input bus),
- *                2 = fx
+ * @param icon_id Icon AND VU source: HintVolOutput (volume icon, output bus),
+ *                HintVolInput (jack/mic icon following the live source, input bus),
+ *                HintVolFx, HintVolFeedback (sound-on-sound)
  *
- * Installing volume cells REPLACES the label hints (ui_hints_set_labels) and vice
- * versa - hold-to-reveal apps install the cells on BTN_HOLD and re-install their
- * labels on BTN_RELEASE (see examples/recorder.c). The firmware owns the cell
- * objects; only the name string and your params_t cross the ABI, and both are
- * dropped automatically when your app exits.
+ * Installing volume cells REPLACES the tapp's ui_hints_set() band and vice versa -
+ * hold-to-reveal apps install the cells on KEY_STATE_HOLD and re-state their band on
+ * KEY_STATE_RELEASED (see examples/recorder.c). Each call clears the selection, so call
+ * ui_hints_volume_select() after the cells are in. The firmware owns the cell
+ * objects; only the name string and the params_t cross the ABI, and both are
+ * dropped automatically when the app exits.
+ *
+ * The band is FIRMWARE-DRIVEN, like the device's own: while it is up, BTN4/BTN5 presses
+ * step the selection and the encoder edits the selected level - the app never receives
+ * those events. A running source's (radio, slicer, a source tapp) level is appended
+ * after the app's own, exactly as the tape decks list it.
  *
  * GEOMETRY: every volume cell is 60px wide and grows to 120px while selected -
  * one pair, no per-icon special case. Four cells plus the grid's 50px BTN4/BTN5
- * pair is exactly the row (3 + 3*60 + 120 + 2*50 = 403), which is what the
- * device's own band uses. Install FEWER than four and the row simply starts
+ * pair is exactly the row (3 + 3*60 + 120 + 2*50 = 403). Install FEWER than four and the row simply starts
  * short: the nav cells stay pinned under BTN4/BTN5 either way, so a 2- or 3-cell
  * band is a first-class layout, not a broken one.
  */
@@ -3056,8 +2327,8 @@ void ui_hints_set_volume(uint8_t slot, uint8_t row, const char* name,
                          params_t* param, uint8_t icon_id);
 
 /**
- * @brief Enlarge/activate one volume cell (slot 0 = none). The cells animate
- * exactly like the device's own hints; call this when your selection moves.
+ * @brief Select one volume cell (slot 0 = none) - the band's INITIAL selection, once
+ * the cells are in. From then on BTN4/BTN5 step it (see ui_hints_set_volume()).
  */
 void ui_hints_volume_select(uint8_t slot, uint8_t row);
 
@@ -3068,12 +2339,12 @@ void ui_hints_volume_select(uint8_t slot, uint8_t row);
  * When shown and hints are not active it displays the idle status items
  * (battery etc). A standalone tapp launches with it shown, matching the rest of
  * the device - call with false to take the full screen. A source tapp launches
- * with it hidden and can call true to get it back (worth it for something you
- * leave running: the battery is the one thing you want to see).
+ * with it hidden and can call true to restore it (recommended for a tapp left
+ * running, so that the battery level stays visible).
  *
- * REMEMBERED against your image and replayed on every refocus, exactly like
- * ui_hints_show() - state it once and it stays. Your role supplies the default;
- * saying nothing keeps it.
+ * REMEMBERED against the tapp's image and replayed on every refocus, exactly like
+ * ui_hints_show() - state it once and it stays. The role supplies the default;
+ * making no call keeps it.
  *
  * The hints live INSIDE the bar, so hiding it does not hide them: a tapp with the
  * statusbar off and the hints on gets a band and nothing else, which is the shape
@@ -3081,9 +2352,7 @@ void ui_hints_volume_select(uint8_t slot, uint8_t row);
  */
 void ui_statusbar_show(bool state);
 
-#endif // !FIRMWARE_BUILD
-
-/** @} */ // end of grp_menu
+/** @} */ // end of grp_hints
 
 // ============================================================================
 // Parameters
@@ -3091,78 +2360,57 @@ void ui_statusbar_show(bool state);
 
 /**
  * @defgroup grp_params Parameters
- * @brief Smoothed, range-clamped values - the unit ui_menu edits and the encoder drives
+ * @brief Range-clamped values - the unit ui_menu edits and the encoder drives
  *
- * A params_t holds a target and a smoothed current value. You set the target;
- * param_update_fast() walks `val` toward it and returns true on the frames it
- * changed - which is exactly what tick() should return, since that is what asks
- * for the repaint. Set `refresh = true` or `val` never follows `target`.
+ * A params_t holds a `target` and a current `val`. The app moves the target;
+ * param_update_fast() copies it into `val` (one call, no easing), fires the registered callback
+ * when `refresh` is set, and returns true once `val == target`.
  *
- * Note the smoothing outlives the input: `val` keeps travelling for several frames
- * after the encoder stops, and those frames only happen if you keep saying true.
+ * @code{.c}
+ * typedef struct { params_t gain; } my_model_t;
+ * // init(): a ranged value - name, start, min, max, step
+ * m->gain = (params_t)PARAM_RANGE("gain", 0.5f, 0.f, 1.f, 0.05f);
+ * @endcode
  *
  * @section param_encoder Driving a param from the encoder
  * @code{.c}
  * // in tick()
- * param_write_delta_coarse(&m->cutoff, os_controls_encoder_get_delta());
- * return param_update_fast(&m->cutoff, m); // true while it is still smoothing
+ * param_write_delta_val(&m->cutoff, os_controls_encoder_get_delta());
+ * param_update_fast(&m->cutoff, m);
  *
  * // in redraw()
- * gfx_draw_strf(gfx, 10, 40, "cutoff %d%%", (int)(param_val_percent(&m->cutoff) * 100));
+ * gfx_draw_strf(gfx, 10, 40, "cutoff %d%%", (int)(m->cutoff.val * 100.f));
  * @endcode
  *
- * Put the same params_t in a ui_menu_node_t's `param` field and the menu edits it
- * for you - the two paths are interchangeable.
+ * Placing the same params_t in a ui_menu_node_t's `param` field lets the menu edit it
+ * directly - the two paths are interchangeable.
  *
  * @note There is no param_init(): it hands back a slot from a firmware-owned pool.
- * Declare params_t values in your own model and fill the fields directly.
+ * Declare params_t values in the app's own model and initialise them with PARAM_RANGE() (or
+ * fill the fields directly; option lists use option_name[] + ParamValSelectType).
  * @{
  */
 
-/** @brief Set the value immediately (clamped to min/max), skipping smoothing */
-void param_set(params_t* param, const float value);
+/** A ranged value param: start value, bounds, encoder step; `refresh` on. Usable both as a
+ *  static initialiser and, with a (params_t) cast, as an assignment. */
+#define PARAM_RANGE(_name, _val, _lo, _hi, _step)                                              \
+    {.name = (_name), .type = ParamValExactType, .val = (_val), .target = (_val),               \
+     .dflt = (_val), .min = (_lo), .max = (_hi), .coarse = (_step), .fine = (_step),            \
+     .refresh = true}
 
-/** @brief Set the value with no clamp and no smoothing - fast path for audio code */
-void param_set_rawfast(params_t* param, const float value);
-
-/** @brief Set the target; `val` then eases toward it on param_update_fast() */
-void param_set_target(params_t* param, const float value);
-
-/** @brief Add to the target (clamped) */
-void param_inc(params_t* param, const float value);
-
-/** @brief Subtract from the target (clamped) */
-void param_dec(params_t* param, const float value);
-
-/** @brief Advance `val` toward `target`; true if it moved this call (redraw cue) */
+/** @brief Move `val` to `target` and fire the callback if `refresh`; true once val == target
+ *  (also true for a NULL param or `refresh == false`) */
 bool param_update_fast(params_t* param, void* ctx);
 
-/** @brief Advance `val` toward `target` without firing the callback */
+/** @brief Move `val` to `target` without firing the callback; true when it was already
+ *  within `fine` of the target and snapped */
 bool param_update_val(params_t* param);
 
-/** @brief Did the value change since the last check? */
-bool param_updated(const params_t* param);
-
-/** @brief Apply an encoder delta using the param's `coarse` step */
-void param_write_delta_coarse(params_t* param, int32_t acc);
-
-/** @brief Apply an encoder delta using the param's `fine` step */
+/** @brief Apply an encoder delta to the target using the param's `fine` step */
 void param_write_delta_val(params_t* param, int32_t acc);
 
-/** @brief Called whenever the value changes; receives the param and your ctx */
+/** @brief Called from param_update_fast() when `refresh` is set; receives the param and the ctx */
 void param_set_callback(params_t* param, void (*callback)(params_t* self, void* context));
-
-/** @brief Raw current value, before range mapping */
-float param_raw(const params_t* param);
-
-/** @brief Current value rescaled from the param's range into [min, max] */
-float param_map(const params_t* param, const float min, const float max);
-
-/** @brief Current value as 0.0-1.0 across the param's own range */
-float param_val_percent(const params_t* param);
-
-/** @brief Do two params hold the same value? */
-bool param_same(const params_t* p1, const params_t* p2);
 
 /** @} */ // end of grp_params
 
@@ -3172,65 +2420,36 @@ bool param_same(const params_t* p1, const params_t* p2);
 
 /**
  * @defgroup grp_notify Notifications
- * @brief Toasts and modal dialogues drawn over your app
+ * @brief Toasts and modal dialogues drawn over the app
  *
- * The firmware owns one notification. Every function here acts on it, so there is
- * nothing to allocate or free - pass NULL wherever a ui_notify_t* is asked for.
+ * The firmware owns one notification; every function here shows it. The caller's strings are
+ * COPIED (a stack buffer is fine), and a newer notification replaces an older one.
  *
  * @warning A **modal** notification swallows input: while it is up the firmware
- * consumes button events before your on_input() sees them and drains the encoder
+ * consumes button events before the app's on_input() sees them and drains the encoder
  * accumulator, so the first os_controls_encoder_get_delta() afterwards reads 0.
- * Do not drive your UI from on_input() while a modal is showing.
+ * The app UI must not be driven from on_input() while a modal is showing.
  * @{
  */
 
-/** @brief Toast: header + hint + optional icon. @param timeout_ms 0 = stay until hidden */
-void ui_notify_info(const char* header, const char* hint, const gfx_img_t* icon,
-                    uint16_t timeout_ms);
-
-/** @brief Error toast */
-void ui_notify_error(const char* message, uint16_t timeout_ms);
-
-/** @brief Success toast */
-void ui_notify_success(const char* message, uint16_t timeout_ms);
-
-/** @brief Warning toast */
-void ui_notify_warning(const char* message, uint16_t timeout_ms);
+/**
+ * @brief A short message (one line, ~30 chars), gone after @p timeout_ms
+ * @param kind NotifyInfo, or NotifySuccess / NotifyWarning / NotifyError (named on a 2nd line)
+ * @param timeout_ms 0 = stays until another notification replaces it
+ */
+void ui_notify_toast(ui_notify_kind_t kind, const char* message, uint16_t timeout_ms);
 
 /**
- * @brief Yes/no dialogue; @p callback fires on confirm
+ * @brief Ask: the user HOLDS BTN1 to confirm or presses BTN4/BTN5 to cancel
+ * @param message up to ~5 wrapped lines ('\n' breaks)
+ * @param callback runs once with the answer - check it: it also fires on cancel
  * @code{.c}
- * static void on_erase(void* ctx, void* unused) { (void)unused; wipe(ctx); }
+ * static void on_erase(void* ctx, bool confirmed) { if(confirmed) wipe(ctx); }
  * ui_notify_confirm("Erase all?", NULL, on_erase, m);
  * @endcode
  */
-void ui_notify_confirm(const char* message, const gfx_img_t* icon,
-                       void (*callback)(void*, void*), void* callback_ctx);
-
-/** @brief Text dialogue with a callback */
-void ui_notify_dialogue(const char* text, void (*callback)(void*, void*), void* callback_ctx);
-
-/** @brief Popup whose callback reports which way it was dismissed */
-void ui_notify_popup_with_cb(const char* header, const char* hint, const gfx_img_t* icon,
-                             void (*callback)(void*, bool), void* callback_ctx);
-
-/** @brief Hide the current notification. Pass NULL. */
-void ui_notify_hide(ui_notify_t* n);
-
-/** @brief Is a notification showing? */
-bool ui_notify_is_active(void);
-
-/** @brief Is this notification visible? Pass NULL for the current one. */
-bool ui_notify_is_visible(const ui_notify_t* n);
-
-/** @brief Make the next notification modal (swallows input - see the warning above) */
-void ui_notify_set_modal(bool modal);
-
-/** @brief Show or hide the confirm button */
-void ui_notify_set_show_confirm_btn(bool show);
-
-/** @brief Move the notification on screen */
-void ui_notify_set_pos_global(const uint16_t x, const uint16_t y);
+void ui_notify_confirm(const char* message, const gfx_img_t* icon, ui_notify_cb_t callback,
+                       void* callback_ctx);
 
 /** @} */ // end of grp_notify
 
@@ -3240,282 +2459,297 @@ void ui_notify_set_pos_global(const uint16_t x, const uint16_t y);
 
 /**
  * @defgroup grp_audio Audio Engine
- * @brief Real-time audio processing
+ * @brief Real-time audio: the engine, its buffers, source apps, MIDI and the input settings
  *
- * The audio engine allows TAPPs to process audio in real-time.
- * Audio callbacks run in a high-priority context.
+ * Point the app's `.engine_cb` at an engine_callbacks_t. The firmware installs it after
+ * `init()`, passes the app's model as `ctx`, and removes it before `deinit()`. Start and stop
+ * it with engine_set_active(). Callbacks run on the audio task: never block or allocate in them.
  *
  * @section audio_buffers Audio Buffers
- * Use the mixer getter functions for stable ABI:
- * - `mixer_get_out(mix)` - Output buffer (interleaved stereo: L, R, L, R, ...)
- * - `mixer_get_in(mix)` - Input buffer
- * - `mixer_get_fx(mix)` - FX send buffer
- * - `mixer_get_fs(mix)` - Frame size (total samples, L+R combined)
- * - Sample rate: 48kHz
+ * - `mixer_get_out(mix)` - output, interleaved stereo (L, R, L, R, ...), zeroed before `process()`.
+ * - `mixer_get_in(mix)` - input. A source app writes its sound here, see below.
+ * - `mixer_get_fx(mix)` - the FX send buffer.
+ * - `mixer_get_fs(mix)` - samples per block, L and R counted separately. `mixer_frames(mix)` is
+ *   the frame count.
+ * - Every buffer runs at `TAPP_SAMPLE_RATE` (48 kHz); a block is at most `TAPP_BLOCK_FRAMES_MAX`
+ *   frames.
  *
  * @section audio_example Example
  * @code{.c}
- * static void my_process(engine_t* engine, mixer_t* mix) {
+ * static void my_process(void* ctx, mixer_t* mix) {    // ctx = the app model
+ *     my_model_t* m = ctx;
  *     float* out = mixer_get_out(mix);
- *     uint32_t fs = mixer_get_fs(mix);
- *     for (uint32_t i = 0; i < fs; i += 2) {
- *         out[i] *= 0.5f;      // Left
- *         out[i+1] *= 0.5f;    // Right
- *     }
+ *     for(uint32_t i = 0, n = mixer_get_fs(mix); i < n; i += 2)
+ *         out[i] = out[i + 1] = m->gain * next_sample(m);
  * }
+ * static void my_active(void* ctx, bool on) { ((my_model_t*)ctx)->playing = on; }
+ * static uint_fast8_t my_is_active(void* ctx) { return ((my_model_t*)ctx)->playing; }
  *
- * static engine_callbacks_t my_engine = {
- *     .process = my_process,
+ * static const engine_callbacks_t my_engine = {
+ *     .process = my_process, .active = my_active, .is_active = my_is_active,
  * };
+ * // descriptor: .engine_cb = &my_engine        start/stop: engine_set_active(true/false)
  * @endcode
  *
- * @section audio_input Source tapps
+ * @section audio_input Source apps
  *
- * Declare the role once at file scope: `TAPP_DECLARE_TYPE(AppTypeSrc);`
- * (tapp-build stamps it into the manifest). The engine-replacing tapp everything
- * above describes is `TAPP_DECLARE_TYPE(AppTypeStandalone);` - declare one or the
- * other. No declaration at all is Utility: a game or tool that owns every button.
+ * Declare `TAPP_DECLARE_TYPE(AppTypeSrc);` once at file scope. A standalone app, which replaces
+ * the tape decks, declares `AppTypeStandalone`; an app with neither is a utility.
  *
- * A source tapp is an audio SOURCE: the firmware keeps its own tapedecks engine
- * running and records your process() output plus the live input, exactly like
- * the built-in radio (the device's input-volume param scales your output).
- * Write the WHOLE buffer from mixer_get_in() every block - overwrite it, don't
- * add. What you find in it on entry: ZEROS normally, or the LIVE INPUT when the
- * user turns the tapedecks' WET switch on, which is available to every source
- * tapp - transform it in place and your render replaces it. Ignore it and you
- * simply overwrite it.
+ * A source app feeds the tape decks: they keep running and record its sound together with
+ * the live input. Its level is the user's **src** level.
  *
- * mixer_get_fx() carries the decks' FX sends - whatever the four tapedecks are
- * feeding their Send knobs into, one block behind (2.667 ms), zero when no deck
- * has Send up. You OWN that buffer for the length of your process() call, the
- * same way the built-in FX chain does, and whatever you leave in it is what the
- * user hears:
- *   - leave it alone      -> the sends pass through dry (the default; a tapp
- *                            that ignores them doesn't silence them)
- *   - overwrite it        -> the user hears your processed version instead
- *   - mix it into your own output, then ZERO it -> heard once, through you
- * Mixing it in without zeroing means the sends are heard twice.
+ * **Write all of `mixer_get_in()` every block** - overwrite it, don't add to it. On entry it holds
+ * silence, or the live input when the user has WET on; process it in place to run the input
+ * through the app.
  *
- * One hazard: mixing mixer_get_fx() into mixer_get_in() closes a real feedback
- * loop (sends -> you -> in_bus -> recorded to tape -> played back -> sends).
- * Route sends to your output, or duck/analyse them, but think twice before
- * folding them into the signal the decks are recording.
+ * `mixer_get_fx()` holds the decks' FX sends, one block late (2.7 ms) and silent when no deck
+ * sends. Whatever is left in it after `process()` is what the user hears:
  *
- * Your samplerate is your own business - you always get the real 48 kHz bus.
- * To work internally at 24 kHz (the built-in radio's own trick, which halves
- * your per-block budget) render into your own half-length scratch and convert
- * with ups2x_f32_add(); for 12 kHz cascade two stages through a 24 kHz
- * intermediate. Both dull the top end - noticeably from ~10 kHz at 24 kHz, and
- * from ~2.5 kHz cascaded from 12 kHz, so treat 12 kHz as a lo-fi/pad rate. To
- * PROCESS the live input at a lower rate, dec2x_f32() is the matching
- * decimator. Q15-internal DSP (Q15_MUL/Q15_LERP/lutsin_q15) pairs well with
- * 24 kHz; float is fully supported too.
+ * - **Leave it alone:** the sends play dry. This is the default.
+ * - **Overwrite it:** the user hears your processed version.
+ * - **Mix it into your output, then zero it:** the sends are heard once, through your app.
+ *   Without the zeroing they are heard twice.
  *
- * UI policy: a source tapp comes up with NO statusbar and the hints UP. Both are
- * DEFAULTS, not prohibitions - ui_statusbar_show(true) and ui_hints_show(false)
- * are each honoured, and a fullscreen tapp whose picture IS the app typically
- * wants exactly that pair: the top 60 rows back, and the battery still visible
- * on something you leave running all night. Refocus re-applies the house style,
- * so re-assert whatever you want from on_resume().
- * Hiding the hints costs you nothing structural: BTN4/BTN5 hold stay the
- * system's back and exit whether or not the band is up. It costs you the only
- * place those gestures are ever NAMED, so hide them only when the app is
- * obvious without labels.
+ * @note Mixing `mixer_get_fx()` into `mixer_get_in()` makes a feedback loop: the sends are
+ * recorded, played back and sent again. Do it only with care.
  *
- * MIDI: declaring any midi_* handler in engine_callbacks_t diverts
- * note/CC/pitch-bend/aftertouch/prog-change from the tapedecks to you while
- * resident; MIDI clock and transport ALWAYS stay with the decks, so the tape
- * stays DAW-syncable. No handlers = the decks keep all MIDI.
+ * A source app starts with the statusbar hidden and the hints shown (@ref app_display). Holding
+ * BTN4 / BTN5 always goes back to the main menu / out to the tape screen, even with the hints
+ * hidden - but the hints are the only place those holds are named, so hide them only if the
+ * app is obvious without labels.
  *
- * Lifecycle: the exit gesture is system-owned - BTN4 hold = back to the menu,
- * BTN5 hold = out to the main screen, neither reaches on_input - and it only
- * backgrounds the tapp: you keep sounding and being recordable, and the user
- * unloads you from the input-source picker.
- * engine_set_callbacks/engine_set_active/engine_clear_callbacks work unchanged.
- * Install order in init(): call engine_set_callbacks() BEFORE engine_set_active()
- * - a set_active before your callbacks are installed is ignored.
+ * Leaving a source app only puts it in the background: it keeps playing and can still be
+ * recorded. The user unloads it from the source picker. For MIDI, see midi_bus().
  *
- * @note Firmware older than this feature ignores the declaration and loads the
- * tapp as a plain engine tapp: audio goes to the monitor, not the record path.
+ * @section audio_rate Computing at a lower rate
+ *
+ * The buffers are always 48 kHz, but an app can compute at a lower rate to save CPU. For
+ * 24 kHz, render half as many samples into a scratch buffer and
+ * upsample with ups2x_f32_add(); two stages give 12 kHz. dec2x_f32() goes the other way, for
+ * processing the live input. 24 kHz dulls the sound noticeably from about 10 kHz, 12 kHz from
+ * about 2.5 kHz, so keep 12 kHz for lo-fi sounds and pads. The Q15 tables (lutsin_q15,
+ * lutcos_q15, lutexp_neg_q15, lutsat_q15) suit 24 kHz work; float works too.
  *
  * @{
  */
 
 /**
- * @brief Your model, as registered by engine_set_callbacks (the auto-register passes
- * os_app_get_model(app))
- * @param engine Engine pointer passed to your callback
- * @return Your callback context (typically your model pointer)
+ * @brief Start or stop the app's audio engine
+ * @param state true to start, false to stop
  *
- * A session constant for your image - but NOT one to fetch in init(): it answers NULL until
- * your callbacks are installed, and on the auto-register path that happens after init()
- * returns. Your model is os_app_get_model(app), the same pointer the auto-register hands
- * this function; keep it in a static from init() and use that in process(). Calling this
- * per block costs a range walk on the audio task for a value that cannot change:
- * @code{.c}
- * static my_model_t* g_model;          // g_model = os_app_get_model(app) in init(), NULL in deinit()
- * static void my_process(engine_t* engine, mixer_t* mix) {
- *     my_model_t* m = g_model;
- *     if(!m) return;
- *     // Now use m->your_data
- * }
- * @endcode
- */
-void* engine_get_ctx(engine_t* engine);
-
-/**
- * @brief Set audio engine callbacks for the app
- * @param app App instance
- * @param cb_ctx Callback context (usually model pointer)
+ * Call it on every play / stop, not only in `init()`. After a few seconds with nothing playing
+ * the firmware pauses audio and stops calling `process()`, and only `engine_set_active(true)`
+ * starts it again - an app that just flips its own playing flag stays silent. The call runs the
+ * app's `active` callback before it returns, and keeps the firmware's idle and sleep decisions
+ * up to date.
  *
- * The app's `engine_cb` field must point to a valid `engine_callbacks_t`.
- */
-void engine_set_callbacks(os_app_t* app, void* cb_ctx);
-
-/**
- * @brief Set audio engine active state - and THE way to un-park the audio path
- * @param state true to enable processing, false to disable
- *
- * Call this on every transport change, not just at init. Two things hang off it:
- *
- * 1. **It wakes the audio path.** After a few seconds with nothing active the firmware
- *    PARKS the SAI DMA, which stops your process() from being called at all. A parked
- *    engine cannot restart itself, so setting your own `playing` flag behind this call's
- *    back leaves the app silent until it is reloaded. `engine_set_active(true)` is what
- *    un-parks it, and it dispatches your `active` callback synchronously, so your flag is
- *    already updated by the time it returns.
- * 2. **It keeps the firmware's activity cache honest** while the engine is not running
- *    (parked, or mid-teardown) - that cache is what the idle and sleep decisions read.
- *
- * Install order in init(): engine_set_callbacks() FIRST. A set_active before your callbacks
- * are installed is ignored, and so is one from an app that owns no engine slot.
- *
- * @see engine_callbacks_t::is_active - the per-block answer this keeps in step with.
+ * Calling it from `init()` is fine: the firmware applies it once the callbacks are installed.
+ * A call from an app without an engine is ignored.
  */
 void engine_set_active(bool state);
 
-/**
- * @brief Clear audio engine callbacks
- *
- * @warning Call this in your deinit() callback before the TAPP unloads
- * to prevent the engine from calling freed TAPP code.
- */
-void engine_clear_callbacks(const engine_callbacks_t* cb);
+/** @name MIDI @{ */
+/* MIDI status bytes - channel-voice are the high nibble, system real-time the whole byte. */
+#define MIDI_NOTE_OFF 0x80
+#define MIDI_NOTE_ON 0x90
+#define MIDI_POLY_AT 0xA0
+#define MIDI_CC 0xB0
+#define MIDI_PROG_CHANGE 0xC0
+#define MIDI_AFTERTOUCH 0xD0
+#define MIDI_PITCH_BEND 0xE0
+#define MIDI_CLOCK 0xF8
+/* Unassigned in the MIDI spec and never sent over USB: the engine's sync pulse, from whichever
+ * sync mode is on. The two data bytes carry the frame offset inside the block where it happened
+ * (14-bit, data1 low). */
+#define MIDI_SYNC 0xF9
+#define MIDI_START 0xFA
+#define MIDI_CONTINUE 0xFB
+#define MIDI_STOP 0xFC
+
+#define MIDI_BUS_RING 64u
+
+/* Who owns channel-voice MIDI. Transport and sync words reach every reader regardless. */
+#define MIDI_CLAIM_TAPP 1u  /* a tapp called midi_bus(true) */
+#define MIDI_CLAIM_RADIO 2u /* a station is loaded */
+
+typedef struct {
+    uint32_t head;       /* words produced so far; ring index = head & (MIDI_BUS_RING - 1) */
+    uint32_t sync_count; /* sync pulses so far */
+    uint32_t ring[MIDI_BUS_RING]; /* status | data1 << 8 | data2 << 16 */
+    uint8_t cc[128];     /* last value per controller, any channel */
+    uint8_t vel[128];    /* last velocity per note, 0 = off (NOTE_ON vel 0 folded here) */
+    uint32_t held[4];    /* 128-bit held-note set */
+    int16_t bend;        /* -8192..8191 */
+    uint8_t aftertouch;
+    uint8_t program;
+    uint8_t transport;   /* last MIDI_START / MIDI_CONTINUE / MIDI_STOP, 0 = none yet */
+    uint8_t claimed;     /* MIDI_CLAIM_* bits */
+} midi_bus_t;
+
+/* ---- readers: plain loads, no call ---- */
+
+static inline uint8_t midi_status(uint32_t m) {
+    return (uint8_t)((m & 0xF0u) == 0xF0u ? (m & 0xFFu) : (m & 0xF0u));
+}
+static inline uint8_t midi_channel(uint32_t m) { return (uint8_t)(m & 0x0Fu); }
+static inline uint8_t midi_data1(uint32_t m) { return (uint8_t)((m >> 8) & 0x7Fu); }
+static inline uint8_t midi_data2(uint32_t m) { return (uint8_t)((m >> 16) & 0x7Fu); }
+static inline bool midi_note_on(uint32_t m) {
+    return (m & 0xF0u) == MIDI_NOTE_ON && midi_data2(m) != 0;
+}
+static inline int32_t midi_bend_of(uint32_t m) {
+    return (int32_t)(((uint32_t)midi_data2(m) << 7) | midi_data1(m)) - 8192;
+}
+static inline uint32_t midi_sync_offset(uint32_t m) {
+    return ((uint32_t)midi_data2(m) << 7) | midi_data1(m);
+}
+
+/* Next word after *cursor, oldest first. A reader that fell more than a ring behind resumes
+ * at the oldest word still present. */
+static inline bool midi_poll(const midi_bus_t* b, uint32_t* cursor, uint32_t* msg) {
+    const uint32_t head = *(const volatile uint32_t*)&b->head;
+    if(*cursor == head) return false;
+    if(head - *cursor > MIDI_BUS_RING) *cursor = head - MIDI_BUS_RING;
+    *msg = b->ring[*cursor & (MIDI_BUS_RING - 1u)];
+    (*cursor)++;
+    return true;
+}
+/* A sync pulse arrived since *last; consume-on-read. */
+static inline bool midi_sync(const midi_bus_t* b, uint32_t* last) {
+    const uint32_t c = *(const volatile uint32_t*)&b->sync_count;
+    if(c == *last) return false;
+    *last = c;
+    return true;
+}
+static inline bool midi_note_held(const midi_bus_t* b, uint8_t n) {
+    return (b->held[(n & 127u) >> 5] >> (n & 31u)) & 1u;
+}
+static inline uint8_t midi_velocity(const midi_bus_t* b, uint8_t n) { return b->vel[n & 127u]; }
+static inline uint8_t midi_cc(const midi_bus_t* b, uint8_t cc) { return b->cc[cc & 127u]; }
+static inline int32_t midi_bend(const midi_bus_t* b) { return b->bend; }
+static inline uint8_t midi_aftertouch(const midi_bus_t* b) { return b->aftertouch; }
+static inline uint8_t midi_program(const midi_bus_t* b) { return b->program; }
+static inline uint8_t midi_transport(const midi_bus_t* b) { return b->transport; }
 
 /**
- * @brief Get the global engine handle
+ * @brief The MIDI bus. Call it once in init() and keep the pointer.
+ * @param claim true: notes, CCs, pitch bend, aftertouch and program changes go to the app
+ *        instead of the tape decks (or a loaded radio station) until the app unloads.
+ *        false: read only - the decks keep playing the notes. A source app that only follows
+ *        the tape's sync passes false.
+ * @return The bus: read-only, owned by the firmware, valid for the life of the device.
  *
- * Your process() callback is handed an engine_t*, but init()/tick() are not -
- * use this when you need it outside the audio callback.
+ * Every incoming MIDI message and every sync pulse lands on the bus, which also keeps the
+ * current state. Clock, sync and transport reach every reader whatever the claim. While a
+ * source app is loaded, the decks ignore Start / Continue / Stop and leave the transport to it.
+ *
+ * The readers are inline loads, cheap enough for the audio task:
+ *
+ * - **State:** midi_note_held(), midi_velocity(), midi_cc(), midi_bend(), midi_aftertouch(),
+ *   midi_program(), midi_transport().
+ * - **Events, in order:** midi_poll(), decoded with midi_status(), midi_channel(),
+ *   midi_data1(), midi_data2(), midi_note_on() and midi_bend_of().
+ * - **Sync pulses:** midi_sync(), or `MIDI_SYNC` events with midi_sync_offset() for the frame.
+ *
+ * midi_poll() reads through your own cursor, so any number of readers can coexist. Keep it in
+ * the app model and start it at `bus->head`; a cursor of 0 replays up to the last 64 messages.
+ *
+ * @code{.c}
+ * // init()
+ * m->bus = midi_bus(true);                 // true: channel-voice MIDI is the app's, not the decks'
+ * m->cursor = m->bus->head;               // from now on, not the ring's backlog
+ * // process()
+ * if(midi_note_held(m->bus, 60)) ...;      // state: what is held / last CC / bend ...
+ * if(midi_sync(m->bus, &m->sync_seen)) restart_loop();   // a sync pulse since last call
+ * uint32_t w;                              // or the events, in order:
+ * while(midi_poll(m->bus, &m->cursor, &w)) {
+ *     switch(midi_status(w)) {
+ *     case MIDI_NOTE_ON:  if(midi_note_on(w)) note_on(midi_data1(w), midi_data2(w)); else note_off(midi_data1(w)); break;
+ *     case MIDI_NOTE_OFF: note_off(midi_data1(w)); break;
+ *     case MIDI_CC:       cc(midi_data1(w), midi_data2(w)); break;
+ *     case MIDI_SYNC:     restart_loop_at(midi_sync_offset(w)); break;  // frame within this block
+ *     }
+ * }
+ * @endcode
  */
-engine_t* engine_get(void);
+const midi_bus_t* midi_bus(bool claim);
+/** @} */
 
 /**
- * @brief Is the audio engine currently processing? (non-zero = yes)
+ * @brief The mixer, for init() and tick()
  *
- * Returns uint_fast8_t, not bool, to match the firmware ABI - same as the
- * is_active member of engine_callbacks_t above.
- */
-uint_fast8_t engine_is_active(void);
-
-/**
- * @brief Get the global mixer handle
- *
- * The counterpart to engine_get(): your process() callback is handed a mixer_t*,
- * but init()/tick() have no other way to reach it. Use the accessors above for
- * buffers; mixer_t itself stays opaque.
+ * `process()` is handed it directly. mixer_t is opaque: use the accessors above.
  */
 mixer_t* mixer_get(void);
 
-/* NOTE: the mixer ROUTING setters are still not exposed as such - mixer_monitor_enable,
- * mixer_mix_wet_enable and mixer_output_resample_enable flip fields on the one global
- * mixer, and mixer_mix_wet_enable additionally calls os_audio_update_chain(), the
- * OS-level control the note below rules out.
- *
- * Two of the three modes are reachable through os_audio_* wrappers instead -
- * os_audio_set_monitor() and os_audio_set_wet() - which record intent, re-derive
- * everything that depends on the change, and return the state actually in effect. The
- * objection that kept wet out ("nothing restores it when your app exits") is answered
- * for it specifically: a tapp's wet is remembered and put back when the image goes, on
- * the normal close and on every load-failure path alike.
- *
- * BOUNCE has no wrapper and wants none: it moves the record tap to the master out bus,
- * which a standalone tapp writes itself later in the same block, so it would record
- * silence. Mix your own. */
+/* NOTE: the mixer's routing setters are not exported. Monitoring and WET are set through
+ * os_audio_set_monitor() and os_audio_set_wet() below. BOUNCE is left out on purpose: a
+ * standalone app writes the master output itself, later in the same block, so bounce would
+ * record silence - mix your own instead. */
 
-/* NOTE: there is deliberately no audio_pause_rx/tx or audio_resume_rx/tx here.
- * SAI DMA is an OS-level control, not part of the engine abstraction, and the
- * firmware already pauses/resumes RX+TX around an engine-app swap (os_app_launch)
- * - the resume lands after your init() returns. Use engine_set_active(). */
+/* NOTE: there is no audio pause / resume call. The firmware pauses audio around an app launch
+ * itself; use engine_set_active(). */
 
 /**
- * @brief Switch which external source the codec listens to, and apply it
- * @param line_mic_only Vestigial - line and mic are the only sources; both modes toggle
- * @return The source now selected: 0 = line/aux, 1 = mic
+ * @brief Switch the input between line and mics
+ * @return The input now selected: 0 = line, 1 = mics
  *
- * This is the same global the device's own input setting drives - it reconfigures
- * the codec input path, re-derives monitoring (mic monitoring needs the headphone
- * jack, because the speaker would feed back) and wakes the audio DMA if it had
- * idled. It PERSISTS after your app exits, exactly as if the user had changed it in
- * the menu, so only call it in response to a deliberate user action.
+ * This changes the device's input setting: it is saved and stays after the app exits, so call
+ * it only when the user asks. It also updates monitoring - the mics are monitored only with
+ * headphones plugged in, or the speaker would feed back.
  */
-uint8_t os_audio_switch_input(bool line_mic_only);
+uint8_t os_audio_switch_input(void);
 
 /**
- * @brief Current input source WITHOUT changing it: 0 = line/aux, 1 = mic
+ * @brief The current input, without changing it: 0 = line, 1 = mics
  *
- * Settled before your init() runs (a persisted mic selection is re-applied at
- * boot), so it is safe to drive your UI from this at launch.
+ * Already settled when `init()` runs, so it is safe to set up the app's UI from it.
  */
 uint8_t os_audio_get_input(void);
 
 /**
- * @brief Is the dry monitor on? (the live input you hear while idle/recording)
+ * @brief Is the live input audible (monitoring)?
  *
- * The EFFECTIVE state, not the intent - it also moves on its own when the source
- * changes or the headphone jack is plugged/unplugged, so read it for display
- * rather than caching a flag of your own.
+ * The firmware also changes it when the input is switched or headphones are plugged in or out,
+ * so read it when drawing rather than caching it.
  */
 bool os_audio_get_monitor(void);
 
 /**
- * @brief Turn the dry monitor on/off - the user-facing toggle.
- * @return the state actually in effect afterwards
+ * @brief Turn monitoring of the live input on or off
+ * @param on true to turn monitoring on
+ * @return The state actually in effect
  *
- * Enabling is REFUSED for mic with no headphones plugged (the speaker would feed
- * back), which is why you should use the return value rather than assume. Your
- * intent is remembered, so a later source switch or jack replug restores what you
- * asked for.
+ * Turning it on is refused for the mics with no headphones plugged in (the speaker would feed
+ * back), so use the return value. The request is remembered: switching the input or plugging
+ * headphones in later restores it.
  *
- * Device-wide, but SESSION-only: unlike the input source and volume, this is not
- * persisted and returns to on at the next boot. Playback is unaffected - this
- * gates the live input, not what your app writes to mixer_get_out().
+ * Device-wide but not saved: monitoring is on again after a restart. It only affects the live
+ * input, not what the app writes to `mixer_get_out()`.
  */
 bool os_audio_set_monitor(bool on);
 
 /**
- * @brief Is the live input routed through the FX graph? (WET)
+ * @brief Is the live input going through the FX chain (WET)?
  *
- * Effective state, not intent - read it for display rather than caching a flag.
+ * Read it when drawing rather than caching it.
  */
 bool os_audio_get_wet(void);
 
 /**
- * @brief Route the live input through the FX graph - the device's WET mode
- * @return the state actually in effect afterwards
+ * @brief Send the live input through the FX chain - the device's WET mode
+ * @param on true for wet
+ * @return The state actually in effect
  *
- * Wet folds the input into the processor bus ALONGSIDE the decks' FX sends, runs the FX
- * graph over both, and moves the record tap to the result - so what you record is what
- * you hear, and mixer_get_record() hands it to you. The dry monitor and the codec's own
- * mic mix are turned off while it is on, because the input is already audible through the
- * graph; with an EMPTY FX chain nothing is processed and the tap carries sends + input.
+ * With wet on, the input and the decks' FX sends go through the FX chain together, and the
+ * result is what gets recorded (mixer_get_record() returns it). Monitoring and the codec's own
+ * mic mix turn off, since the input is already heard through the chain. With an empty chain
+ * the sound passes through unprocessed.
  *
- * DEVICE-WIDE, like os_audio_switch_input() - the same mode the device's own WET switch
- * drives, so only call it for a deliberate user action. Session state, not persisted.
- *
- * Unlike the input source, YOUR change is undone for you: the firmware remembers what wet
- * was when you first touched it and puts it back when your app exits, including when
- * init() returns false. Set it back yourself if you want it restored earlier.
+ * Device-wide, like os_audio_switch_input(), so call it only when the user asks. It is not
+ * saved, and when the app exits wet goes back to what it was before the app changed it -
+ * also when `init()` fails.
  */
 bool os_audio_set_wet(bool on);
 
@@ -3530,51 +2764,51 @@ bool os_audio_set_wet(bool on);
  * @brief Button and encoder input
  *
  * @section input_callback Input Callback
- * Use the `on_input` callback in your app descriptor:
+ * Use the `on_input` callback in the app descriptor:
  *
  * @code{.c}
  * void my_input(os_app_t* app, uint8_t btn, KeyStateEnum state) {
- *     if (btn == 0 && state == KEY_STATE_PRESSED) {
+ *     if(btn == BTN1 && state == KEY_STATE_PRESSED) {
  *         // BTN1 pressed
  *     }
  * }
  * @endcode
  *
- * BTN4 and BTN5 HOLD are the firmware's on a tapp that DECLARES a type, and never
- * reach on_input there (their presses do - and those two PRESS cells are yours to
- * label, see ui_hints_set_labels()). A UTILITY tapp - the default, declare nothing -
- * keeps both holds and every hint cell, and calls os_app_exit() itself; it is opened
- * from the main menu's setup -> utils row. A utility tapp in WINDOW mode is the one
- * exception: it paints over the still-visible main menu, which cannot take input
- * while a window is up, so BTN4 and BTN5 HOLD close the window (presses stay yours).
- * See the window-mode fields on os_app_t. Standalone tapp: a hold shows the
- * hints, or, if you installed no hints of your own, opens the MAIN MENU straight
- * away; hints up, BTN4 hold opens the main menu over the running tapp (audio keeps
- * going, tick() pauses, on_pause/on_resume bracket it) and BTN5 hold closes the
- * hints - even ones you raised yourself with ui_hints_show(). The user leaves
- * through the main-app switcher (BTN1 hold on the main menu's setup ENTRY - the
- * gesture is on the entry, not a row inside it - which lists tapedecks first
- * while a tapp runs: pick it to return to the decks, pick another app to swap
- * the running one). Source tapp: BTN4 hold = back to the menu, BTN5 hold = out
- * to the main screen, both background it. While your own ui_menu_t is shown it
- * is modal and takes those holds itself (back / close). os_app_exit() remains
- * for a programmatic exit.
+ * BTN4 and BTN5 HOLD are the firmware's on a tapp that DECLARES a type and never reach
+ * on_input there; their presses do (and those two PRESS cells are the tapp's to label, see
+ * ui_hints_set()). By role:
+ *   - utility (the default, declare nothing): both holds and every hint cell belong to the
+ *     tapp, and it exits with os_app_exit(). Opened from the utils list (BTN1 hold on setup).
+ *     In WINDOW mode BTN4/BTN5 HOLD close the window instead - the menu underneath cannot take
+ *     input while a window is up; presses stay with the tapp. See os_app_set_window().
+ *   - standalone: a hold reveals the tapp's hints or, if it installed none, opens the main
+ *     menu straight away - a band of only the firmware's two icons would be pointless. Hints
+ *     up, BTN4 hold opens the main menu over the running tapp (audio keeps going, tick()
+ *     pauses, on_pause/on_resume bracket it); BTN5 hold puts away hints the FIRMWARE revealed,
+ *     and opens the menu too on a band the tapp keeps up with ui_hints_show(true). A short
+ *     BTN4/BTN5 press on a cell left blank dismisses system-revealed hints and is swallowed.
+ *     The user leaves through the main-app switcher (BTN1 hold on the main menu's tape ENTRY -
+ *     the gesture is on the entry, not a row inside it - which lists tapedecks first while
+ *     a tapp runs: picking it returns to the decks, picking another app swaps the running one).
+ *   - source: BTN4 hold = back to the menu, BTN5 hold = out to the main screen; both
+ *     background the tapp.
+ * While the tapp's own ui_menu_t is shown it is modal and takes those holds itself (back /
+ * close). os_app_exit() remains for a programmatic exit.
  *
  * @section input_buttons Button IDs
- * | ID | Name | Common Use |
- * |----|------|------------|
- * | 0 | BTN1 | Select |
- * | 1 | BTN2 | - |
- * | 2 | BTN3 | - |
- * | 3 | BTN4 | system: quick hints / main menu (HOLD); press is yours |
- * | 4 | BTN5 | system: close hints (HOLD); press is yours |
- * | 5 | ENCODER_I | Rotation notification - see below, NOT a button |
+ * | id | Common use |
+ * |----|------------|
+ * | BTN1 | Select |
+ * | BTN2 | - |
+ * | BTN3 | - |
+ * | BTN4 | system: quick hints / main menu (HOLD) on a standalone; press goes to the tapp |
+ * | BTN5 | system: close hints / main menu (HOLD) on a standalone; press goes to the tapp |
+ * | BTN_ENCODER | the encoder turned - NOT a button |
  *
- * There is no encoder push button. ID 5 fires when the encoder is *turned*, and
- * the firmware sends it with a zero-initialised state, so `state` is always
- * `KEY_STATE_RELEASED`. Never branch on the state for ID 5 - either ignore the
- * event and poll os_controls_encoder_get_delta() from tick(), or use ID 5 purely
- * as a "something moved" hint and read the delta in response.
+ * There is no encoder push button. BTN_ENCODER fires when the encoder is *turned*, and
+ * its `state` is always `KEY_STATE_RELEASED` - never branch on it. Either ignore the event
+ * and poll os_controls_encoder_get_delta() from tick(), or treat it as "something moved"
+ * and read the delta in response. hint_press(btn) / hint_hold(btn) name a button's cells.
  *
  * @{
  */
@@ -3601,22 +2835,22 @@ int32_t os_controls_encoder_get_delta(void);
  * something of its own: hold "right" in a game for three seconds and the device
  * powers down mid-play.
  *
- * Pass `false` to take the button, `true` to give it back. Only take it if you
- * actually use BTN5 holds - while it is yours, the user cannot switch the device
- * off without leaving your app first, so make sure leaving is possible.
+ * Pass `false` to take the button, `true` to give it back. Take it only if the app
+ * actually uses BTN5 holds - while the app holds it, the user cannot switch the device
+ * off without leaving the app first, so leaving must remain possible.
  *
- * Restored for you when your image closes, INCLUDING when init() returns false
- * (which never runs deinit()) and when your tapp faults. You still should give it
+ * Restored automatically when the image closes, INCLUDING when init() returns false
+ * (which never runs deinit()) and when the tapp faults. The app should still give it
  * back explicitly; the sweep is a safety net, not the contract.
  *
- * @param state true = BTN5 hold powers the device off (the default), false = it is yours
+ * @param state true = BTN5 hold powers the device off (the default), false = the app owns it
  *
  * @code{.c}
- * static bool app_init(void* ctx) {
+ * static bool app_init(os_app_t* app) {
  *     os_controls_enable_shutdown(false); // BTN4/BTN5 holds are our D-pad
  *     return true;
  * }
- * static void app_deinit(void* ctx) {
+ * static void app_deinit(os_app_t* app) {
  *     os_controls_enable_shutdown(true);
  * }
  * @endcode
@@ -3626,7 +2860,7 @@ void os_controls_enable_shutdown(bool state);
 /* NOTE: os_controls_set_hold_timeout() is deliberately not exposed. The hold
  * threshold is device-wide state shared with the OS and every other app; a tapp
  * changing it would silently retune the whole UI, and nothing restores it on
- * exit. Handle your own long-press by timing KEY_STATE_PUSH with os_tick_get(). */
+ * exit. Implement custom long-press handling by timing KEY_STATE_PRESSED with os_tick_get(). */
 
 /** @} */ // end of grp_input
 
@@ -3641,27 +2875,19 @@ void os_controls_enable_shutdown(bool state);
  * The tape API provides access to the global tape storage and transport state.
  * TAPPs can query tape state and control playback/recording.
  *
- * @section tape_state Tape States
- * - TAPE_STATE_UNMOUNTED (0) - No tape loaded
- * - TAPE_STATE_IDLE (1) - Tape loaded but not playing/recording
- * - TAPE_STATE_PLAYING (2) - Tape is playing
- * - TAPE_STATE_RECORDING (3) - Tape is recording
- *
  * @{
  */
 
-#ifndef FIRMWARE_BUILD
 // Opaque tape type for external apps
 typedef struct tape_storage tape_t;
 
-// Tape state enum (must match firmware tape_state_t)
+/** tape_get_state(). */
 typedef enum {
-    TAPE_STATE_UNMOUNTED = 0,
-    TAPE_STATE_IDLE = 1,
+    TAPE_STATE_UNMOUNTED = 0, /**< no tape loaded */
+    TAPE_STATE_IDLE = 1,      /**< loaded, not playing or recording */
     TAPE_STATE_PLAYING = 2,
     TAPE_STATE_RECORDING = 3,
 } tape_state_t;
-#endif
 
 /**
  * @brief Get the global tape instance
@@ -3677,13 +2903,6 @@ tape_t* tape_get(void);
 tape_state_t tape_get_state(const tape_t* tape);
 
 /**
- * @brief Check if tape is idle (not playing or recording)
- * @param tape Tape instance from tape_get()
- * @return true if tape is idle
- */
-bool tape_is_idle(const tape_t* tape);
-
-/**
  * @brief Get tape length in tape positions (SD sectors)
  * @param tape Tape instance from tape_get()
  * @return Tape length in positions. 1 position = 1 sector = 64 stereo frames,
@@ -3697,16 +2916,16 @@ typedef struct tape_rec tape_rec_t;
 /**
  * @brief Begin recording session
  * @param tape Tape instance from tape_get()
- * @param pos Starting position in tape POSITIONS (SD sectors), NOT frames.
- *            tape_get_position() returns frames - divide by 64.
+ * @param pos Starting position in tape POSITIONS (SD sectors, 64 stereo frames each), NOT frames.
  * @param reverse True for reverse direction
- * @return Recording handle, or NULL if already recording
+ * @return Recording handle. A take still open is aborted first.
  *
- * Undo capture is automatic. Marks created on commit.
+ * No undo is captured for the take, and the tape's previous undo/redo is dropped. Marks
+ * are created on commit.
  *
- * @note This only brackets the take (undo, timeline, mark). It writes NO audio -
- * your engine callback has replaced the one that normally does. Stream your
- * output to the tape with tape_write() between begin and commit.
+ * @note This only brackets the take (timeline, mark). It writes NO audio -
+ * the tapp's engine callback has replaced the one that normally does. Stream the
+ * tapp's output to the tape with tape_write() between begin and commit.
  */
 tape_rec_t* tape_rec_begin(tape_t* tape, uint32_t pos, bool reverse);
 
@@ -3742,7 +2961,7 @@ bool tape_rec_undo_execute(tape_t* tape);
 
 // ----------------------------------------------------------------------------
 // Tape "creative kernel" - minimal read access for sampling/cutup TAPPs.
-// Positions are in STEREO FRAMES (1 frame = L+R; tape_size() is also frames).
+// Positions are in STEREO FRAMES (1 frame = L+R). tape_size() is in POSITIONS - multiply by 64.
 // ----------------------------------------------------------------------------
 
 /**
@@ -3771,7 +2990,7 @@ bool tape_marks_get(const tape_t* tape, uint32_t idx, uint32_t* start_frame, uin
  * @return Number of stereo frames actually read
  *
  * @warning Blocks on SD DMA. Call from tick()/init() (main thread), NEVER
- * from the audio process() callback. Sequence the slices yourself in process().
+ * from the audio process() callback. The tapp sequences the slices itself in process().
  */
 uint32_t tape_read(const tape_t* tape, uint32_t pos_frame, float* dst, uint32_t n_frames);
 
@@ -3786,7 +3005,7 @@ uint32_t tape_read(const tape_t* tape, uint32_t pos_frame, float* dst, uint32_t 
  * Clamped to the tape length and addressed from the tape's own data area, so it
  * cannot reach any other file. Partial sectors are read-modify-written.
  *
- * This is how a TAPP records: ring your process() output in RAM and drain it
+ * This is how a TAPP records: ring the process() output in RAM and drain it
  * here from tick(), bracketed by tape_rec_begin()/tape_rec_commit() so a mark is
  * created. Undo covers only what tape_rec_begin() armed - writes outside a
  * begin/commit pair overwrite tape audio permanently.
@@ -3800,16 +3019,16 @@ uint32_t tape_read(const tape_t* tape, uint32_t pos_frame, float* dst, uint32_t 
  */
 uint32_t tape_write(tape_t* tape, uint32_t pos_frame, const float* src, uint32_t n_frames);
 
-/** @name Streaming windows - the path the built-in tapedecks use
+/** @name Streaming windows
  *
  * tape_read()/tape_write() above BLOCK: they DMA into a shared staging buffer and
- * memcpy out of it, on your tick(), which is the lowest-priority task in the system.
+ * memcpy out of it, on the app's tick(), which is the lowest-priority task in the system.
  * A four-track streamer built that way spends 30-135 ms of a 40 ms tick inside SD and
  * its record ring overflows - dropped frames, and a take that reads back decimated.
  *
- * This is the mechanism the firmware's own decks use instead. A tape_buffer_t owns TWO
- * 4096-frame windows of DMA-capable AXI SRAM. You call tape_buffer_update() from
- * process() with the window you are about to need; it either cache-hits (no I/O at all)
+ * Streaming windows avoid that. A tape_buffer_t owns TWO
+ * 4096-frame windows of DMA-capable AXI SRAM. The tapp calls tape_buffer_update() from
+ * process() with the window it is about to need; it either cache-hits (no I/O at all)
  * or posts one fire-and-forget SD command and returns in microseconds. Nothing blocks,
  * ever, and the DMA lands straight in the window - no copies.
  *
@@ -3819,21 +3038,21 @@ uint32_t tape_write(tape_t* tape, uint32_t pos_frame, const float* src, uint32_t
  * tape_buffer_flush() when the take ends, or the still-resident window never lands.
  *
  * Prefetch ONE WINDOW AHEAD. There is no miss detection - a late DMA silently replays
- * the stale window - so issue the request while you still have a window's worth of audio
+ * the stale window - so issue the request while a window's worth of audio is still
  * left to play. That is the ~85 ms budget the whole design rests on.
  *
- * The pool is small and shared with the firmware's decks. Take what you need in init(),
+ * The pool is small and shared with the firmware's decks. Claim what is needed in init(),
  * release it in deinit(), and check for NULL. The decks lend theirs back while a
  * standalone tapp holds the main engine slot, which is what makes four of them
  * available to a multitrack tapp at all.
  *
- * TWO CONSTRAINTS THAT SHAPE YOUR DESIGN, both easy to miss:
- *  - Windows tile a FIXED grid measured from the start of the tape. Any region you
- *    stream must be aligned to TAPE_WINDOW_FR frames, or every window straddles two
- *    of your regions. Snap your region offsets, not your reads.
- *  - Nothing tells you a read has LANDED - tape_buffer_ready() means "issued". The
- *    design is deadline-based, not completion-based: request a window early enough
- *    that it cannot still be in flight when you reach it. A late one silently
+ * TWO CONSTRAINTS THAT SHAPE THE DESIGN, both easy to miss:
+ *  - Windows tile a FIXED grid measured from the start of the tape. Any streamed region
+ *    must be aligned to TAPE_WINDOW_FR frames, or every window straddles two
+ *    regions. Snap the region offsets, not the reads.
+ *  - Nothing signals that a read has LANDED - tape_buffer_update() returning true means
+ *    "issued". The design is deadline-based, not completion-based: request a window early
+ *    enough that it cannot still be in flight when playback reaches it. A late one silently
  *    replays whatever was in the slot.
  * @{
  */
@@ -3843,15 +3062,13 @@ uint32_t tape_write(tape_t* tape, uint32_t pos_frame, const float* src, uint32_t
 /** Stereo frames per streaming window - 4096, about 85 ms at 48 kHz. */
 #define TAPE_WINDOW_FR 4096u
 
-#ifndef FIRMWARE_BUILD
-/** Opaque streaming window pair. You get a pointer; the body is firmware-private. */
+/** Opaque streaming window pair. The caller holds a pointer; the body is firmware-private. */
 typedef struct tape_buffer tape_buffer_t;
-#endif
 
 /**
  * @brief Claim a pair of DMA windows from the tape's pool
  * @param tape Tape instance from tape_get()
- * @return NULL when the pool is exhausted - ALWAYS check, and fail your init() if so
+ * @return NULL when the pool is exhausted - ALWAYS check, and fail init() if so
  */
 tape_buffer_t* tape_buffer_init(tape_t* tape);
 
@@ -3859,34 +3076,29 @@ tape_buffer_t* tape_buffer_init(tape_t* tape);
 void tape_buffer_deinit(tape_buffer_t* s);
 
 /**
- * @brief Request the window you will need NEXT, and swap the other one in to play now
+ * @brief Request the window needed NEXT, and swap the other one in to play now
  * @param s Window pair
  * @param pos Tape POSITION, and it must sit on the TAPE_WINDOW_POS grid
  * @param write true to write the evicted window back on the way out (recording)
- * @return false only if the SD queue was full; the pair is unchanged
+ * @return false only if the SD queue was full - and the slot is relabelled anyway, so it
+ *         will replay stale audio: treat false as a dropped window, not a retry
  *
  * **This is a two-slot pipeline, and the naming hides it.** On a miss the DMA is
  * started into the slot that was current, and the OTHER slot - the one a previous
- * call already filled - becomes what tape_buffer_get_ptr() returns. So you do not
- * request the window you are about to play; you request the one AFTER it, and read
- * back the one you requested last time. On a hit (either slot already holds `pos`)
+ * call already filled - becomes what tape_buffer_get_ptr() returns. So the caller does
+ * not request the window it is about to play; it requests the one AFTER it, and reads
+ * back the one it requested last time. On a hit (either slot already holds `pos`)
  * nothing is issued and that slot simply becomes current.
  *
- * Practically: at each window boundary call tape_buffer_req_new() then
- * tape_buffer_update() with `pos + TAPE_WINDOW_POS`, and play tape_buffer_get_ptr().
+ * Practically: at each window boundary call tape_buffer_update() with
+ * `pos + TAPE_WINDOW_POS`, and play tape_buffer_get_ptr().
  * After a seek the pipeline is empty, so prime it with TWO calls - the first has
  * nothing valid to hand back, which is why tape_buffer_clear_all_buffers() zeroes
- * both slots: you get a moment of silence rather than whatever was resident.
+ * both slots: the result is a moment of silence rather than whatever was resident.
  *
  * Safe from process(): a hit does no I/O, a miss posts one command and returns.
  */
 bool tape_buffer_update(tape_buffer_t* s, uint32_t pos, bool write);
-
-/** @brief Has the last request been issued? Cleared by tape_buffer_req_new(). */
-bool tape_buffer_ready(tape_buffer_t* s);
-
-/** @brief Arm the next request - call before the tape_buffer_update() for a new window. */
-void tape_buffer_req_new(tape_buffer_t* s);
 
 /**
  * @brief The resident window: TAPE_WINDOW_FR stereo frames, interleaved L,R
@@ -3904,7 +3116,7 @@ float* tape_buffer_get_next_ptr(tape_buffer_t* s);
  *
  * Recording persists only through eviction, so at the end of a take the resident
  * window(s) still hold audio that nothing has written. Call this once when the take
- * ends or you lose up to two windows of it.
+ * ends, or up to two windows of it are lost.
  */
 void tape_buffer_flush(tape_buffer_t* s);
 
@@ -3925,7 +3137,7 @@ void tape_buffer_mute_tail(tape_buffer_t* s, uint32_t sample_offset);
  *
  * Cues are what the device's skip-to-cue navigation steps through. Duplicates
  * within one sector are merged, the list is kept in tape order, and the save is
- * flagged for you. A cue at position 0 is perfectly legal.
+ * flagged automatically. A cue at position 0 is legal.
  */
 bool tape_cue_add(tape_t* tape, uint32_t start_frame, uint32_t end_frame);
 
@@ -3946,26 +3158,18 @@ bool tape_cue_get(tape_t* tape, uint32_t idx, uint32_t* start_frame, uint32_t* e
  * @brief Erase [start_frame, end_frame): audio, marks, and cues
  * @return false if the span is empty, off-tape, or a take is open
  *
- * The audio blocks are zeroed (asynchronously, on the storage task), 
- * the span is punched out of the recorded-region marks 
- * (a longer mark is split around it), every cue
- * overlapping the span is deleted, and the timeline waveform is refreshed.
+ * The audio blocks are zeroed (asynchronously, on the storage task), the span is punched out
+ * of the recorded-region marks (a longer mark is split around it), every cue overlapping the
+ * span is deleted, and the timeline waveform is refreshed.
  * Everything persists automatically.
  *
  * Cue indices shift on deletion - re-read tape_cues_count() and re-select
  * afterwards. The erase is captured by the single-level record undo
  * (tape_rec_undo_execute() restores it) for spans up to ~136 s and until the
  * next tape_rec_begin(); longer spans erase without undo. Refused while a
- * recording in progressq - commit or abort first.
+ * recording in progress - commit or abort first.
  */
 bool tape_erase(tape_t* tape, uint32_t start_frame, uint32_t end_frame);
-
-/**
- * @brief Current tape playhead position, in stereo frames
- * @param tape Tape instance from tape_get()
- * @return Playhead position (frames)
- */
-uint32_t tape_get_position(const tape_t* tape);
 
 /** @} */ // end of grp_tape
 
@@ -3977,12 +3181,10 @@ uint32_t tape_get_position(const tape_t* tape);
  * @defgroup grp_timeline Tape Timeline
  * @brief Control tape timeline visibility and display
  *
- * @section timeline_intro The strip is off for a tapp until you ask
+ * @section timeline_intro The strip is off for a tapp until requested
  *
- * Every tapp role defaults to no stock timeline - it belongs to the tape decks, and a
- * tapp that draws its own lanes does not want the device's strip over them. Ask for it
- * with tape_timeline_show(true), and point it at something with tape_timeline_setup()
- * plus tape_timeline_attach_default() or tape_timeline_attach_params().
+ * To display timeline - equest it with tape_timeline_show(true), and point it at the tapp's own params with
+ * tape_timeline_setup() plus tape_timeline_attach_params().
  * @{
  */
 
@@ -3991,17 +3193,9 @@ uint32_t tape_get_position(const tape_t* tape);
  * @param state true to show, false to hide
  *
  * REMEMBERED, like ui_hints_show() and ui_statusbar_show(): the firmware records the
- * request against YOUR image and replays it every time it re-derives the screen, so one
- * call in init() survives a menu round-trip with no on_resume() of your own. Keyed per
+ * request against the CALLING image and replays it every time it re-derives the screen, so
+ * one call in init() survives a menu round-trip with no on_resume() handling. Keyed per
  * image, so a co-resident source tapp and standalone tapp cannot overwrite each other's.
- *
- * Two things still hide it whatever you asked for, both deliberate: a main-menu SUBMENU
- * (it takes the screen rather than overlaying it, so nothing of yours may show through),
- * and window mode (the menu underneath owns every surface). The root menu overlays and
- * leaves your strip alone.
- *
- * Visibility only - it does not re-run tape_timeline_setup(), which would NULL the
- * params you registered.
  */
 void tape_timeline_show(bool state);
 
@@ -4049,31 +3243,18 @@ void tape_timeline_set_loop(bool state);
 void tape_timeline_switch_track(uint8_t tr);
 
 /**
- * @brief Bind the global tape playhead/loop/waveform to the timeline tracks
- * @param tracks Number of tracks to bind (match tape_timeline_setup)
- *
- * Call after tape_timeline_setup(...) and before tape_timeline_show(true) so the
- * real firmware timeline widget renders the actual tape playhead/waveform (where a
- * TAPP's recording lands). Without this the widget has no track params and won't
- * display.
- */
-void tape_timeline_attach_default(uint8_t tracks);
-
-/**
- * @brief Bind YOUR params to a timeline track, instead of the tapehead singleton
+ * @brief Bind the APP's params to a timeline track, instead of the tapehead singleton
  * @param track Track index (0-3), within the count given to tape_timeline_setup()
  * @param pos   Playhead position, in tape positions (frames / 64)
  * @param start Loop/selection start
  * @param end   Loop/selection end
  *
- * Use this rather than tape_timeline_attach_default() when your TAPP owns the
- * engine: the tapehead singleton stops advancing then, so a default-attached
- * timeline sits frozen. Drive the three params yourself from tick() and the widget
- * follows - and return true from tick() while the transport is moving, since advancing the
- * params does not by itself buy you the frame that repaints them.
+ * The app drives the three params from tick() and the widget follows - tick() must also
+ * return true while the transport is moving, since advancing the params does not by itself
+ * schedule the frame that repaints them.
  *
  * Call after tape_timeline_setup() and before tape_timeline_show(true). The
- * params must outlive the timeline - put them in your model, not on the stack -
+ * params must outlive the timeline - keep them in the app model, not on the stack -
  * and the visible span is taken from the currently loaded tape, so there is
  * nothing to size by hand.
  *
@@ -4092,13 +3273,13 @@ void tape_timeline_attach_params(uint8_t track, params_t* pos, params_t* start, 
  * @param user Passed through to the callback
  *
  * The callback fires on the UI task each frame the timeline is drawn - which is each frame
- * that gets painted at all, i.e. the ones your tick() asked for - AFTER the
+ * that gets painted at all, i.e. the ones the app's tick() requested - AFTER the
  * widget has fully rendered - waveform, playheads, loop shading, marks, cues and
  * the live-record waveform are already on screen. Draw on top of them; do not
  * redraw them. x/y/w are the widget's current on-screen rect; the height is not
- * passed (five parameters is the gateway ceiling) - it is whatever you gave
- * tape_timeline_setup(), and your drawing is clipped to the widget's actual box
- * either way. Pass NULL to remove; the firmware also clears the hook when your
+ * passed (five parameters is the gateway ceiling) - it is the value given to
+ * tape_timeline_setup(), and the callback's drawing is clipped to the widget's actual box
+ * either way. Pass NULL to remove; the firmware also clears the hook when the
  * app is unloaded.
  */
 void tape_timeline_set_gfx_cb(tapp_statusbar_gfx_cb cb, void* user);
@@ -4118,11 +3299,6 @@ void tape_timeline_set_gfx_cb(tapp_statusbar_gfx_cb cb, void* user);
  *
  * IMPORTANT:
  * - The returned pointer must remain valid for the app's lifetime
- * - Typically, you should return a pointer to a static os_app_t struct
- * - Use the native os_app_t type for compatibility
+ * - Typically, the implementation returns a pointer to a static os_app_t struct
  */
 __attribute__((weak)) os_app_t* tapp_get_descriptor(void);
-
-#ifdef __cplusplus
-}
-#endif

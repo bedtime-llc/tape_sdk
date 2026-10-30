@@ -2,38 +2,40 @@
 //
 // This is the reference for tape I/O from a tapp
 //
-//   process()  never touches the SD card. It copies the live input into a RAM
-//              ring on the way to the monitor output, and reads playback out of
-//              a RAM buffer. That is the whole audio-thread contract.
-//   tick()     does all the blocking work — draining the ring to tape_write()
-//              while recording, refilling the playback buffers with tape_read()
-//              while playing.
+//   process()  does ALL the tape I/O, and still never blocks. Playback and
+//              recording both run through one tape_buffer_t — a pair of 4096-frame
+//              DMA windows out of the tape's own pool, the same mechanism the
+//              built-in tapedecks use. Play out of the resident window, overdub it
+//              in place to record; the window is written back when it is evicted.
+//   tick()     does the take bookkeeping — cues, marks, erase, meters. No SD.
+//
 //
 // Recording only ever lands in FREE tape: marks are kept sorted and merged, so
 // everything past the last mark's end is empty. If there is no room it refuses
 // rather than wrapping over your first take.
 //
 // Controls: BTN1 play/stop   BTN2 rec/stop   BTN3 loop on/off
-//           BTN4/BTN5 previous / next take   BTN4-hold exit
-//           BTN1-hold volume band (encoder adjusts, BTN4/BTN5 pick IN/OUT)
+//           BTN4/BTN5 previous / next take
+//           BTN1-hold volume hints (encoder adjusts, BTN4/BTN5 pick the cell)
 //           BTN2-hold erase the selected take (cue, mark, AND audio)
 //           BTN3-hold mic/line input (device-wide + persistent, hence a hold)
+//           LEDs: flash red when a take clips
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "tapp_api.h" // also declares the libc subset (memcpy, snprintf, sinf, ...)
+#include "tapp_api.h"
+
+TAPP_DECLARE_TYPE(AppTypeStandalone);
 
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
-#define SR             48000.0f
-#define TOP_BAR        48
 #define FRAMES_PER_POS 64u           // 1 tape position (SD sector) = 64 stereo frames
-#define RING_FR   16384u             // record ring: 128 KB, ~341 ms against a 40 ms tick
-#define PLAY_FR   4096u              // playback half-buffer (one SD DMA's worth)
 #define REC_FADE_FR 1440u            // ~30 ms — the anti-click ramp at both ends
-#define MIN_REC_FR  (2u * 48000u)    // refuse a take with less than 2 s of free tape
+#define WIN_NONE  0xFFFFFFFFu        // "the pipeline is empty" — process() re-primes
+#define MIN_REC_FR  (2u * TAPP_SAMPLE_RATE) // refuse a take with less than 2 s of free tape
 #define COMMIT_TRIM_POS 64u
+#define CLIP_TH 0.95f                // the input limiter's ceiling: a hot mic take is clamped AT it, never past
 
 enum { ST_STOP = 0, ST_REC, ST_PLAY };
 
@@ -45,126 +47,115 @@ typedef struct {
     volatile bool    stop_req;       // set by input, cleared once the fade finishes
     volatile float   rec_gain;       // 0..1 tap fade — the anti-click
 
-    // record ring (process writes, tick drains)
-    float*   ring;
-    volatile uint32_t w_fr, r_fr;    // free-running frame cursors (wrap-safe)
-    volatile uint32_t drops;         // frames lost to a full ring — must stay 0
+    tape_buffer_t*    wb;            // the DMA window pair — claimed in init()
+    volatile uint32_t frame;         // absolute tape frame under the head
+    volatile uint32_t cur_win;       // window index `frame` last resolved to, or WIN_NONE
 
     uint32_t rec_tok;                // tape_rec_t token
-    uint32_t rec_frame;              // write head on tape, in frames
     uint32_t rec_start;              // where this take began
     uint32_t rec_limit;              // first frame we must NOT write
     bool     no_room;                // last rec attempt refused
     bool     cue_fail;               // last take produced no navigable cue
 
-    // playback double buffer (tick fills, process reads)
-    float*   play_buf;               // 2 * PLAY_FR frames
-    volatile uint8_t  play_cur;      // half process is reading
-    volatile bool     half_ready[2];
-    uint32_t half_src[2];            // tape frame each half was read from
-    volatile uint32_t play_idx;      // frame index within the current half
-    volatile uint32_t play_frame;    // absolute tape frame being heard
     uint32_t play_start, play_end;   // the take being played
-    uint32_t fill_next;              // next tape frame to read
-    volatile uint32_t seek_gen;      // bumped on every seek; invalidates in-flight fills
     bool     loop;                   // BTN3: replay the take instead of stopping
 
     // metering (process writes, redraw reads)
     volatile float peak_l, peak_r;
     volatile bool  clip;             // latched at 0 dBFS, cleared when a take starts
+    bool led_clip;                   // process sets it on an over while recording; the LED pattern takes it
     float hold_l, hold_r; uint16_t hold_t;
 
-    // volume band (BTN1 hold; input reads, process applies)
+    // volume hints (BTN1 hold; input reads, process applies)
     params_t vol_out;                // app-local PLAYBACK trim (IN is the device's)
-    uint8_t  vol_sel;                // 0 = IN, 1 = OUT
-    volatile bool vol_ui;            // band shown while PLAY is held
+    params_t vol_fx;                 // app-local FX send of the playback
+    volatile bool vol_ui;            // hints shown while PLAY is held
     volatile bool erase_req;         // confirm popup said yes; tick performs it
 
     uint32_t take_idx;               // take (mark) navigation cursor
     uint32_t take_n;                 // takes (MARKS) on the tape, refreshed from tick
     uint32_t tape_cap;               // tape length in frames
     uint32_t free_fr;                // free tape past the last mark, in frames
-    uint8_t  in_src;                 // 0=line 1=mic (the only sources)
+    uint8_t  in_src;                 // 0=line 1=mic (the only sources), polled on the tick
     uint8_t  hint_state;             // state the hint labels were built for
-    uint8_t  hint_src;               // source the hint labels were built for
-    uint8_t  hint_takes;             // take-presence the hint LOCKS were built for
-    uint8_t  hint_mon;               // monitor state the hint labels were built for
+    uint8_t  hint_src;               // source the hint switch was built for
 
     params_t tl_pos, tl_start, tl_end;
 
-    char s_remain[24];
+    char s_remain[24];               // "FREE mm:ss", drawn in the info column
+    char s_take[16];                 // "TAKE n/m", ditto
 } rec_model_t;
 
-static rec_model_t* g_model = 0;
-
-static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
-static void rec_play_seek(rec_model_t* m, uint32_t frame);
+static void rec_seek(rec_model_t* m, uint32_t frame);
 static void rec_hints(const rec_model_t* m);
 static void rec_erase_take(rec_model_t* m);
 
 // ----------------------------------------------------------------------------
-// Audio — no SD access, ever.
+// Audio
 // ----------------------------------------------------------------------------
-static void rec_process(engine_t* engine, mixer_t* mix) {
-    rec_model_t* m = engine_get_ctx(engine);
-    if (!m) return;
+static inline void rec_win_request(rec_model_t* m, uint32_t win, bool write) {
+    tape_buffer_update(m->wb, win * TAPE_WINDOW_POS, write);
+}
+
+// ctx is our model — the firmware hands it to every engine callback.
+static void rec_process(void* restrict ctx, mixer_t* restrict mix) {
+    rec_model_t* m = ctx;
     float* out = mixer_get_out(mix);
-    const float* in = mixer_get_in(mix);
+    const float* in = mixer_get_record(mix);
     const uint32_t fs = mixer_get_fs(mix);
     if (!out) return;
 
     const float g_target = (m->state == ST_REC && !m->stop_req) ? 1.0f : 0.0f;
     const float g_step = 1.0f / (float)REC_FADE_FR;
     const float vout = m->vol_out.val;
+    const float vfx = m->vol_fx.val;
+    float* send = mixer_get_send(mix);  // ACCUMULATE into it: the FX chain's input
+
+    const bool rec = (m->state == ST_REC);
+    const bool run = (rec || m->state == ST_PLAY) && m->wb;
+
+    if (rec) mixer_rec_active(mix);
 
     float pl = 0.f, pr = 0.f;
+    float* buf = run ? tape_buffer_get_ptr(m->wb) : 0;
 
     for (uint32_t i = 0; i < fs; i += 2) {
-        float l = 0.f, r = 0.f;      // what we RECORD and METER
-        float ol = 0.f, orr = 0.f;   // what we contribute to the output bus
+        float l = 0.f, r = 0.f;
+        float ol = 0.f, orr = 0.f;
 
-        if (m->state == ST_PLAY && m->play_buf) {
-            if (m->half_ready[m->play_cur]) {
-                const float* s = m->play_buf + (size_t)m->play_cur * PLAY_FR * 2u
-                                 + (size_t)m->play_idx * 2u;
-                l = s[0] * vout; r = s[1] * vout;
-                ol = l; orr = r;                  // playback IS ours to output
-                m->play_frame++;
-                if (++m->play_idx >= PLAY_FR) {
-                    m->half_ready[m->play_cur] = false;
-                    m->play_cur ^= 1u;
-                    m->play_idx = 0;
+        uint32_t off = 0;
+        if (run) {
+            const uint32_t win = m->frame / TAPE_WINDOW_FR;
+            if (win != m->cur_win) {
+                if (m->cur_win == WIN_NONE || win != m->cur_win + 1u) {
+                    rec_win_request(m, win, rec);
                 }
+                rec_win_request(m, win + 1u, rec);
+                m->cur_win = win;
+                buf = tape_buffer_get_ptr(m->wb);
             }
-            // Not ready: output silence rather than stale audio, and do not
-            // advance — tick() will catch up.
+            off = (m->frame & (TAPE_WINDOW_FR - 1u)) * 2u;
+        }
+
+        if (m->state == ST_PLAY) {
+            if (buf && m->frame < m->play_end) {
+                l = buf[off] * vout; r = buf[off + 1] * vout;
+                ol = l; orr = r;                  // playback IS ours to output
+                m->frame++;
+            }
         } else if (in) {
-            // Read the input for the ring and the meters — but DO NOT echo it,
-            // and apply NO gain: in_bus is already scaled by the device's input
-            // volume (mixer_input), which the IN cell drives directly.
-            // Monitoring is the firmware's job and it happens AFTER this callback
-            // (os_audio_chain_default): mic is monitored inside the codec (ADCMIX,
-            // ~0 ms), line/USB by the chain's own in->out add.
             l = in[i]; r = in[i + 1];
         }
 
-        if (m->state == ST_REC && m->ring) {
+        if (rec) {
             float g = m->rec_gain;
             g += (g_target > g) ? g_step : -g_step;
             g = clampf(g, 0.f, 1.f);
             m->rec_gain = g;
-
-            if (g > 0.f || !m->stop_req) {
-                const uint32_t w = m->w_fr;
-                if (w - m->r_fr < RING_FR) {
-                    float* slot = m->ring + (size_t)(w & (RING_FR - 1)) * 2u;
-                    slot[0] = l * g;
-                    slot[1] = r * g;
-                    m->w_fr = w + 1;
-                } else {
-                    m->drops++;
-                }
+            if (buf && (g > 0.f || !m->stop_req) && m->frame < m->rec_limit) {
+                buf[off] = l * g;
+                buf[off + 1] = r * g;
+                m->frame++;
             }
         }
 
@@ -175,34 +166,45 @@ static void rec_process(engine_t* engine, mixer_t* mix) {
         // Always WRITE (not +=): out_bus still holds the previous block, and the
         // chain's monitor add lands on top of whatever we leave here.
         out[i] = ol; out[i + 1] = orr;
+        if (send) { send[i] += ol * vfx; send[i + 1] += orr * vfx; }
     }
 
     m->peak_l = (pl > m->peak_l) ? pl : m->peak_l * 0.85f;
     m->peak_r = (pr > m->peak_r) ? pr : m->peak_r * 0.85f;
-    if (pl >= 1.0f || pr >= 1.0f) m->clip = true;
+    if (pl >= CLIP_TH || pr >= CLIP_TH) { m->clip = true; if (rec) m->led_clip = true; }
 }
 
-static void rec_eng_active(engine_t* e, bool state) { (void)e; (void)state; }
-static uint_fast8_t rec_eng_is_active(engine_t* e) {
-    (void)e;
-    return 1;
+/* Red for one step after an over while recording, dark otherwise. Every step writes, since
+ * the LED driver latches. Runs on the OS LED task, so it keeps going under the main menu. */
+static void rec_led_clip(const os_led_t* led, const void* ctx) {
+    (void)led;
+    rec_model_t* m = (rec_model_t*)ctx;
+    const uint8_t r = m->led_clip ? 50 : 0;
+    m->led_clip = false;
+    for (uint8_t i = 0; i < 4; i++) hal_led_set_rgb(i, r, 0, 0);
 }
-static void eng_noop_core(os_core_t* c) { (void)c; }
-static void eng_noop(engine_t* e) { (void)e; }
 
+static led_pattern_t rec_led_pattern = { .callback = rec_led_clip, .steps = 255, .loop = 1 };
+
+/* No is_active: process() runs every block, so stopped it meters the live input. Sleep still
+ * comes - a stopped recorder writes silence and does not call mixer_rec_active(). */
 static const engine_callbacks_t rec_engine = {
-    .init = eng_noop_core, .process = rec_process, .defaults = eng_noop, .cleanup = eng_noop_core,
-    .active = rec_eng_active, .is_active = rec_eng_is_active,
+    .process = rec_process,
 };
+
+static void rec_set_state(rec_model_t* m, uint8_t state) {
+    if (m->state == state) return;
+    m->state = state;
+}
 
 // ----------------------------------------------------------------------------
 // Tape placement — free space only
 // ----------------------------------------------------------------------------
-#define REC_GUARD_FR (128u * FRAMES_PER_POS)   // ~170 ms, same as the tapedecks's AUTO mode
+#define REC_GUARD_FR (128u * FRAMES_PER_POS)
 
 static bool rec_free_region(tape_t* t, uint32_t* start_fr, uint32_t* limit_fr) {
     if (!t) return false;
-    const uint32_t cap = tape_size(t) * FRAMES_PER_POS;   // tape_size() is POSITIONS
+    const uint32_t cap = tape_size(t) * FRAMES_PER_POS;
     const uint32_t n = tape_marks_count(t);
     uint32_t end = 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -216,34 +218,26 @@ static bool rec_free_region(tape_t* t, uint32_t* start_fr, uint32_t* limit_fr) {
     return true;
 }
 
-static void rec_flush(rec_model_t* m, tape_t* t, int budget, bool final) {
-    for (int guard = 0; guard < budget && m->r_fr != m->w_fr; guard++) {
-        if (m->rec_frame >= m->rec_limit) break;
-        uint32_t n = m->w_fr - m->r_fr;
-        const uint32_t to_end = RING_FR - (m->r_fr & (RING_FR - 1));
-        if (n > to_end) n = to_end;
-        if (n > PLAY_FR) n = PLAY_FR;
-        const uint32_t room = m->rec_limit - m->rec_frame;
-        if (n > room) n = room;
-        if (!final) { n &= ~(FRAMES_PER_POS - 1u); if (!n) break; }
-        const float* src = m->ring + (size_t)(m->r_fr & (RING_FR - 1)) * 2u;
-        const uint32_t got = tape_write(t, m->rec_frame, src, n);
-        m->r_fr += got;
-        m->rec_frame += got;
-        if (got < n) break;
-    }
+static void rec_seek(rec_model_t* m, uint32_t frame) {
+    m->frame = frame;
+    m->cur_win = WIN_NONE;
+}
+
+static void rec_stream_invalidate(rec_model_t* m) {
+    if (m->wb) tape_buffer_clear_all_buffers(m->wb);
+    m->cur_win = WIN_NONE;
 }
 
 static void rec_stop_take(rec_model_t* m, tape_t* t) {
-    rec_flush(m, t, 64, true);
+    if (m->wb) tape_buffer_flush(m->wb);
 
-    uint32_t end_fr = m->rec_frame;
+    uint32_t end_fr = m->frame;
     m->cue_fail = true;
     if (m->rec_tok) {
 
         const uint32_t end_pos = tape_rec_commit(
             (tape_rec_t*)(uintptr_t)m->rec_tok,
-            m->rec_frame / FRAMES_PER_POS + COMMIT_TRIM_POS);
+            m->frame / FRAMES_PER_POS + COMMIT_TRIM_POS);
         const uint32_t start_fr = m->rec_start + REC_FADE_FR;
         end_fr = end_pos * FRAMES_PER_POS;
         m->rec_tok = 0;
@@ -261,7 +255,6 @@ static void rec_stop_take(rec_model_t* m, tape_t* t) {
             }
         }
 
-        // The take just made becomes the selection: shade everything outside it.
         m->tl_start.val = m->tl_start.target = (float)(start_fr / FRAMES_PER_POS);
         m->tl_end.val = m->tl_end.target = (float)end_pos;
         tape_timeline_set_loop(true);
@@ -269,14 +262,14 @@ static void rec_stop_take(rec_model_t* m, tape_t* t) {
 
     m->play_start = m->rec_start + REC_FADE_FR;
     m->play_end = end_fr;
-    if (m->play_end > m->play_start) rec_play_seek(m, m->play_start);
-    m->state = ST_STOP;
+    if (m->play_end > m->play_start) rec_seek(m, m->play_start);
+    rec_set_state(m, ST_STOP);
     m->stop_req = false;
 }
 
 static void rec_start_take(rec_model_t* m) {
     tape_t* t = tape_get();
-    if (!t || !m->ring) { m->no_room = true; return; }
+    if (!t || !m->wb) { m->no_room = true; return; }
     uint32_t start = 0, limit = 0;
     if (!rec_free_region(t, &start, &limit)) { m->no_room = true; return; }
 
@@ -284,72 +277,32 @@ static void rec_start_take(rec_model_t* m) {
     m->cue_fail = false;
     m->clip = false;
     m->rec_start = start;
-    m->rec_frame = start;
     m->rec_limit = limit;
-    m->w_fr = m->r_fr = 0;
-    m->drops = 0;
     m->rec_gain = 0.f;
+    rec_seek(m, start);
     m->rec_tok = (uint32_t)(uintptr_t)tape_rec_begin(
         t, (start + REC_FADE_FR) / FRAMES_PER_POS, false);
     m->tl_start.val = m->tl_start.target = (float)(start / FRAMES_PER_POS);
     m->tl_end.val = m->tl_end.target = (float)(start / FRAMES_PER_POS);
     tape_timeline_set_loop(false);
     m->stop_req = false;
-    m->state = ST_REC;
+    rec_set_state(m, ST_REC);
 }
 
-static void rec_play_seek(rec_model_t* m, uint32_t frame) {
-    m->half_ready[0] = m->half_ready[1] = false;
-    m->play_cur = 0;
-    m->play_idx = 0;
-    m->play_frame = frame;
-    m->fill_next = frame;
-    m->seek_gen++;   // invalidates any fill already in flight — see rec_fill_halves
-}
-
-static void rec_fill_halves(rec_model_t* m, tape_t* t) {
-    if (!m->play_buf) return;
-    // Latch play_cur ONCE: process() flips it whenever a half runs out, so
-    // re-reading it per iteration could fill the same half twice and leave the
-    // other empty.
-    const uint8_t cur = m->play_cur;
-    for (int h = 0; h < 2; h++) {
-        const uint8_t idx = (uint8_t)((cur + h) & 1u);
-        if (m->half_ready[idx]) continue;
-        if (m->fill_next >= m->play_end) return;          // take finished
-        uint32_t n = m->play_end - m->fill_next;
-        if (n > PLAY_FR) n = PLAY_FR;
-        float* dst = m->play_buf + (size_t)idx * PLAY_FR * 2u;
-        // tape_read BLOCKS for milliseconds, and BTN1/BTN4/BTN5 run on another
-        // task — a seek can land mid-read. Snapshot the generation and drop the
-        // fill if it moved, instead of clobbering the freshly reset fill_next and
-        // publishing a half full of pre-seek audio.
-        const uint32_t gen = m->seek_gen;
-        const uint32_t at = m->fill_next;
-        const uint32_t got = tape_read(t, at, dst, n);
-        if (m->seek_gen != gen) return;
-        if (n < PLAY_FR) {                                // zero the tail
-            memset(dst + (size_t)n * 2u, 0, (size_t)(PLAY_FR - n) * 2u * sizeof(float));
-        }
-        m->half_src[idx] = at;
-        m->fill_next = at + (got ? got : n);
-        m->half_ready[idx] = true;
-    }
-}
-
- 
-#define DIG_Y    (TOP_BAR + 14)                  // 7-seg counter, 62..105
+ #define DIG_Y    (TAPP_CONTENT_Y + 14)           // 7-seg counter, 62..105
 #define DIG_W    26
 #define DIG_H    44
 #define DIG_SPAN 188                             // see rec_redraw: 34+36+12+34+36+10+26
-#define DIG_X    84                              // between the badge and the info column
+#define DIG_X    84
+#define COL_R    392
+#define MONO_W   9
+#define COL_TAKE 71
+#define COL_FREE 89
+#define COL_CLIP 107
 #define BADGE_X  8
 #define BADGE_W  62
 #define BADGE_H  22
 #define BADGE_Y  (DIG_Y + (DIG_H - BADGE_H) / 2) // centred on the counter
-#define COL_R    392                             // info column, right-aligned to here
-#define COL_TAKE 81                              // baselines: which take, free tape —
-#define COL_FREE 99                              // two rows centred on the counter block
 #define RULE_Y   114
 #define MET_X    8                               // 16 segments span 8..390 — flush with
 #define MET_SW   22                              // the rule above (8..392), no gutters
@@ -359,11 +312,7 @@ static void rec_fill_halves(rec_model_t* m, tape_t* t) {
 #define MET_L_Y  121                             // hold pips live in the 4 rows above
 #define MET_R_Y  141
 #define ALERT_H  20
-// The plate OVERLAYS the lower meter row — same philosophy it always had (it used
-// to cover the live waveform strip): a warning is rare and actionable, and the
-// solid plate erases what is beneath. 146..165 stays inside the 167 budget.
 #define ALERT_Y  146
-// Transport glyphs, sized to sit inside the pill with room to breathe.
 #define ICON_R   15                               // record dot radius
 #define ICON_SQ  30                              // stop square side
 #define ICON_H   30                              // play triangle: odd, so the apex is one row
@@ -398,8 +347,7 @@ static void draw_digit(gfx_t* g, int x, int y, int w, int h, int d) {
  static void draw_tri(gfx_t* g, int x, int y, int h, int w) {
     for (int i = 0; i < h; i++) {
         const int d = (i < h / 2) ? i : (h - 1 - i);   // rows out from the nearest flat edge
-        gfx_draw_hline(g, (gfx_uint_t)x, (gfx_uint_t)(y + i),
-                       (gfx_uint_t)(1 + (2 * d * (w - 1)) / (h - 1)));
+        gfx_draw_hline(g, x, y + i, 1 + (2 * d * (w - 1)) / (h - 1));
     }
 }
 
@@ -409,18 +357,14 @@ static void draw_transport(gfx_t* g, int x, int y, int w, int h, uint8_t state, 
      gfx_set_color(g, 1);
 
     if (state == ST_REC) {
-        gfx_draw_disc(g, (gfx_uint_t)cx, (gfx_uint_t)cy, ICON_R, GFX_DRAW_ALL);
+        gfx_draw_disc(g, cx, cy, ICON_R, GFX_DRAW_ALL);
     } else if (state == ST_PLAY) {
-        // Optically centred, not arithmetically: a triangle's mass sits behind its apex, so
-        // centring the bounding box leaves it looking a pixel or two right of centre.
         draw_tri(g, cx - ICON_W / 2 - 1, cy - ICON_H / 2, ICON_H, ICON_W);
     } else {
         gfx_draw_rect_fill(g, cx - ICON_SQ / 2, cy - ICON_SQ / 2, ICON_SQ, ICON_SQ);
     }
 }
 
-// Segment thresholds in amplitude, 3 dB apart from -45 dB to 0 dB. A table
-// instead of a log so the meter needs no math library.
 #define METER_SEGS 16
 static const float METER_TH[METER_SEGS] = {
     0.0056f, 0.0079f, 0.0112f, 0.0158f, 0.0224f, 0.0316f, 0.0447f, 0.0631f,
@@ -443,19 +387,26 @@ static void draw_meter(gfx_t* g, int y, float peak, float hold) {
 }
 
 
+static void rec_draw_info(gfx_t* gfx, const rec_model_t* m) {
+    gfx_set_color(gfx, 1);
+    gfx_set_font(gfx, DepartureMono_Regular_10);
+    gfx_draw_str(gfx, COL_R - MONO_W * (int)strlen(m->s_take), COL_TAKE, m->s_take);
+    gfx_draw_str(gfx, COL_R - MONO_W * (int)strlen(m->s_remain), COL_FREE, m->s_remain);
+}
+
 static void rec_redraw(gfx_t* gfx, const os_app_t* app) {
     rec_model_t* m = os_app_get_model(app);
     gfx_set_color(gfx, 1);
 
     const bool rec = (m->state == ST_REC);
     draw_transport(gfx, BADGE_X, BADGE_Y, BADGE_W, BADGE_H, m->state,
-                   rec ? (((ui_get_frame(gfx) >> 3) & 1u) == 0) : (m->state == ST_PLAY));
+                   rec ? (((os_tick_get() / 400u) & 1u) == 0) : (m->state == ST_PLAY));
 
     // ---- counter: mm:ss.d of the take being recorded or played ----
     uint32_t fr = 0;
-    if (rec) fr = m->w_fr;
-    else if (m->play_end > m->play_start) fr = m->play_frame - m->play_start;
-    const uint32_t total_ds = fr / 4800u;                 // tenths of a second
+    if (rec) fr = m->frame - m->rec_start;
+    else if (m->play_end > m->play_start) fr = m->frame - m->play_start;
+    const uint32_t total_ds = fr / 4800u;
     const int mins = (int)(total_ds / 600u) % 100;
     const int secs = (int)((total_ds / 10u) % 60u);
     const int tenths = (int)(total_ds % 10u);
@@ -470,16 +421,8 @@ static void rec_redraw(gfx_t* gfx, const os_app_t* app) {
     gfx_draw_rect_fill(gfx, dx, DIG_Y + DIG_H - 3, 3, 3); dx += 10;   // decimal point
     draw_digit(gfx, dx, DIG_Y, DIG_W, DIG_H, tenths);
 
-    gfx_set_font(gfx, DepartureMono_Regular_10);
-    char line[16];
-    if (m->take_n) {
-        snprintf(line, sizeof(line), "TAKE %u/%u",
-                 (unsigned)(m->take_idx + 1u), (unsigned)m->take_n);
-    } else {
-        snprintf(line, sizeof(line), "TAKE -/-");
-    }
-    gfx_draw_str(gfx, COL_R - (int)gfx_get_str_width(gfx, line), COL_TAKE, line);
-    gfx_draw_str(gfx, COL_R - (int)gfx_get_str_width(gfx, m->s_remain), COL_FREE, m->s_remain);
+    // ---- mode glyphs above, TAKE/FREE in the column beside the counter ----
+    rec_draw_info(gfx, m);
 
     gfx_draw_hline_dithered(gfx, 8, RULE_Y, SCREEN_WIDTH - 16, 3);
 
@@ -488,12 +431,9 @@ static void rec_redraw(gfx_t* gfx, const os_app_t* app) {
     draw_meter(gfx, MET_R_Y, m->peak_r, m->hold_r);
 
     // ---- alert plate ----
-    char buf[28];
     const char* warn = 0;
     if (m->no_room)       warn = "NO FREE TAPE SPACE";
     else if (m->cue_fail) warn = "TAKE HAS NO CUE";
-    else if (m->drops)    { snprintf(buf, sizeof(buf), "DROPPED %u FRAMES",
-                                     (unsigned)m->drops); warn = buf; }
     if (warn) {
         gfx_set_font(gfx, gfx_nunito_semibold_14);
         const int tw = (int)gfx_get_str_width(gfx, warn);
@@ -504,34 +444,18 @@ static void rec_redraw(gfx_t* gfx, const os_app_t* app) {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Hints / status
-// ----------------------------------------------------------------------------
 static void rec_hints(const rec_model_t* m) {
-    static tapp_hint_pair_t hints[5];
-    hints[0] = (tapp_hint_pair_t){ m->state == ST_PLAY ? "stop" : "play", "vol" };
-    hints[1] = (tapp_hint_pair_t){ m->state == ST_REC ? "stop" : "rec", "erase" };
-    hints[2] = (tapp_hint_pair_t){ "loop",
-                                   m->in_src == 1u ? "mic" :
-                                   m->in_src == 0u ? "line" : "input" };
-    hints[3] = (tapp_hint_pair_t){ "< prev", "exit" };
-    hints[4] = (tapp_hint_pair_t){ "next >", "mon" };
-    ui_hints_set_labels(hints);
-
-    // set_labels rebuilds the cells and clears active/locked state — re-assert
-    // last. Unavailable actions render as dithered 
-    ui_hints_set_active(HintPress3, m->loop);
-    // Lit = the live input is being monitored. Read the EFFECTIVE state: it also
-    // moves on its own (jack replug, source switch), which the tick drift check
-    // below notices.
-    ui_hints_set_active(HintHold5, os_audio_get_monitor());
-    const bool no_takes = m->take_n == 0;
-    ui_hints_set_locked(HintPress1, m->state == ST_REC ||
-                        (m->state == ST_STOP && m->play_end <= m->play_start));
-    ui_hints_set_locked(HintPress2, m->state == ST_PLAY);
-    ui_hints_set_locked(HintHold2, m->state == ST_REC || no_takes);
-    ui_hints_set_locked(HintPress4, no_takes);
-    ui_hints_set_locked(HintPress5, no_takes);
+    const tapp_hint_cell_t hints[HintsActionsTotal] = {
+        [HintPress1] = {"play", gfx_icon(GfxIconPlay), NULL, m->state == ST_PLAY ? HINT_ACTIVE : 0},
+        [HintHold1] = {"vol", gfx_icon(GfxIconVolume)},
+        [HintPress2] = {"rec", gfx_icon(GfxIconRec), NULL, m->state == ST_REC ? HINT_ACTIVE : 0},
+        [HintHold2] = {"erase", gfx_icon(GfxIconErase)},
+        [HintPress3] = {"loop", gfx_icon(GfxIconBack), NULL, m->loop ? HINT_ACTIVE : 0},
+        [HintHold3] = {NULL, gfx_icon(GfxIconJack), gfx_icon(GfxIconMic), m->in_src == 1u ? HINT_ON : 0},
+        [HintPress4] = {NULL, gfx_icon(GfxIconPlayRev)}, // prev / next take
+        [HintPress5] = {NULL, gfx_icon(GfxIconPlay)},
+    };
+    ui_hints_set(hints);
 }
 
 // ----------------------------------------------------------------------------
@@ -542,23 +466,15 @@ static bool rec_tick(os_app_t* app) {
     tape_t* t = tape_get();
 
     if (m->state == ST_REC && t) {
-        rec_flush(m, t, 4, false);
-        if (!m->stop_req && m->rec_start + m->w_fr + REC_FADE_FR >= m->rec_limit) {
-            m->stop_req = true;
-        }
-
-        if ((m->stop_req && m->rec_gain <= 0.001f) || m->rec_frame >= m->rec_limit) {
+        if (!m->stop_req && m->frame + REC_FADE_FR >= m->rec_limit) m->stop_req = true;
+        if ((m->stop_req && m->rec_gain <= 0.001f) || m->frame >= m->rec_limit) {
             rec_stop_take(m, t);
         }
-    } else if (m->state == ST_PLAY && t) {
-        // End-of-take FIRST: a loop wrap then refills within this same tick,
-        // instead of leaving both halves empty until the next one (~40 ms of
-        // silence at every loop point).
-        if (m->play_frame >= m->play_end) {
-            if (m->loop && m->play_end > m->play_start) rec_play_seek(m, m->play_start);
-            else m->state = ST_STOP;
+    } else if (m->state == ST_PLAY) {
+        if (m->frame >= m->play_end) {
+            if (m->loop && m->play_end > m->play_start) rec_seek(m, m->play_start);
+            else rec_set_state(m, ST_STOP);
         }
-        if (m->state == ST_PLAY) rec_fill_halves(m, t);
     }
 
     // Peak hold, ~1 s.
@@ -566,37 +482,37 @@ static bool rec_tick(os_app_t* app) {
     if (m->peak_r >= m->hold_r) { m->hold_r = m->peak_r; m->hold_t = 25; }
     if (m->hold_t) { m->hold_t--; } else { m->hold_l *= 0.9f; m->hold_r *= 0.9f; }
 
-    // Erase deferred from the confirm popup's callback (widget context).
+
     if (m->erase_req) { m->erase_req = false; rec_erase_take(m); }
 
-    // Remaining free tape.
     uint32_t s = 0, lim = 0;
     if (t && rec_free_region(t, &s, &lim)) {
         m->free_fr = lim - s;
-        const uint32_t rem = m->free_fr / 48000u;
+        const uint32_t rem = m->free_fr / TAPP_SAMPLE_RATE;
         snprintf(m->s_remain, sizeof(m->s_remain), "FREE %02u:%02u",
                  (unsigned)(rem / 60u), (unsigned)(rem % 60u));
     } else {
         m->free_fr = 0;
         snprintf(m->s_remain, sizeof(m->s_remain), "FREE 00:00");
     }
-    if (t) m->take_n = tape_marks_count(t);
 
-    // A take can also end on its own — tape full, or playback reaching the end —
-    // and an erase can flip take-presence with no state change; the labels AND
-    // the locked cells follow the model, not only the press that changed it.
-    // Never while the volume band is up: set_labels would replace its cells.
-    if (!m->vol_ui && (m->hint_state != m->state || m->hint_src != m->in_src ||
-                       m->hint_takes != (m->take_n != 0) ||
-                       m->hint_mon != os_audio_get_monitor())) {
+    m->in_src = os_audio_get_input();
+
+    if (t) m->take_n = tape_marks_count(t);
+    if (m->take_n) {
+        snprintf(m->s_take, sizeof(m->s_take), "TAKE %u/%u",
+                 (unsigned)(m->take_idx + 1u), (unsigned)m->take_n);
+    } else {
+        snprintf(m->s_take, sizeof(m->s_take), "TAKE -/-");
+    }
+
+    if (!m->vol_ui && (m->hint_state != m->state || m->hint_src != m->in_src)) {
         m->hint_state = m->state;
         m->hint_src = m->in_src;
-        m->hint_takes = m->take_n != 0;
-        m->hint_mon = os_audio_get_monitor();
         rec_hints(m);
     }
 
-    const uint32_t head = (m->state == ST_REC) ? (m->rec_start + m->w_fr) : m->play_frame;
+    const uint32_t head = m->frame;
     m->tl_pos.prev = m->tl_pos.val;
     m->tl_pos.val = m->tl_pos.target = (float)(head / FRAMES_PER_POS);
     if (m->state == ST_REC) m->tl_end.val = m->tl_end.target = m->tl_pos.val;
@@ -610,14 +526,12 @@ static void rec_select_take(rec_model_t* m, uint32_t idx) {
     m->take_idx = idx;
     m->play_start = cs;
     m->play_end = ce;
-    rec_play_seek(m, cs);
+    rec_seek(m, cs);
     m->tl_start.val = m->tl_start.target = (float)(cs / FRAMES_PER_POS);
     m->tl_end.val = m->tl_end.target = (float)(ce / FRAMES_PER_POS);
     tape_timeline_set_loop(true);
 }
 
-// Marks are kept sorted by start, so stepping is index +/- 1 with wrap and the
-// order matches the timeline left-to-right.
 static void rec_goto_take(rec_model_t* m, bool back) {
     tape_t* t = tape_get();
     if (!t) return;
@@ -627,15 +541,10 @@ static void rec_goto_take(rec_model_t* m, bool back) {
     rec_select_take(m, back ? (m->take_idx + n - 1u) % n : (m->take_idx + 1u) % n);
 }
 
-static void rec_erase_confirm_cb(void* ctx, void* confirmed) {
+static void rec_erase_confirm_cb(void* ctx, bool confirmed) {
     if (confirmed) ((rec_model_t*)ctx)->erase_req = true;
 }
 
-// BTN2 hold: erase the selected take — audio, MARK and any overlapping cue,
-// via tape_erase(). Bounds come from the take's MARK (the navigation unit), so
-// a take without a cue erases just as well. Not while recording (erase refuses
-// under an open take anyway). Erasing the last take genuinely reclaims free
-// tape: the free region is everything past the last mark.
 static void rec_erase_take(rec_model_t* m) {
     tape_t* t = tape_get();
     if (!t || m->state == ST_REC) return;
@@ -646,8 +555,9 @@ static void rec_erase_take(rec_model_t* m) {
     if (!tape_marks_get(t, m->take_idx, &cs, &ce)) return;
     // Stop BEFORE erasing: the selection is about to go stale, and process()
     // gates its playback reads on state == ST_PLAY.
-    if (m->state == ST_PLAY) m->state = ST_STOP;
+    if (m->state == ST_PLAY) rec_set_state(m, ST_STOP);
     if (!tape_erase(t, cs, ce)) return;
+    rec_stream_invalidate(m);
     n = tape_marks_count(t);
     m->take_n = n;
     if (!n) {
@@ -662,103 +572,71 @@ static void rec_erase_take(rec_model_t* m) {
 }
 
 
-static void rec_vol_step(params_t* p, int32_t acc) {
-    float delta = p->fine * (float)acc;
-    const float norm = (p->target - p->min) / (p->max - p->min);
-    delta *= 0.1f + 0.9f * norm;
-    float t = p->target + delta;
-    t = (float)(int32_t)(t * 1000.f + 0.5f) * 0.001f;   // roundf isn't exported; t >= 0 here
-    p->target = p->val = clampf(t, p->min, p->max);
-}
-
-// IN is the DEVICE's input level (monitor + record + USB, persistent)
-static params_t* rec_vol_param(rec_model_t* m, bool out) {
-    return out ? &m->vol_out : mixer_get_input_vol(mixer_get());
-}
-
+/* List the levels and the band does the rest: BTN4/BTN5 step them and the encoder edits
+ * the selected one (the firmware's, not ours), with the running source's level appended. */
 static void rec_vol_show(rec_model_t* m) {
-    params_t* in_vol = rec_vol_param(m, false);
-    if (in_vol) ui_hints_set_volume(1, 0, "in", in_vol, 1);
-    ui_hints_set_volume(2, 0, "out", &m->vol_out, 0);
-    // No input param (mixer not up): fall back to OUT so the band is never empty.
-    ui_hints_volume_select((m->vol_sel || !in_vol) ? 2 : 1, 0);
+    params_t* in_vol = mixer_get_input_vol(mixer_get());
+    ui_hints_set_volume(1, 0, NULL, NULL, 0);
+    ui_hints_set_volume(1, 1, "out", &m->vol_out, HintVolOutput);
+    ui_hints_set_volume(2, 0, "fx send", &m->vol_fx, HintVolFx);
+    if (in_vol) ui_hints_set_volume(3, 0, "in", in_vol, HintVolInput);
+    else        ui_hints_set_volume(3, 0, NULL, NULL, 0);
+    ui_hints_set_volume(4, 0, "<", NULL, 0);
+    ui_hints_set_volume(5, 0, ">", NULL, 0);
+    ui_hints_volume_select(1, 1);   // start on "out"
+}
+
+static void rec_vol_hide(rec_model_t* m) {
+    m->vol_ui = false;
+    rec_hints(m);
 }
 
 static void rec_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
     rec_model_t* m = os_app_get_model(app);
 
-    if (btn == 5) {
-        // Encoder rotation (state is always RELEASED — never branch on it).
-        // Drain the delta unconditionally so the accumulator can't dump a stale
-        const int32_t d = os_controls_encoder_get_delta();
-        if (m->vol_ui && d) {
-            params_t* p = rec_vol_param(m, m->vol_sel != 0);
-            if (p == &m->vol_out) {
-                rec_vol_step(p, d);          // ours: no callback to fire
-            } else if (p) {
-                param_write_delta_val(p, d);
-                param_update_fast(p, NULL);
-            }
-        }
+    if (btn == BTN_ENCODER) return;
+
+    if (m->vol_ui) {
+        if (st == KEY_STATE_RELEASED && btn == BTN1) rec_vol_hide(m);
         return;
     }
 
     if (st == KEY_STATE_PRESSED) {
         switch (btn) {
-        case 0:                                   // play / stop
-            if (m->state == ST_PLAY) { m->state = ST_STOP; }
+        case BTN1:
+            if (m->state == ST_PLAY) { rec_set_state(m, ST_STOP); }
             else if (m->state == ST_STOP && m->play_end > m->play_start) {
-                rec_play_seek(m, m->play_start);
-                m->clip = false;                  // the readout resets with the pass
-                m->state = ST_PLAY;
+                rec_seek(m, m->play_start);
+                m->clip = false;
+                rec_set_state(m, ST_PLAY);
             }
             break;
-        case 1:                                   // rec / stop
-            if (m->state == ST_REC) m->stop_req = true;   // fade out, tick closes it
+        case BTN2:
+            if (m->state == ST_REC) m->stop_req = true;
             else if (m->state != ST_PLAY) rec_start_take(m);
             break;
-        case 2:                                   // loop on/off for playback
+        case BTN3:
             m->loop = !m->loop;
             break;
-        // While the volume band is up, BTN4/BTN5 pick the cell instead of stepping cues
-        case 3: if (m->vol_ui) { m->vol_sel = 0; ui_hints_volume_select(1, 0); }
-                else rec_goto_take(m, true);
-                break;
-        case 4: if (m->vol_ui) { m->vol_sel = 1; ui_hints_volume_select(2, 0); }
-                else rec_goto_take(m, false);
-                break;
+
+        case BTN4: rec_goto_take(m, true);  break;
+        case BTN5: rec_goto_take(m, false); break;
         default: break;
         }
         m->hint_state = m->state;
         m->hint_src = m->in_src;
-        m->hint_takes = m->take_n != 0;
-        m->hint_mon = os_audio_get_monitor();
 
-        if (!m->vol_ui) rec_hints(m);
+        rec_hints(m);
     } else if (st == KEY_STATE_HOLD) {
 
-        if (btn == 3) { os_app_exit(); return; }
-        if (btn == 0) { m->vol_ui = true; rec_vol_show(m); }
-        if (btn == 1 && m->state != ST_REC && m->take_n) {
+        if (btn == BTN1 && !m->vol_ui) { m->vol_ui = true; rec_vol_show(m); }
+        if (btn == BTN2 && m->state != ST_REC && m->take_n) {
             ui_notify_confirm("Hold play to confirm\nerasing this take",
                               NULL, rec_erase_confirm_cb, m);
         }
-        if (btn == 2) {
-            // Mic <-> line. This writes the DEVICE-WIDE input setting and it.
-            m->in_src = os_audio_switch_input(true);
+        if (btn == BTN3) {
+            m->in_src = os_audio_switch_input();
             m->hint_src = m->in_src;
-            if (!m->vol_ui) rec_hints(m);
-        }
-        if (btn == 4) {
-            // Monitor on/off. Refused for mic with no headphones (feedback), so
-            // take the state from the return value, not from what we asked for.
-            // Playback is unaffected — this gates the LIVE input only.
-            m->hint_mon = os_audio_set_monitor(!os_audio_get_monitor());
-            if (!m->vol_ui) rec_hints(m);
-        }
-    } else if (st == KEY_STATE_RELEASED) {
-        if (btn == 0 && m->vol_ui) {
-            m->vol_ui = false;
             rec_hints(m);
         }
     }
@@ -767,33 +645,20 @@ static void rec_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
 // ----------------------------------------------------------------------------
 // Params / lifecycle
 // ----------------------------------------------------------------------------
-static void mk_param(params_t* p, const char* name, float val, float mn, float mx, float coarse) {
-    memset(p, 0, sizeof(*p));
-    *(const char**)&p->name = name;
-    *(ParamTypeUI_t*)&p->type = ParamValExactType;
-    *(bool*)&p->refresh = true;
-    p->val = val; p->min = mn; p->max = mx; p->dflt = val; p->coarse = coarse; p->fine = coarse;
-}
-
-static bool rec_init(os_app_t* app, va_list args) {
-    (void)args;
+static bool rec_init(os_app_t* app) {
     rec_model_t* m = os_app_get_model(app);
-    g_model = m;
 
-    m->ring = (float*)os_malloc(RING_FR * 2u * sizeof(float));
-    m->play_buf = (float*)os_malloc(2u * PLAY_FR * 2u * sizeof(float));
-    if (!m->ring || !m->play_buf) return false;
+    m->wb = tape_buffer_init(tape_get());
+    if (!m->wb) return false;
+    m->cur_win = WIN_NONE;
 
-    mk_param(&m->tl_pos,   "pos",   0.f, 0.f, 1e9f, 1.f);
-    mk_param(&m->tl_start, "start", 0.f, 0.f, 1e9f, 1.f);
-    mk_param(&m->tl_end,   "end",   0.f, 0.f, 1e9f, 1.f);
-    mk_param(&m->vol_out, "out", 1.f, 0.f, 2.f, 0.02f);
-    m->vol_out.dflt = 1.f;
-    m->vol_out.target = 1.f;
-    *(ParamTypeUI_t*)&m->vol_out.type = ParamValDBType;
-    m->vol_sel = 0;
-    m->state = ST_STOP;
-    // Both, or the tick's hint drift check fires once for nothing on frame one.
+    m->tl_pos = (params_t)PARAM_RANGE("pos", 0.f, 0.f, 1e9f, 1.f);
+    m->tl_start = (params_t)PARAM_RANGE("start", 0.f, 0.f, 1e9f, 1.f);
+    m->tl_end = (params_t)PARAM_RANGE("end", 0.f, 0.f, 1e9f, 1.f);
+    m->vol_out = (params_t)PARAM_RANGE("out", 1.f, 0.f, 2.f, 0.02f);
+    m->vol_out.type = ParamValDBType;
+    m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.f, 0.f, 1.f, 0.02f);
+    m->vol_fx.type = ParamValDBType;
     m->in_src = os_audio_get_input();
     m->hint_src = m->in_src;
 
@@ -812,52 +677,34 @@ static bool rec_init(os_app_t* app, va_list args) {
         if (m->take_n) { m->take_idx = 0; rec_goto_take(m, true); }
     }
 
-    // The statusbar's own text is not drawn while the hint band is up, so the
-    // transport state lives in the app's badge instead of in a string nobody sees.
-    ui_statusbar_show(true);
-    m->hint_state = m->state;
-    m->hint_takes = m->take_n != 0;
-    m->hint_mon = os_audio_get_monitor();
-    rec_hints(m);
+    ui_statusbar_show(false);
     ui_hints_show(true);
 
-    engine_set_callbacks(app, m);
+    snprintf(m->s_take, sizeof(m->s_take), "TAKE -/-");
+    snprintf(m->s_remain, sizeof(m->s_remain), "FREE 00:00");
+    m->hint_state = m->state;
+    rec_hints(m);
+
+    os_led_set_pattern(&rec_led_pattern, m);
     engine_set_active(true);
     return true;
 }
 
-static bool rec_deinit(os_app_t* app) {
+static void rec_deinit(os_app_t* app) {
     rec_model_t* m = os_app_get_model(app);
-    g_model = 0;
     if (m->state == ST_REC) {
         m->state = ST_STOP;
         m->rec_gain = 0.f;
         tape_t* t = tape_get();
         if (t) rec_stop_take(m, t);
     }
-    m->state = ST_STOP;
-
     tape_timeline_set_loop(false);
     tape_timeline_show(false);
-    engine_set_active(false);
-    engine_clear_callbacks(&rec_engine);
-    if (m->ring) { os_free(m->ring); m->ring = 0; }
-    if (m->play_buf) { os_free(m->play_buf); m->play_buf = 0; }
-    return true;
+    tape_buffer_deinit(m->wb);
 }
 
-static os_app_data_t rec_data = {
-    .model = NULL, .model_size = sizeof(rec_model_t), .init = rec_init, .deinit = rec_deinit,
-};
-
-static os_app_t rec_app = {
-    .name = "Recorder",
-    .type = AppFullscreenType,
-    .data = &rec_data,
-    .redraw = (os_app_redraw)rec_redraw,
-    .tick = rec_tick,
-    .on_input = rec_input,
-    .engine_cb = &rec_engine,
-};
-
-os_app_t* tapp_get_descriptor(void) { return &rec_app; }
+TAPP_APP("Recorder", rec_model_t, rec_init, rec_deinit,
+         .redraw = rec_redraw,
+         .tick = rec_tick,
+         .on_input = rec_input,
+         .engine_cb = &rec_engine);

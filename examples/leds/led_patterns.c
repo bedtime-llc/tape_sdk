@@ -181,68 +181,8 @@ static void led_pulse_cb(const os_led_t* led, const void* ctx) {
             hal_led_set_rgb(i, 0, 0, 0);
     }
 }
+ 
 
-// --- Candle: soft warm yellow/orange gentle flicker ---
-static void led_candle_cb(const os_led_t* led, const void* ctx) {
-    (void)ctx;
-    for(uint8_t i = 0; i < 4; i++) {
-        uint8_t noise = led_hash(os_led_get_step(led) * 3 + i * 53);
-        uint8_t r = 25 + (noise & 15); // 25-40
-        uint8_t g = 12 + ((noise >> 2) & 7); // 12-19
-        uint8_t b = 1 + ((noise >> 5) & 1); // 1-2
-        hal_led_set_rgb(i, r, g, b);
-    }
-}
-
-
-led_pattern_t led_pattern_rainbow = {
-    .callback = &led_rainbow_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_breathe_rgb = {
-    .callback = &led_breathe_rgb_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_comet = {
-    .callback = &led_comet_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_sparkle = {
-    .callback = &led_sparkle_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_fire = {
-    .callback = &led_fire_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_ocean = {
-    .callback = &led_ocean_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_pulse = {
-    .callback = &led_pulse_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_candle = {
-    .callback = &led_candle_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
 
 
 // --- Aurora: slow green/cyan/purple shimmer, phase-shifted ---
@@ -517,126 +457,6 @@ static void led_ember_cb(const os_led_t* led, const void* ctx) {
 }
 
 
-led_pattern_t led_pattern_aurora = {
-    .callback = &led_aurora_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_heartbeat = {
-    .callback = &led_heartbeat_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_police = {
-    .callback = &led_police_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_lava = {
-    .callback = &led_lava_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_ice = {
-    .callback = &led_ice_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_sunset = {
-    .callback = &led_sunset_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_morse_sos = {
-    .callback = &led_morse_sos_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_radar = {
-    .callback = &led_radar_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_bounce = {
-    .callback = &led_bounce_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_matrix = {
-    .callback = &led_matrix_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_campfire = {
-    .callback = &led_campfire_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_ocean_deep = {
-    .callback = &led_ocean_deep_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_neon = {
-    .callback = &led_neon_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_thunder = {
-    .callback = &led_thunder_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_breathe_warm = {
-    .callback = &led_breathe_warm_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_chase_dual = {
-    .callback = &led_chase_dual_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_twinkle = {
-    .callback = &led_twinkle_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_gradient_shift = {
-    .callback = &led_gradient_shift_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_wave_green = {
-    .callback = &led_wave_green_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_ember = {
-    .callback = &led_ember_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
 
 // --- Plasma: multi-frequency color mixing ---
 static void led_plasma_cb(const os_led_t* led, const void* ctx) {
@@ -979,129 +799,6 @@ static void led_vu_strobe_cb(const os_led_t* led, const void* ctx) {
     uint8_t v = on ? (uint8_t)(30 + level * 30.f) : 0;
     for(uint8_t i = 0; i < 4; i++) hal_led_set_rgb(i, v, v, v);
 }
-
-// --- New creative pattern structs ---
-
-led_pattern_t led_pattern_plasma = {
-    .callback = &led_plasma_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_pendulum = {
-    .callback = &led_pendulum_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_firefly = {
-    .callback = &led_firefly_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_waterfall = {
-    .callback = &led_waterfall_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_strobe_rgb = {
-    .callback = &led_strobe_rgb_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_galaxy = {
-    .callback = &led_galaxy_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_snake = {
-    .callback = &led_snake_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_breathe_purple = {
-    .callback = &led_breathe_purple_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_drip = {
-    .callback = &led_drip_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_prism = {
-    .callback = &led_prism_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_fire = {
-    .callback = &led_vu_fire_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_pulse = {
-    .callback = &led_vu_pulse_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_rainbow = {
-    .callback = &led_vu_rainbow_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_spark = {
-    .callback = &led_vu_spark_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_breathe = {
-    .callback = &led_vu_breathe_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_spectrum = {
-    .callback = &led_vu_spectrum_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_plasma = {
-    .callback = &led_vu_plasma_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_comet = {
-    .callback = &led_vu_comet_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_aurora = {
-    .callback = &led_vu_aurora_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
-led_pattern_t led_pattern_vu_strobe = {
-    .callback = &led_vu_strobe_cb,
-    .loop = 1,
-    .steps = 255,
-    .rate = 50,
-};
 
 // --- Tide: smooth sinusoidal color waves, 90° phase per LED ---
 static void led_tide_cb(const os_led_t* led, const void* ctx) {
@@ -1590,62 +1287,287 @@ led_pattern_t led_pattern_mist = {
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_log = {
-    .callback = &led_vu_log_cb,
+ led_pattern_t led_pattern_rainbow = {
+    .callback = &led_rainbow_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_trigger = {
-    .callback = &led_vu_trigger_cb,
+led_pattern_t led_pattern_breathe_rgb = {
+    .callback = &led_breathe_rgb_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_envelope = {
-    .callback = &led_vu_envelope_cb,
+led_pattern_t led_pattern_sparkle = {
+    .callback = &led_sparkle_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_spectral = {
-    .callback = &led_vu_spectral_cb,
+led_pattern_t led_pattern_pulse = {
+    .callback = &led_pulse_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_strobe_link = {
-    .callback = &led_vu_strobe_link_cb,
+led_pattern_t led_pattern_aurora = {
+    .callback = &led_aurora_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_particles = {
-    .callback = &led_vu_particles_cb,
+led_pattern_t led_pattern_police = {
+    .callback = &led_police_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_warmth = {
-    .callback = &led_vu_warmth_cb,
+led_pattern_t led_pattern_neon = {
+    .callback = &led_neon_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_wave = {
-    .callback = &led_vu_wave_cb,
+led_pattern_t led_pattern_gradient_shift = {
+    .callback = &led_gradient_shift_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_gate = {
-    .callback = &led_vu_gate_cb,
+led_pattern_t led_pattern_plasma = {
+    .callback = &led_plasma_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
 };
-led_pattern_t led_pattern_vu_impact = {
-    .callback = &led_vu_impact_cb,
+led_pattern_t led_pattern_pendulum = {
+    .callback = &led_pendulum_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_firefly = {
+    .callback = &led_firefly_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_prism = {
+    .callback = &led_prism_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+
+// --- Candle: soft warm yellow/orange gentle flicker ---
+static void led_candle_cb(const os_led_t* led, const void* ctx) {
+    (void)ctx;
+    for(uint8_t i = 0; i < 4; i++) {
+        uint8_t noise = led_hash(os_led_get_step(led) * 3 + i * 53);
+        uint8_t r = 25 + (noise & 15); // 25-40
+        uint8_t g = 12 + ((noise >> 2) & 7); // 12-19
+        uint8_t b = 1 + ((noise >> 5) & 1); // 1-2
+        hal_led_set_rgb(i, r, g, b);
+    }
+}
+
+/* Restored: these definitions were lost while the demo table below still named them,
+ * leaving the example unbuildable. Verbatim from the last committed revision. */
+led_pattern_t led_pattern_bounce = {
+    .callback = &led_bounce_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_breathe_purple = {
+    .callback = &led_breathe_purple_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_breathe_warm = {
+    .callback = &led_breathe_warm_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_campfire = {
+    .callback = &led_campfire_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_candle = {
+    .callback = &led_candle_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_chase_dual = {
+    .callback = &led_chase_dual_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_drip = {
+    .callback = &led_drip_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_ember = {
+    .callback = &led_ember_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_galaxy = {
+    .callback = &led_galaxy_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_heartbeat = {
+    .callback = &led_heartbeat_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_ice = {
+    .callback = &led_ice_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_lava = {
+    .callback = &led_lava_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_matrix = {
+    .callback = &led_matrix_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_morse_sos = {
+    .callback = &led_morse_sos_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_ocean_deep = {
+    .callback = &led_ocean_deep_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_radar = {
+    .callback = &led_radar_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_snake = {
+    .callback = &led_snake_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_strobe_rgb = {
+    .callback = &led_strobe_rgb_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_sunset = {
+    .callback = &led_sunset_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_thunder = {
+    .callback = &led_thunder_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_twinkle = {
+    .callback = &led_twinkle_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_aurora = {
+    .callback = &led_vu_aurora_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_breathe = {
+    .callback = &led_vu_breathe_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_comet = {
+    .callback = &led_vu_comet_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_fire = {
+    .callback = &led_vu_fire_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_plasma = {
+    .callback = &led_vu_plasma_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_pulse = {
+    .callback = &led_vu_pulse_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_rainbow = {
+    .callback = &led_vu_rainbow_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_spark = {
+    .callback = &led_vu_spark_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_spectrum = {
+    .callback = &led_vu_spectrum_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_vu_strobe = {
+    .callback = &led_vu_strobe_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_waterfall = {
+    .callback = &led_waterfall_cb,
+    .loop = 1,
+    .steps = 255,
+    .rate = 50,
+};
+led_pattern_t led_pattern_wave_green = {
+    .callback = &led_wave_green_cb,
     .loop = 1,
     .steps = 255,
     .rate = 50,
@@ -1658,10 +1580,7 @@ led_pattern_t led_pattern_vu_impact = {
 const led_demo_t led_demos[] = {
     { "rainbow", &led_pattern_rainbow },
     { "breathe", &led_pattern_breathe_rgb },
-    { "comet", &led_pattern_comet },
     { "sparkle", &led_pattern_sparkle },
-    { "fire", &led_pattern_fire },
-    { "ocean", &led_pattern_ocean },
     { "pulse", &led_pattern_pulse },
     { "candle", &led_pattern_candle },
     { "aurora", &led_pattern_aurora },
@@ -1714,16 +1633,6 @@ const led_demo_t led_demos[] = {
     { "radiate", &led_pattern_radiate },
     { "syncopate", &led_pattern_syncopation },
     { "mist", &led_pattern_mist },
-    { "vu log", &led_pattern_vu_log },
-    { "vu trigger", &led_pattern_vu_trigger },
-    { "vu envelop", &led_pattern_vu_envelope },
-    { "vu spectra", &led_pattern_vu_spectral },
-    { "vu stb lnk", &led_pattern_vu_strobe_link },
-    { "vu particl", &led_pattern_vu_particles },
-    { "vu warmth", &led_pattern_vu_warmth },
-    { "vu wave", &led_pattern_vu_wave },
-    { "vu gate", &led_pattern_vu_gate },
-    { "vu impact", &led_pattern_vu_impact },
 };
 
 const uint16_t led_demo_count = (uint16_t)(sizeof(led_demos) / sizeof(led_demos[0]));

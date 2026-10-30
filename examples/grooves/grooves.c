@@ -2,7 +2,7 @@
 // scratch, upsamples into the mixer in_bus with ups2x_f32_add(), so the tapedecks
 // record it like the radio. (The firmware does no rate conversion — a source tapp
 // always gets the real 48k bus and owns its own internal rate.)
-// Controls: BTN1=play/stop (custom glyph hint)   BTN2=shuffle   BTN3=param readout (no action)
+// Controls: BTN1=play/stop (custom glyph hint)   BTN2=shuffle   BTN3=param adjust on/off (all params)
 //           BTN4/BTN5 press = enc target back/fwd (hold = system back/exit)
 //           ENC drives the selected target: morph drift tempo dens tone key scale
 //                                           tracks pump.
@@ -24,15 +24,16 @@ TAPP_DECLARE_TYPE(AppTypeSrc);
 #define STEPS       16           // max steps per track
 #define GRID        4            // 4x4 morph node grid
 #define NODES       (GRID * GRID)
-#define TRACKS      6
-#define TOP_BAR     26
+#define TRACKS      7
 
-enum { T_KICK = 0, T_SNARE, T_HAT, T_BASS, T_LEAD, T_PAD };
+/* Order is also the ENABLE order: the `tracks` knob brings them in left to right, so the kit
+ * assembles drums-first and the bass lands last. */
+enum { T_KICK = 0, T_SNARE, T_HAT, T_CLAP, T_METAL, T_GLITCH, T_BASS };
 
 #define INF_SX    96
 #define INF_SY    36
 #define INF_X     70                            // 70..166 — center-left, clear of metro and params
-#define INF_Y     40                            // 50..86, below the hint band, above the grid
+#define INF_Y     40                            // 50..86, below the hints, above the grid
 #define INF_TH     9                            // stroke thickness
 #define INF_DOT_R  4                            // travelling marker radius (9px)
 #define UI_HALFTONE 4                           // 50% halftone — shared by the figure-8 and metronome
@@ -46,8 +47,8 @@ enum { T_KICK = 0, T_SNARE, T_HAT, T_BASS, T_LEAD, T_PAD };
 #define FIG_BPR ((FIG_W + 7) / 8)
 
 // Encoder targets — BTN4/BTN5 step through these
-enum { ENC_MORPH = 0, ENC_DRIFT, ENC_TRACKS, ENC_PUMP,  ENC_DENS, ENC_TONE, ENC_KEY, ENC_SCALE,
-    ENC_TEMPO, ENC_TOTAL };
+enum { ENC_MORPH = 0, ENC_DRIFT, ENC_TRACKS, ENC_PUMP, ENC_REL, ENC_DENS, ENC_TONE, ENC_KEY,
+    ENC_SCALE, ENC_TEMPO, ENC_TOTAL };
 
 /* One params_t per encoder target, edited the way the main menu edits its rows:
  * the encoder writes the TARGET (param_write_delta_coarse), the tick eases val
@@ -72,6 +73,14 @@ static params_t gb_prm[ENC_TOTAL] = {
         .refresh = true },
     [ENC_PUMP]  = { .name = "pump",  .type = ParamValScaledType, .coarse = 0.02f, .fine = 0.01f,
         .min = 0.f,  .max = 1.f,   .dflt = 0.75f, .val = 0.75f, .target = 0.75f,
+        .refresh = true },
+    /* Sidechain RELEASE, split out of `pump` so depth and length are independent — pump used to
+     * derive both and you could not have a deep short duck or a shallow long one. 60..600 ms; the
+     * 0.333 default is exactly the 240 ms that pump 0.75 used to give, so nothing moves until it
+     * is touched. Named "rel" rather than "release": the BTN3 hint cell is narrow and the longest
+     * existing name is "tracks" at 6 chars. */
+    [ENC_REL]   = { .name = "rel",   .type = ParamValScaledType, .coarse = 0.02f, .fine = 0.01f,
+        .min = 0.f,  .max = 1.f,   .dflt = 0.333f, .val = 0.333f, .target = 0.333f,
         .refresh = true },
     [ENC_DENS]  = { .name = "dens",  .type = ParamValScaledType, .coarse = 0.02f, .fine = 0.01f,
         .min = 0.f,  .max = 1.f,   .dflt = 0.85f, .val = 0.85f, .target = 0.85f, .refresh = true },
@@ -99,7 +108,6 @@ static inline float fast_exp2f(float x) {
     return u.f;
 }
 
-static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 static inline float fsin_i32(int32_t ph) {
     const float u = (float)ph * I32_TO_F;            /* -1..1 == theta/pi */
@@ -155,8 +163,16 @@ static inline int deg2semi(int sc, int deg) {
 #define MIX_SWING   0.10f
 #define BUS_TRIM    0.80f
 
-static const float LVL[TRACKS]       = { 0.95f, 0.50f, 0.20f, 0.62f, 0.32f, 0.22f };
-static const float DENS_DFLT[TRACKS] = { 0.85f, 0.55f, 0.70f, 0.62f, 0.50f, 0.75f };
+/* Morph automation: one motion lane, recorded by holding BTN3 and looped on release.
+ * ONE SAMPLE PER UI TICK, no timestamps — the controls poll only wakes early on BTN1-BTN5
+ * edges (os_system.c pin-scopes the EXTI wake on purpose, so a leaked encoder line cannot
+ * "collapse the poll cadence to per-edge"), so turning the knob does NOT shorten tick():
+ * record and replay run at the same steady ~40ms and the loop keeps the gesture's length. */
+enum { AUTO_OFF = 0, AUTO_REC, AUTO_PLAY };
+#define AUTO_MAX    512                     /* ~20 s at the 40 ms tick; 1 KB in the model */
+
+static const float LVL[TRACKS]       = { 0.95f, 0.50f, 0.20f, 0.42f, 0.30f, 0.24f, 0.62f };
+static const float DENS_DFLT[TRACKS] = { 0.85f, 0.55f, 0.70f, 0.42f, 0.48f, 0.38f, 0.62f };
 static const float HAT_RATIO[6] = { 1.0f, 1.4471f, 1.6170f, 1.9265f, 2.5028f, 2.6637f };
 
 // ----------------------------------------------------------------------------
@@ -183,6 +199,7 @@ typedef struct {
      * silently revert encoder detents. See morph_phase(). */
     uint16_t morph_drift;                   // audio-owned drift accumulator
     uint8_t  enc_target;
+    bool     adj_off;               // BTN3 tap: the knob leaves EVERY param alone (bar greyed)
     uint8_t pat [2][TRACKS][NODES][STEPS];  // 0..255 intensity
     int8_t  tune[2][TRACKS][NODES][STEPS];  // drums: character  pitched: scale degree
     uint8_t plen[2][TRACKS];                // polymeter loop length
@@ -198,22 +215,39 @@ typedef struct {
     uint32_t regen_seed;
 
     // synth voices ---------------------------------------------------------
-    uint32_t k_ph;  float k_f, k_f0, k_env, k_click, k_dec, k_drv, k_h2, k_h4, k_nrm;
+    uint32_t k_ph;  float k_f, k_f0, k_env, k_click, k_dec, k_drv;
     uint32_t s_ph1, s_ph2, s_inc1, s_inc2;
-    float    s_nenv, s_tenv, s_tr, s_ndec, s_lp, s_bp, s_bpf, s_nmix;
-    uint32_t h_ph[6], h_inc[6];  float h_env, h_dec, h_lp, h_bp, h_f;
+    float    s_nenv, s_tenv, s_tr, s_ndec, s_lp, s_bp, s_bpf, s_nmix, s_fd, s_q;
+    uint32_t h_ph[6], h_inc[6];  float h_env, h_dec, h_lp, h_bp, h_f, h_fd, h_q;
     uint32_t b_ph, b_sph, b_inc, b_sinc;
     float    b_rinc, b_env, b_fenv, b_amp, b_lp, b_bp, b_q, b_fd, b_dec, b_sub;
-    uint32_t l_pm, l_ps, l_incm, l_incs;
-    float    l_rincs, l_ratio, l_f, l_tgt, l_env, l_dec, l_lp, l_la;
-    uint8_t  l_prev;                        // lead played last step -> glide
-    uint32_t p_ph[6], p_inc[6], p_lfo;
-    float    p_rinc[6], p_f[3], p_tgt[3], p_env, p_gate, p_ac;
-    float    p_det, p_atk, p_rel, p_bright;   // per-chord voicing, from the node axes
-    float    p_lpL, p_bpL, p_lpR, p_bpR, p_hpL, p_hpR, p_fc;
+    /* CLAP/TOM — a burst train (the clap) over a short pitched body (the tom). `c` morphs between
+     * the two, so one voice covers hand-clap and rototom without a second set of state. */
+    uint32_t cl_ph, cl_inc;
+    float    cl_env, cl_dec, cl_bpf, cl_lp, cl_bp, cl_benv, cl_bdec, cl_mix;
+    uint32_t cl_gap, cl_t;                  // burst spacing and countdown
+    uint8_t  cl_n;                          // bursts left in the train
+    /* FM METAL — two-op FM through a bandpass. Kept SMOOTH: a modest, non-integer ratio and an
+     * index that decays, so it rings rather than clangs. */
+    uint32_t mt_pc, mt_pm, mt_incc, mt_incm;
+    float    mt_env, mt_dec, mt_idx, mt_idec, mt_f, mt_lp, mt_bp;
+    /* GLITCH — sample-and-hold noise (a rate crush) through a resonant bandpass. PLEASANT: the
+     * hold rate is tuned to the voice's pitch, so the aliasing lands on harmonics, not hash. */
+    uint32_t gl_hold, gl_t;
+    float    gl_env, gl_dec, gl_val, gl_f, gl_lp, gl_bp, gl_q;
 
     float   dcx_l, dcy_l, dcx_r, dcy_r;
     float   dens[TRACKS];                   // per-track density — the dens PARAM is a macro over these
+    float   dens_prev;                      // last dens knob value, for the delta below
+
+    /* Morph motion lane. Zeroed with the model at every launch, so AUTO_OFF + empty is the
+     * free initial state. Records/replays the UI-owned half of the morph position ONLY —
+     * morph_drift stays the audio thread's, so `drift` keeps advancing on top of a playing
+     * lane exactly as it does on top of the knob. */
+    uint8_t  auto_state;                    // AUTO_OFF / AUTO_REC / AUTO_PLAY
+    uint8_t  auto_moved;                    // the knob actually moved during this take
+    uint16_t auto_len, auto_idx;
+    uint16_t auto_buf[AUTO_MAX];            // morph position, phase units (val * 65536)
 
     uint8_t fig_base[FIG_H * FIG_BPR];      // baked INF_TH path stroke (band-local bits)
     uint8_t fig_fat[FIG_H * FIG_BPR];       // baked INF_TH+4 stroke (selected halo)
@@ -221,6 +255,10 @@ typedef struct {
     ui_roll_text_t enc_roll;                // mechanical roll for the enc-target name
     ui_roll_text_t val_roll;                // mechanical roll for the key/scale VALUE text
     char key_txt[8];                        // persistent note-name text the value roll diffs against
+    /* The selected value as text, for the hold cell's LABEL. The cell paints itself, but a
+     * HintCustom degrades to a plain HintString wherever another band seeds from ours, and
+     * there a number is the honest fallback. Model storage: hint labels are REFERENCED. */
+    char val_txt[10];
     /* 24k render scratch + its upsampler state. The state MUST persist across
      * blocks (it carries the interpolator seam) — a model field, zeroed once. */
     float scratch24[GB_SCRATCH24];
@@ -237,8 +275,6 @@ typedef struct {
      * that longer tail is what reads as a pump rather than a click. */
     float sc_env, sc_dec;
 } gb_model_t;
-
-static gb_model_t* g_model = 0;
 
 // ----------------------------------------------------------------------------
 // RNG
@@ -270,18 +306,14 @@ static const uint8_t PULSES[TRACKS][GRID] = {
     {  2,  4,  6,  8 },   // kick
     {  2,  2,  3,  5 },   // snare
     {  4,  7, 11, 15 },   // hat
+    {  1,  2,  3,  5 },   // clap   - sparse, answers the snare
+    {  2,  3,  5,  7 },   // metal  - tuned, carries the line the lead used to
+    {  3,  5,  7, 11 },   // glitch - busiest, fills the gaps
     {  3,  5,  8, 11 },   // bass
-    {  2,  3,  5,  7 },   // lead
-    {  1,  2,  2,  4 },   // pad
 };
-static const uint8_t ROT0[TRACKS] = { 0, 4, 0, 0, 2, 0 };
+/* Rotations pull the new voices OFF the kick/snare grid so they interlock rather than double. */
+static const uint8_t ROT0[TRACKS] = { 0, 4, 0, 6, 2, 3, 0 };
 
-static const int8_t PROG[4][4] = {
-    { 0, 5, 3, 4 },   // i  VI  IV  V
-    { 0, 3, 4, 4 },   // i  IV  V   V
-    { 0, 6, 5, 4 },   // i VII  VI  V
-    { 0, 2, 5, 3 },   // i III  VI  IV
-};
 
 static int8_t drum_tune(gb_model_t* m, int tr, int node, int s) {
     int c;
@@ -311,8 +343,8 @@ static void gen_node(gb_model_t* m, int buf, int tr, int node) {
     uint8_t* pd = m->pat[buf][tr][node];
     int8_t*  td = m->tune[buf][tr][node];
 
-    const int lo = (tr == T_LEAD) ? -2 : -5;
-    const int hi = (tr == T_LEAD) ? 12 :  7;
+    const int lo = -5;
+    const int hi =  7;
     int deg = lo + (int)(urand(m) % (uint32_t)(hi - lo + 1));
 
     for (int s = 0; s < STEPS; s++) {
@@ -321,10 +353,10 @@ static void gen_node(gb_model_t* m, int buf, int tr, int node) {
         else if (s & 1)         pd[s] = 120 + (uint8_t)(urand(m) % 60);   // ghost
         else                    pd[s] = 200;
 
-        if (tr <= T_HAT) {
+        /* Clap is an untuned drum, so it takes the beater character like the other three. Metal,
+         * glitch and bass are tuned and walk a scale degree instead. */
+        if (tr <= T_CLAP) {
             td[s] = drum_tune(m, tr, node, s);
-        } else if (tr == T_PAD) {
-            td[s] = PROG[node & 3][(s >> 2) & 3];
         } else {
             const uint32_t r = urand(m);
             deg += (int)(r % 7) - 3;
@@ -428,22 +460,10 @@ static void gb_bake_fig(gb_model_t* m) {
     }
 }
 
-/* Transparent stencil blit: SET bits only, as hline runs in the CURRENT color
- * (there is no transparent xbm blit in the API — gfx_draw_xbm overwrites the
- * whole box). Runs keep it cheap: a few hlines per row. */
+/* Stencil blit: the baked figures are XBM bitmaps (LSB first, rows byte-padded), and a draw
+ * callback starts with TRANSPARENT blits — only the SET bits paint, in the current colour. */
 static void gb_blit(gfx_t* gfx, const uint8_t* s) {
-    for (int row = 0; row < FIG_H; row++) {
-        const uint8_t* b = &s[row * FIG_BPR];
-        const gfx_uint_t y = (gfx_uint_t)(INF_Y - INF_PAD + row);
-        int x = 0;
-        while (x < FIG_W) {
-            if (b[x >> 3] == 0) { x = (x & ~7) + 8; continue; }
-            if (!(b[x >> 3] & (1u << (x & 7)))) { x++; continue; }
-            const int x0 = x;
-            while (x < FIG_W && (b[x >> 3] & (1u << (x & 7)))) x++;
-            gfx_draw_hline(gfx, (gfx_uint_t)(INF_X - INF_PAD + x0), y, (gfx_uint_t)(x - x0));
-        }
-    }
+    gfx_draw_xbm(gfx, INF_X - INF_PAD, INF_Y - INF_PAD, FIG_W, FIG_H, s);
 }
 
 static void morph_weights(const gb_model_t* m, uint16_t morph, morph_w_t* w) {
@@ -459,6 +479,50 @@ static void morph_weights(const gb_model_t* m, uint16_t morph, morph_w_t* w) {
     w->n[3] = (uint16_t)(w->n[2] + 1);    w->w[3] = ax * ay;
 }
 
+/* ---- morph as a modulator of dens/tone ------------------------------------------------------
+ * The figure-8 position offsets the two knobs by +/-15% of their range, so ONE knob moves the
+ * arrangement: the pattern breathes denser and thinner, the kit retunes, as morph travels. The
+ * knob stays the centre the deviation is measured from.
+ *
+ * Different axes on purpose — x drives density, y drives tone — so the two do not move in lockstep
+ * and the lobes of the 8 are not simply "more of everything".
+ *
+ * Both MUST be read through these, never from gb_prm directly: tone is read independently by
+ * fire_step and gb_process, and dens by fire_step, steps_to_next and gb_redraw. They agree today
+ * only because they happen to read the same field; with a morph term they would disagree, and the
+ * drawn grid would stop matching what is heard. */
+#define MORPH_MOD 0.30f          /* +/-0.15 around the knob. NOTE for tone: tone_semis scales by
+                                  * 48, so this is +/-7.2 SEMITONES of drum transpose and, since
+                                  * tone drives the varispeed, a 1.5x swing in drum length too.
+                                  * 0.12f would give a more conservative +/-3 semitones. */
+
+static void morph_mod_xy(const gb_model_t* m, float* dx, float* dy) {
+    float nx, ny; morph_xy_raw(morph_arc(m, morph_phase(m)), &nx, &ny);
+    *dx = (nx - 0.5f) * MORPH_MOD;
+    *dy = (ny - 0.5f) * MORPH_MOD;
+}
+
+/* PER-VOICE tone. Each voice reads the figure-8 at its own rotation, so morph does not transpose
+ * the kit as a block — the voices drift against each other, one going up while another goes down,
+ * and the kit keeps re-tuning itself as the knob travels. Spread over HALF the loop because fy
+ * completes two periods per lap, so half a lap is one full sweep of the offset and the seven
+ * voices land on seven genuinely different points.
+ *
+ * Everything downstream follows automatically: tone_stretch and tone_dsc are called with the
+ * voice's own value, so a voice tuned lower also rings longer and darkens further. */
+static float gb_tone_tr(const gb_model_t* m, int tr) {
+    const uint16_t ph = (uint16_t)(morph_phase(m) + (uint16_t)(tr * (32768 / TRACKS)));
+    float nx, ny; morph_xy_raw(morph_arc(m, ph), &nx, &ny);
+    (void)nx;
+    return clampf(gb_prm[ENC_TONE].val + (ny - 0.5f) * MORPH_MOD, 0.f, 1.f);
+}
+
+static float gb_dens(const gb_model_t* m, int tr) {
+    float dx, dy; morph_mod_xy(m, &dx, &dy);
+    (void)dy;
+    return clampf(m->dens[tr] + dx, 0.f, 1.f);
+}
+
 static void step_cell(const gb_model_t* m, const morph_w_t* w, int tr, int st,
                       float* inten, float* tune) {
     const int buf = m->live;
@@ -471,16 +535,17 @@ static void step_cell(const gb_model_t* m, const morph_w_t* w, int tr, int st,
         if (iv > best) { best = iv; bestv = m->tune[buf][tr][w->n[k]][st]; }
     }
     *inten = si * (1.0f / 255.0f);
-    if (tr >= T_BASS) *tune = (float)bestv;
+    if (tr >= T_METAL) *tune = (float)bestv;   /* tuned voices: the raw degree, unsmoothed */
     else              *tune = (si > 0.5f) ? (sT / si) : 0.0f;
 }
 
 static int steps_to_next(const gb_model_t* m, const morph_w_t* w, int tr, int from) {
-    const int L = m->plen[m->live][tr] ? m->plen[m->live][tr] : STEPS;
+    const int   L   = m->plen[m->live][tr] ? m->plen[m->live][tr] : STEPS;
+    const float thr = 1.0f - gb_dens(m, tr);   /* loop-invariant — morph does not move mid-scan */
     for (int g = 1; g <= L; g++) {
         float inten, tn;
         step_cell(m, w, tr, (from + g) % L, &inten, &tn);
-        if (inten > 1.0f - m->dens[tr]) return g;
+        if (inten > thr) return g;
     }
     return L;   /* nothing else fires this loop — ring for the whole thing */
 }
@@ -503,6 +568,27 @@ static inline float drum_octave(gb_model_t* m, float bias, uint32_t odds) {
     return ((frand(m) < bias) ? -12.0f : 12.0f);
 }
 
+/* ---- `tone` as VARISPEED ---------------------------------------------------------------------
+ * A sampler pitches down by reading slower, so a hit two octaves down is four times as LONG and its
+ * whole spectrum descends with it. These drums had absolute-ms decays and additive-in-tone filters,
+ * so the knob moved pitch and nothing else. That is the difference between "sampled down" and
+ * "detuned", and no amount of harmonic help substitutes for it.
+ *
+ * Both are unity for tone >= 0.5, so the upper half of the knob is bit-identical. Keyed on the KNOB,
+ * not on per-hit pitch: keying on pitch would also catch drum_octave's random hits and make ~1 in 8
+ * of them twice as long as their neighbours at the DEFAULT setting. */
+static inline float tone_stretch(float tone) {          /* time  x1 .. x4 */
+    return fmaxf(1.0f, fast_exp2f(-tone_semis(tone) * (1.0f / 12.0f)));
+}
+static inline float tone_dsc(float tone) {              /* cutoff x1 .. x0.25 */
+    return fminf(1.0f, fast_exp2f(tone_semis(tone) * (1.0f / 12.0f)));
+}
+/* Ceiling for a stretched tail, relative to the grid rather than a fixed wall: unbounded, a
+ * max-settings kick reaches 2 s, which is 27 steps at 200 BPM. 803 ms at 112, 450 ms at 200. */
+static inline float drum_cap(void) {
+    return fminf(900.0f, (15000.0f / fmaxf(gb_prm[ENC_TEMPO].val, 1.0f)) * 6.0f);
+}
+
 // ----------------------------------------------------------------------------
 // Voice triggers
 // ----------------------------------------------------------------------------
@@ -511,17 +597,36 @@ static void trig_kick(gb_model_t* m, float vel, float c, float tone, float np, f
     m->k_f0    = drum_pitch(42.0f, np * 8.0f + c * 7.0f + tone_semis(tone)
                                   + drum_octave(m, 0.85f, 40u), j);
     m->k_f     = m->k_f0 * (3.2f + 1.6f * c);
-    const float lo = clampf((42.0f - m->k_f0) * (1.0f / 31.5f), 0.f, 1.f);   /* 0 at 42Hz, 1 at 10.5 */
-    m->k_h2    = 0.55f * lo;
-    m->k_h4    = 0.40f * lo * lo;
-    m->k_nrm   = 1.0f / (1.0f + m->k_h2 + m->k_h4);
+    /* How far below centre the KNOB is — deliberately NOT derived from k_f0. Keying off the pitch
+     * also catches the random octave-down kicks, which sounds like a good idea until 1 kick in 8
+     * comes out brighter than its neighbours at the DEFAULT setting (drum_octave above drops
+     * 13% of them an octave whatever `tone` says). The knob is what the player moves; it alone
+     * should change the timbre. Exactly 0 for tone >= 0.5, so the upper half is untouched on
+     * EVERY hit — keying on k_f0 could not promise even that, since the +/-1.5% jitter `j` puts
+     * f0 just under 42 on about half of them. */
+    const float lo = clampf((0.5f - tone) * 2.0f, 0.f, 1.f);
     m->k_ph    = 0x40000000u;
     m->k_env   = vel;
+    /* Click backed off as the body sinks. It was a constant, so once the fundamental left the
+     * audible band it simply became the whole sound. Unity at centre and above. */
     m->k_click = vel * (0.16f + 0.10f * (c + 1.0f)) * (1.0f - 0.55f * lo);
     m->sc_env  = 1.0f;                 // full pump on every kick
-    m->k_dec   = decay_coef((150.0f + 110.0f * c) * (1.0f + nd * 0.8f)
-                            * (0.92f + 0.16f * frand(m)));
-     m->k_drv   = 1.7f + 0.7f * lo;
+    m->k_dec   = decay_coef(clampf((150.0f + 110.0f * c) * (1.0f + nd * 0.8f)
+                                   * (0.92f + 0.16f * frand(m)) * tone_stretch(tone),
+                                   5.0f, drum_cap()));
+    /* Pitch it down like a SAMPLE. A sample survives -2 octaves because it is broadband: every
+     * harmonic descends with the fundamental and plenty stays audible. This body is ONE sine, so
+     * transposing it left nothing up there — that, not anything about hearing, is why the bottom
+     * of the knob was a bare click.
+     *
+     * sat1 manufactures odd harmonics, and 3f0/5f0 DO descend with f0 (the lowest audible partial
+     * runs 42 -> 89 -> 63 -> 44 -> 31 Hz across the knob) while being spaced by f0, so the ear
+     * reconstructs the missing fundamental. Octave partials at 2f0/4f0 were tried and are wrong:
+     * their weight has to rise as f0 falls, and that rise cancels the transposition exactly —
+     * the audible pitch stops descending, and the loudest partial can even jump an octave UP.
+     *
+     * 2.6 puts the 3rd harmonic near -12 dBc. Not higher: 5.9 squares the sine into a buzzer. */
+    m->k_drv   = 1.7f + 0.9f * lo;     /* 1.7 at centre and above, 2.6 at the bottom */
 }
 
 static void trig_snare(gb_model_t* m, float vel, float c, float tone, float np, float nd) {
@@ -535,8 +640,28 @@ static void trig_snare(gb_model_t* m, float vel, float c, float tone, float np, 
     m->sc_env = fmaxf(m->sc_env, 0.5f);
     m->s_tenv = vel * (0.85f - 0.35f * c);
     m->s_tr   = vel;
-    m->s_ndec = decay_coef((26.0f + 17.0f * (c + 1.0f)) * (1.0f + nd * 0.7f));
-    m->s_bpf  = svf_f(1200.0f + 1100.0f * (c + 1.0f) + 900.0f * tone);
+    m->s_ndec = decay_coef(clampf((26.0f + 17.0f * (c + 1.0f)) * (1.0f + nd * 0.7f)
+                                  * (0.92f + 0.16f * frand(m))   /* the kick had this; snare did not */
+                                  * tone_stretch(tone), 3.0f, drum_cap()));
+    /* Cutoff MULTIPLIED by the pitch ratio, not offset by it. The old `+ 900*tone` left the noise
+     * band at 1200-3400 Hz while the tonal partials dropped to 45 Hz — the noise half never
+     * descended, which is most of why the low kit sounded thin and disconnected from its pitch.
+     *
+     * Base now also takes `np` (so morph moves the filter the way it already moves pitch and
+     * decay — the filters were the one part of the voice the node axes never reached), `vel` (an
+     * accent reads BRIGHTER, not merely louder) and a per-hit +/-8% jitter so repeated steps stop
+     * being bit-identical. */
+    m->s_bpf  = svf_f((1200.0f + 1100.0f * (c + 1.0f) + 900.0f * tone)
+                      * (1.0f + np * 0.35f) * (0.70f + 0.42f * vel)
+                      * (0.92f + 0.16f * frand(m)) * tone_dsc(tone));
+    /* Filter ENVELOPE depth. The cutoff used to be static for the whole hit; it now rides the
+     * noise envelope that is already decaying, so the band sweeps down as the hit dies — crack
+     * then body, instead of one flat colour. No new envelope state: s_nenv is right there.
+     * Depth from `nd`, the morph decay axis, so long hits sweep further. */
+    m->s_fd   = 1.6f * (1.0f + nd * 0.6f) * (0.8f + 0.4f * frand(m));
+    /* Damping falls as the knob goes up: the band gets narrower and rings, so a pitched-up kit
+     * squelches instead of sitting flat. 0.45 (the old constant) at centre and below. */
+    m->s_q    = clampf(0.45f - 0.22f * clampf((tone - 0.5f) * 2.0f, 0.f, 1.f), 0.20f, 0.45f);
     m->s_nmix = 0.55f + 0.225f * (c + 1.0f);
 }
 
@@ -547,9 +672,20 @@ static void trig_hat(gb_model_t* m, float vel, float c, bool open, float tone,
                                1.0f + (frand(m) - 0.5f) * 0.05f);
     for (int k = 0; k < 6; k++) m->h_inc[k] = HZ2INC(f0 * HAT_RATIO[k]);
     m->h_env = vel;
-    m->h_dec = decay_coef((open ? (90.0f + 120.0f * c) : (16.0f + 11.0f * (c + 1.0f)))
-                          * (1.0f + nd * 0.7f));
-    m->h_f   = svf_f(5200.0f + 2200.0f * c + 2200.0f * tone);
+    /* fmaxf on the base: an open hat at c = -1 computes 90 + 120*(-1) = -30 ms, which only ever
+     * worked because decay_coef clamps internally — multiplying a negative by the stretch keeps it
+     * negative, so pin it before it is scaled. */
+    m->h_dec = decay_coef(clampf(fmaxf(open ? (90.0f + 120.0f * c) : (16.0f + 11.0f * (c + 1.0f)),
+                                       2.0f) * (1.0f + nd * 0.7f) * tone_stretch(tone),
+                                 2.0f, drum_cap()));
+    /* Same three additions as the snare: np so morph reaches the filter, vel so accents open it,
+     * and per-hit jitter. */
+    m->h_f   = svf_f((5200.0f + 2200.0f * c + 2200.0f * tone)
+                     * (1.0f + np * 0.30f) * (0.70f + 0.42f * vel)
+                     * (0.92f + 0.16f * frand(m)) * tone_dsc(tone));
+    /* Filter envelope off h_env — the hat's only envelope. This is what turns "shh" into "tss". */
+    m->h_fd  = 1.3f * (1.0f + nd * 0.6f) * (0.8f + 0.4f * frand(m));
+    m->h_q   = clampf(0.55f - 0.26f * clampf((tone - 0.5f) * 2.0f, 0.f, 1.f), 0.26f, 0.55f);
 }
 
 static void trig_bass(gb_model_t* m, int semi, bool acc, float tone, float np, float nd,
@@ -570,29 +706,66 @@ static void trig_bass(gb_model_t* m, int semi, bool acc, float tone, float np, f
     m->b_dec  = decay_coef(clampf(fmaxf(base_ms, gap_ms * 0.9f), 60.0f, 900.0f));
 }
 
-static void trig_lead(gb_model_t* m, int semi, bool acc, bool glide, float tone,
-                      float np, float nd) {
-    m->l_tgt = note_to_freq((float)semi);
-    if (!glide) m->l_f = m->l_tgt;                       
-    m->l_env   = 1.0f;
-    m->l_dec   = decay_coef((acc ? 260.0f : 130.0f) * (1.0f + nd * 0.8f));
-    m->l_la    = clampf((acc ? 0.55f : 0.28f) * (1.0f + np * 0.45f)
-                        * (0.8f + frand(m) * 0.4f), 0.08f, 0.85f);
-    m->l_ratio = clampf(1.0f + tone * 2.5f + (acc ? 0.45f : 0.0f) + np * 0.9f
-                        + (frand(m) - 0.5f) * 0.7f, 1.0f, 4.2f);
+/* ---- CLAP / TOM ------------------------------------------------------------------------------
+ * A burst train of filtered noise (hand clap) sitting on a short pitched body (rototom). `c` slides
+ * between them, so the two ends of the character axis give two different instruments off one voice
+ * and one set of state. Everything varispeeds with the rest of the kit. */
+static void trig_clap(gb_model_t* m, float vel, float c, float tone, float np, float nd) {
+    const float st = tone_stretch(tone);
+    m->cl_mix  = clampf(0.5f - c * 0.55f, 0.f, 1.f);      /* 1 = all clap, 0 = all tom */
+    m->cl_env  = vel;
+    m->cl_dec  = decay_coef(clampf((34.0f + 26.0f * (c + 1.0f)) * (1.0f + nd * 0.7f)
+                                   * (0.9f + 0.2f * frand(m)) * st, 3.0f, drum_cap()));
+    m->cl_bpf  = svf_f((1150.0f + 900.0f * (c + 1.0f) + 700.0f * tone)
+                       * (1.0f + np * 0.35f) * (0.70f + 0.42f * vel) * tone_dsc(tone));
+    /* Body: a tom, tuned off the same node axis the other drums use. */
+    const float bf = drum_pitch(150.0f, np * 9.0f + c * 6.0f + tone_semis(tone), 1.0f);
+    m->cl_inc  = HZ2INC(bf);
+    m->cl_ph   = 0x40000000u;
+    m->cl_benv = vel * (1.0f - m->cl_mix) * 1.15f;
+    m->cl_bdec = decay_coef(clampf((90.0f + 70.0f * (c + 1.0f)) * st, 5.0f, drum_cap()));
+    /* Burst train: 3-4 slaps ~9 ms apart, stretching with everything else. */
+    m->cl_n    = (uint8_t)(3 + (xrand(m) & 1u));
+    m->cl_gap  = (uint32_t)(SR * 0.009f * st * (0.8f + 0.4f * frand(m)));
+    m->cl_t    = m->cl_gap;
 }
 
-static void trig_pad(gb_model_t* m, int deg, int sc, int base, float np, float nd) {
-    m->p_det    = 0.0035f * (1.0f + np * 0.8f) * (0.7f + frand(m) * 0.6f);
-    m->p_bright = np;
-    m->p_atk    = 1.736e-4f / (1.0f + nd * 0.8f);
-    m->p_rel    = 2.98e-5f  / (1.0f + nd * 0.8f);
-    for (int v = 0; v < 3; v++) {
-        int semi = base + deg2semi(sc, deg + v * 2);
-        while (semi > base + 14) semi -= 12;
-        while (semi < base)      semi += 12;
-        m->p_tgt[v] = note_to_freq((float)semi);
-    }
+/* ---- FM METAL --------------------------------------------------------------------------------
+ * Two-op FM through a bandpass. Deliberately SMOOTH: the ratio sits just off an integer so it beats
+ * rather than clangs, and the index decays FASTER than the amplitude so each hit starts bright and
+ * settles into a clean ring instead of buzzing all the way out. Tuned - it takes the scale degree,
+ * so it carries the melodic line the lead used to. */
+static void trig_metal(gb_model_t* m, float vel, float c, int semi, float tone, float np, float nd) {
+    const float st = tone_stretch(tone);
+    const float f  = note_to_freq((float)semi) * fast_exp2f(tone_semis(tone) * (1.0f / 12.0f));
+    m->mt_incc = HZ2INC(f);
+    m->mt_incm = HZ2INC(f * (2.0f + 0.41f + np * 0.35f));   /* off-integer = beating, not clang */
+    m->mt_pc = m->mt_pm = 0;
+    m->mt_env  = vel;
+    m->mt_dec  = decay_coef(clampf((150.0f + 190.0f * (c + 1.0f)) * (1.0f + nd * 0.8f)
+                                   * (0.9f + 0.2f * frand(m)) * st, 5.0f, drum_cap()));
+    m->mt_idx  = 1.5f + 1.7f * vel + np * 0.6f;
+    m->mt_idec = decay_coef(clampf(55.0f * (1.0f + nd * 0.5f) * st, 4.0f, drum_cap()));
+    m->mt_f    = svf_f((2400.0f + 1500.0f * (c + 1.0f)) * (0.70f + 0.42f * vel) * tone_dsc(tone));
+}
+
+/* ---- GLITCH ----------------------------------------------------------------------------------
+ * Sample-and-hold noise - a rate crush - through a resonant bandpass. Kept PLEASANT by tying the
+ * hold period to the voice's own pitch: the crush then folds down onto harmonics of that pitch
+ * rather than spraying inharmonic hash, so it reads as a tuned burst. */
+static void trig_glitch(gb_model_t* m, float vel, float c, int semi, float tone, float np, float nd) {
+    const float st = tone_stretch(tone);
+    const float f  = note_to_freq((float)(semi + 12)) * fast_exp2f(tone_semis(tone) * (1.0f / 12.0f));
+    const uint32_t h = (uint32_t)(SR / fmaxf(f, 20.0f));
+    m->gl_hold = h ? h : 1u;                              /* hold period = one cycle of f */
+    m->gl_t    = 0;
+    m->gl_val  = 0.f;
+    m->gl_env  = vel;
+    m->gl_dec  = decay_coef(clampf((22.0f + 34.0f * (c + 1.0f)) * (1.0f + nd * 0.8f)
+                                   * (0.85f + 0.3f * frand(m)) * st, 3.0f, drum_cap()));
+    m->gl_f    = svf_f(fminf(f * (2.0f + np * 0.8f), 7000.0f) * (0.70f + 0.42f * vel)
+                       * tone_dsc(tone));
+    m->gl_q    = clampf(0.42f - np * 0.16f, 0.16f, 0.75f);
 }
 
 // ----------------------------------------------------------------------------
@@ -601,7 +774,6 @@ static void trig_pad(gb_model_t* m, int deg, int sc, int base, float np, float n
 static void fire_step(gb_model_t* m, const morph_w_t* w) {
     const int   sc   = (int)gb_prm[ENC_SCALE].val & 3;
     const int   root = (int)gb_prm[ENC_KEY].val;
-    const float tone = clampf(gb_prm[ENC_TONE].val, 0.f, 1.f);
     const int   buf  = m->live;
     const float step_ms = 15000.0f / fmaxf(gb_prm[ENC_TEMPO].val, 1.0f);
     uint8_t fired = 0;
@@ -609,12 +781,13 @@ static void fire_step(gb_model_t* m, const morph_w_t* w) {
     for (int t = 0; t < TRACKS; t++) {
         float inten, tn;
         step_cell(m, w, t, m->tstep[t], &inten, &tn);
-        if (inten <= 1.0f - m->dens[t]) {
-            if (t == T_LEAD) m->l_prev = 0;
+        if (inten <= 1.0f - gb_dens(m, t)) {
             continue;
         }
         fired |= (uint8_t)(1u << t);
 
+        /* Each voice gets its own point on the morph loop — see gb_tone_tr. */
+        const float tone = gb_tone_tr(m, t);
         const bool  acc = inten > 0.78f;
         const float vel = 0.65f + 0.35f * fminf(inten, 1.0f);
         const float c   = clampf(tn * (1.0f / 64.0f), -1.f, 1.f);
@@ -630,10 +803,13 @@ static void fire_step(gb_model_t* m, const morph_w_t* w) {
         case T_BASS:  trig_bass (m, root + deg2semi(sc, deg), acc, tone,
                                  node_char(m->npit[buf], w, t), node_char(m->ndec[buf], w, t),
                                  (float)steps_to_next(m, w, t, m->tstep[t]) * step_ms); break;
-        case T_LEAD:  trig_lead (m, root + 19 + deg2semi(sc, deg), acc, m->l_prev != 0, tone,
-                                 node_char(m->npit[buf], w, t), node_char(m->ndec[buf], w, t));
-                      m->l_prev = 1; break;
-        case T_PAD:   trig_pad  (m, deg, sc, root + 24,
+        case T_CLAP:  trig_clap (m, vel, c, tone, node_char(m->npit[buf], w, t),
+                                                 node_char(m->ndec[buf], w, t)); break;
+        /* The two tuned percussion voices take the scale degree, so they carry the melodic line
+         * the lead and pad used to — an octave apart so they do not crowd each other. */
+        case T_METAL: trig_metal(m, vel, c, root + 19 + deg2semi(sc, deg), tone,
+                                 node_char(m->npit[buf], w, t), node_char(m->ndec[buf], w, t)); break;
+        case T_GLITCH:trig_glitch(m, vel, c, root + 12 + deg2semi(sc, deg), tone,
                                  node_char(m->npit[buf], w, t), node_char(m->ndec[buf], w, t)); break;
         default: break;
         }
@@ -681,9 +857,9 @@ static void clock_next(gb_model_t* m, uint32_t spf_q8, int32_t sw_q8,
 // ----------------------------------------------------------------------------
 // Audio: generate into in_bus — the decks record it, MixerInputVolParam applies
 // ----------------------------------------------------------------------------
-static void gb_process(engine_t* engine, mixer_t* mix) {
-    gb_model_t* m = engine_get_ctx(engine);
-    if (!m) return;
+// ctx is our model — the firmware hands it to every engine callback.
+static void gb_process(void* restrict ctx, mixer_t* restrict mix) {
+    gb_model_t* m = ctx;
     float* const bus = mixer_get_in(mix);   // the 48k record bus
     if (!bus) return;
     const uint32_t fs = mixer_get_fs(mix);  // 48k samples (L+R)
@@ -705,13 +881,29 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
     dec2x_f32(&m->dec, bus, m->in24, n24 * 2);
 
     // ---- block-rate constants -------------------------------------------
+    /* The BUS character (crush, drive) stays on the bare knob: it is one global colour for the
+     * whole kit, not something that should wobble per voice. The voices take gb_tone_tr. */
     const float tone = clampf(gb_prm[ENC_TONE].val, 0.f, 1.f);
-    const float kcd  = decay_coef(2.5f);    // kick click
-    const float kpd  = decay_coef(10.f);    // kick pitch sweep
-    const float sdt  = decay_coef(90.f);    // snare tone
-    const float srd  = decay_coef(1.5f);    // snare transient
-    const float bfd  = decay_coef(90.f);    // bass filter
-    const float b_f0 = svf_f(70.0f + 180.0f * tone);
+
+    /* Varispeed — see tone_stretch() above. Unity for tone >= 0.5. Per VOICE now: the kick's
+     * click and pitch sweep follow the kick's own tone, the snare's ring and crack the snare's. */
+    const float st_k = tone_stretch(gb_tone_tr(m, T_KICK));
+    const float st_s = tone_stretch(gb_tone_tr(m, T_SNARE));
+    /* The knob is now dirty at BOTH ends and clean only in the middle. Down low the grit is the
+     * SP's 12-bit; up high it is drive and resonance — pitched-up drums were the one place the kit
+     * stayed clinically tight, and tight is not the point. `hi` is 0 at centre, 1 at the top. */
+    const float hi      = clampf((tone - 0.5f) * 2.0f, 0.f, 1.f);
+    /* Halved from the first pass — full-depth 12-bit read as fizzy rather than gritty. The SP's
+     * charm is a bed of grit under the hit, not hash over it. */
+    const float crush   = fmaxf(clampf((0.5f - tone) * 2.0f, 0.f, 1.f) * 0.55f, hi * 0.28f);
+    const float dirt    = 1.0f + 1.15f * hi;                        /* pre-crush drive */
+
+    const float kcd  = decay_coef(2.5f * st_k);   // kick click
+    const float kpd  = decay_coef(10.f * st_k);   // kick pitch sweep — the big one
+    const float sdt  = decay_coef(90.f * st_s);   // snare tone
+    const float srd  = decay_coef(1.5f * st_s);   // snare transient
+    const float bfd  = decay_coef(90.f);    // bass filter (not a drum — unscaled)
+    const float b_f0 = svf_f(70.0f + 180.0f * gb_tone_tr(m, T_BASS));   /* bass follows its own */
 
     const float    drf      = gb_prm[ENC_DRIFT].val;
     const uint32_t spf_q8   = (uint32_t)(SR * 60.0f * 256.0f / (gb_prm[ENC_TEMPO].val * 4.0f));
@@ -727,34 +919,19 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
     const float g_s = (nt > T_SNARE) ? LVL[T_SNARE] : 0.f;
     const float g_h = (nt > T_HAT)   ? LVL[T_HAT]   : 0.f;
     const float g_b = (nt > T_BASS)  ? LVL[T_BASS]  : 0.f;
-    const float g_l = (nt > T_LEAD)  ? LVL[T_LEAD]  : 0.f;
-    const float g_p = (nt > T_PAD)   ? LVL[T_PAD]   : 0.f;
+    const float g_cl = (nt > T_CLAP)   ? LVL[T_CLAP]   : 0.f;
+    const float g_mt = (nt > T_METAL)  ? LVL[T_METAL]  : 0.f;
+    const float g_gl = (nt > T_GLITCH) ? LVL[T_GLITCH] : 0.f;
     const float pmp   = clampf(gb_prm[ENC_PUMP].val, 0.f, 1.f);
     const float d_in  = 2.6f * pmp;            // 0 .. 2.6 (pins at SC_FLOOR past 1)
-    const float d_pad = fmaxf(0.55f, d_in);    // 0.55 .. 2.6
+    const float d_pad = fmaxf(0.55f, d_in);    // 0.55 .. 2.6  (the ringing metal voice)
     const float d_bas = fmaxf(0.25f, d_in);    // 0.25 .. 2.6
-    m->sc_dec = decay_coef(180.0f + 80.0f * pmp);
+    /* Release is its own knob now — `pump` is depth only. 60..600 ms; rel 0.333 is the 240 ms that
+     * pump 0.75 used to produce, so the default sound is unchanged. */
+    m->sc_dec = decay_coef(60.0f + 540.0f * clampf(gb_prm[ENC_REL].val, 0.f, 1.f));
 
     morph_w_t w; morph_weights(m, morph_phase(m), &w);
 
-    const uint32_t frames = n24 >> 1;
-    m->p_lfo += (uint32_t)(frames * 19676u);                // ~0.11 Hz
-    const float lfo = fsin_i32((int32_t)m->p_lfo) * 0.5f + 0.5f;
-    m->p_fc = svf_f(900.0f + 700.0f * lfo + 500.0f * tone + 600.0f * m->p_bright);
-    m->p_ac = (m->p_gate > m->p_env) ? m->p_atk : m->p_rel;
-
-    m->l_f += (m->l_tgt - m->l_f) * 0.058f;                 // portamento, ~46 ms
-    m->l_incm  = HZ2INC(m->l_f);
-    m->l_incs  = HZ2INC(m->l_f * m->l_ratio);
-    m->l_rincs = m->l_incs ? 1.0f / (float)m->l_incs : 0.0f;
-
-    for (int v = 0; v < 3; v++) {                           // pad chord glide, ~41 ms
-        m->p_f[v] += (m->p_tgt[v] - m->p_f[v]) * 0.0645f;
-        m->p_inc[2 * v]     = HZ2INC(m->p_f[v] * (1.0f - m->p_det));
-        m->p_inc[2 * v + 1] = HZ2INC(m->p_f[v] * (1.0f + m->p_det));
-        m->p_rinc[2 * v]     = m->p_inc[2 * v]     ? 1.0f / (float)m->p_inc[2 * v]     : 0.0f;
-        m->p_rinc[2 * v + 1] = m->p_inc[2 * v + 1] ? 1.0f / (float)m->p_inc[2 * v + 1] : 0.0f;
-    }
 
     for (uint32_t i = 0; i < n24; i += 2) {
         // ---- clock: step + ratchet sub-hits ----
@@ -789,13 +966,10 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
 
         // ---- KICK ----
         m->k_f  = m->k_f0 + (m->k_f - m->k_f0) * kpd;
-        m->k_ph += HZ2INC(m->k_f);
-        float kick = fsin_i32((int32_t)m->k_ph)
-                   + fsin_i32((int32_t)(m->k_ph << 1)) * m->k_h2
-                   + fsin_i32((int32_t)(m->k_ph << 2)) * m->k_h4;
-        kick *= m->k_nrm * m->k_env;
+        m->k_ph += HZ2INC(m->k_f); 
+        float kick = fsin_i32((int32_t)m->k_ph) * m->k_env;
         kick += nrand(m) * m->k_click;
-        kick  = sat1(kick * m->k_drv);
+        kick  = sat1(kick * m->k_drv);   /* k_drv carries the low-pitch body — see trig_kick */
         m->sc_env *= m->sc_dec;
         const float sc    = m->sc_env;
         const float duck  = fmaxf(1.0f - d_pad * sc, SC_FLOOR);
@@ -804,7 +978,8 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
 
         // ---- SNARE ----
         const float nz = nrand(m);
-        SVF(nz, m->s_lp, m->s_bp, m->s_bpf, 0.45f);
+        /* Cutoff rides the decaying noise envelope: the band sweeps down across the hit. */
+        SVF(nz, m->s_lp, m->s_bp, fminf(m->s_bpf * (1.0f + m->s_fd * m->s_nenv), 1.2f), m->s_q);
         m->s_ph1 += m->s_inc1;  m->s_ph2 += m->s_inc2;
         const float tonal = (fsin_i32((int32_t)m->s_ph1) * 0.6f +
                              fsin_i32((int32_t)m->s_ph2) * 0.4f) * m->s_tenv;
@@ -815,7 +990,7 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
         uint32_t hacc = 0;
         for (int k = 0; k < 6; k++) { m->h_ph[k] += m->h_inc[k]; hacc += m->h_ph[k] >> 31; }
         const float metal = (float)hacc * (1.0f / 3.0f) - 1.0f;
-        SVF(metal, m->h_lp, m->h_bp, m->h_f, 0.55f);
+        SVF(metal, m->h_lp, m->h_bp, fminf(m->h_f * (1.0f + m->h_fd * m->h_env), 1.2f), m->h_q);
         const float hat = m->h_bp * m->h_env;
         m->h_env *= m->h_dec;
 
@@ -828,37 +1003,63 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
         const float bass = sat1(m->b_lp * m->b_env * m->b_amp * 1.35f);
         m->b_env *= m->b_dec;  m->b_fenv *= bfd;
 
-        // ---- LEAD ----
-        const uint32_t lpm = m->l_pm + m->l_incm;
-        if (lpm < m->l_incm) m->l_ps = (uint32_t)((float)lpm * m->l_ratio);
-        else                 m->l_ps += m->l_incs;
-        m->l_pm = lpm;
-        const float lsaw = saw_u32(m->l_ps) - blep_u32(m->l_ps, m->l_incs, m->l_rincs);
-        m->l_lp += (lsaw - m->l_lp) * m->l_la;
-        const float lead = m->l_lp * m->l_env;
-        m->l_env *= m->l_dec;
-
-        // ---- PAD  ----
-        float padl = 0.f, padr = 0.f;
-        for (int k = 0; k < 6; k++) {
-            m->p_ph[k] += m->p_inc[k];
-            const float s = saw_u32(m->p_ph[k]) - blep_u32(m->p_ph[k], m->p_inc[k], m->p_rinc[k]);
-            if (k & 1) padr += s; else padl += s;
+        // ---- CLAP / TOM ----
+        if (m->cl_n) {                                  /* burst train: re-fire the noise env */
+            if (m->cl_t) m->cl_t--;
+            else { m->cl_env = fmaxf(m->cl_env, 0.8f); m->cl_t = m->cl_gap; m->cl_n--; }
         }
-        padl *= (1.0f / 3.0f);  padr *= (1.0f / 3.0f);
-        SVF(padl, m->p_lpL, m->p_bpL, m->p_fc, 0.7f);
-        SVF(padr, m->p_lpR, m->p_bpR, m->p_fc, 0.7f);
-        m->p_hpL += (m->p_lpL - m->p_hpL) * 0.0249f;
-        m->p_hpR += (m->p_lpR - m->p_hpR) * 0.0249f;
-        m->p_env += (m->p_gate - m->p_env) * m->p_ac;
-        const float pg = m->p_env * duck;
-        padl = (m->p_lpL - m->p_hpL) * pg;
-        padr = (m->p_lpR - m->p_hpR) * pg;
+        float clap = nrand(m) * m->cl_env * m->cl_mix;
+        SVF(clap, m->cl_lp, m->cl_bp, m->cl_bpf, 0.38f);
+        clap = m->cl_bp * 1.5f;
+        m->cl_ph += m->cl_inc;                          /* tom body under the slaps */
+        clap += fsin_i32((int32_t)m->cl_ph) * m->cl_benv;
+        m->cl_env *= m->cl_dec;  m->cl_benv *= m->cl_bdec;
 
-        const float mid  = g_k * kick + g_b * duckb * bass + g_s * snare + g_h * hat + g_l * lead;
-        const float side = 0.10f * g_s * snare - 0.22f * g_h * hat + 0.26f * g_l * lead;
-        float l = mid - side + g_p * padl;
-        float r = mid + side + g_p * padr;
+        // ---- FM METAL ----
+        m->mt_pm += m->mt_incm;
+        const float mmod = fsin_i32((int32_t)m->mt_pm) * m->mt_idx;
+        m->mt_pc += m->mt_incc;
+        /* Index decays faster than amplitude: bright attack settling to a clean ring, not a buzz. */
+        float mtl = fsin_i32((int32_t)(m->mt_pc + (uint32_t)(mmod * 3.0e8f))) * m->mt_env;
+        SVF(mtl, m->mt_lp, m->mt_bp, m->mt_f, 0.30f);
+        /* The one new voice that RINGS, so it inherits the pad's side of the sidechain — otherwise
+         * `d_pad` and its duck died with the pad and the pump knob would only move bass and input. */
+        mtl = m->mt_bp * duck;
+        m->mt_env *= m->mt_dec;  m->mt_idx *= m->mt_idec;
+
+        // ---- GLITCH ----
+        if (m->gl_t) m->gl_t--;
+        else { m->gl_val = nrand(m); m->gl_t = m->gl_hold; }   /* S&H at one cycle of the pitch */
+        float glitch = m->gl_val * m->gl_env;
+        SVF(glitch, m->gl_lp, m->gl_bp, m->gl_f, m->gl_q);
+        glitch = m->gl_bp * 1.4f;
+        m->gl_env *= m->gl_dec;
+
+        /* SP-1200 12-bit, on the drums only — they are what the machine sampled. Mixed in by
+         * `crush` rather than switched, so tone >= 0.5 is bit-exact rather than merely inaudible,
+         * and the grit arrives with the varispeed instead of as a separate mode. One quantiser on
+         * the sum, not three per voice; `side` below stays clean, which keeps the noise mono. */
+        float drums = g_k * kick + g_s * snare + g_h * hat
+                    + g_cl * clap + g_mt * mtl + g_gl * glitch;
+        /* Push the bus into the soft clip before quantising, so at high tone the kit grits up and
+         * loses its edges instead of staying surgical.
+         *
+         * MIXED IN by `hi`, not applied outright: sat1 is NOT transparent at unity drive
+         * (sat1(1.0) = 0.852, sat1(0.5) = 0.481), so calling it unconditionally put the whole drum
+         * bus through a soft clipper that was never there. It compresses the biggest peaks hardest
+         * — the kick — and a pitched-down kick is 4x longer, so it sat on the clipper continuously
+         * and audibly lost its low end. At hi == 0 this is now exactly `drums`. */
+        drums += (sat1(drums * dirt) - drums) * hi;
+        const float dq = drums * 2048.0f;
+        drums += ((float)(int32_t)(dq + (dq < 0.f ? -0.5f : 0.5f)) * (1.0f / 2048.0f) - drums)
+                 * crush;
+
+        /* Width off the voices with the most air in them; the kick and the bass stay dead centre. */
+        const float mid  = drums + g_b * duckb * bass;
+        const float side = 0.10f * g_s * snare - 0.22f * g_h * hat
+                         + 0.20f * g_cl * clap - 0.26f * g_gl * glitch + 0.16f * g_mt * mtl;
+        float l = mid - side;
+        float r = mid + side;
 
         // DC pole kept from the 48k version — cutoff doubles to ~24 Hz at 24k, fine.
         const float yl = l - m->dcx_l + 0.99843f * m->dcy_l; m->dcx_l = l; m->dcy_l = yl; l = yl;
@@ -886,11 +1087,11 @@ static void gb_process(engine_t* engine, mixer_t* mix) {
     m->h_env = dnz(m->h_env);   m->h_lp = dnz(m->h_lp);     m->h_bp = dnz(m->h_bp);
     m->b_env = dnz(m->b_env);   m->b_fenv = dnz(m->b_fenv);
     m->b_lp = dnz(m->b_lp);     m->b_bp = dnz(m->b_bp);
-    m->l_env = dnz(m->l_env);   m->l_lp = dnz(m->l_lp);
-    m->p_env = dnz(m->p_env);
-    m->p_lpL = dnz(m->p_lpL);   m->p_bpL = dnz(m->p_bpL);
-    m->p_lpR = dnz(m->p_lpR);   m->p_bpR = dnz(m->p_bpR);
-    m->p_hpL = dnz(m->p_hpL);   m->p_hpR = dnz(m->p_hpR);
+    m->cl_env = dnz(m->cl_env); m->cl_benv = dnz(m->cl_benv);
+    m->cl_lp = dnz(m->cl_lp);   m->cl_bp = dnz(m->cl_bp);
+    m->mt_env = dnz(m->mt_env); m->mt_idx = dnz(m->mt_idx);
+    m->mt_lp = dnz(m->mt_lp);   m->mt_bp = dnz(m->mt_bp);
+    m->gl_env = dnz(m->gl_env); m->gl_lp = dnz(m->gl_lp);   m->gl_bp = dnz(m->gl_bp);
     m->dcy_l = dnz(m->dcy_l);   m->dcy_r = dnz(m->dcy_r);
 }
 
@@ -902,27 +1103,25 @@ static void voices_silence(gb_model_t* m) {
     m->s_nenv = m->s_tenv = m->s_tr = m->s_lp = m->s_bp = 0.f;
     m->h_env = m->h_lp = m->h_bp = 0.f;
     m->b_env = m->b_fenv = m->b_lp = m->b_bp = 0.f;
-    m->l_env = m->l_lp = 0.f;  m->l_prev = 0;
-    m->p_env = 0.f; m->p_gate = 0.f;
-    m->p_lpL = m->p_bpL = m->p_lpR = m->p_bpR = m->p_hpL = m->p_hpR = 0.f;
+    m->cl_env = m->cl_benv = m->cl_lp = m->cl_bp = 0.f;  m->cl_n = 0;
+    m->mt_env = m->mt_idx = m->mt_lp = m->mt_bp = 0.f;
+    m->gl_env = m->gl_lp = m->gl_bp = m->gl_val = 0.f;
     m->dcx_l = m->dcy_l = m->dcx_r = m->dcy_r = 0.f;
     m->sc_env = 0.f;
 }
 
 static void gb_set_playing(gb_model_t* m, bool state) {
     m->playing = state;
-    if (state) m->p_gate = 1.0f;
-    else       voices_silence(m);
+    if (!state) voices_silence(m);
 }
 
-static void gb_eng_active(engine_t* e, bool state) { (void)e; if (g_model) gb_set_playing(g_model, state); }
-static uint_fast8_t gb_eng_is_active(engine_t* e) { (void)e; return (g_model && g_model->playing) ? 1 : 0; }
-static void eng_noop_core(os_core_t* c) { (void)c; }
-static void eng_noop(engine_t* e) { (void)e; }
+static void gb_eng_active(void* ctx, bool state) { gb_set_playing(ctx, state); }
+static uint_fast8_t gb_eng_is_active(void* ctx) { return ((gb_model_t*)ctx)->playing; }
 
 static const engine_callbacks_t gb_engine = {
-    .init = eng_noop_core, .process = gb_process, .defaults = eng_noop, .cleanup = eng_noop_core,
-    .active = gb_eng_active, .is_active = gb_eng_is_active,
+    .process = gb_process,
+    .active = gb_eng_active,
+    .is_active = gb_eng_is_active,
 };
 
 // ----------------------------------------------------------------------------
@@ -949,7 +1148,7 @@ static void gb_redraw(gfx_t* gfx, const os_app_t* app) {
         const int len = m->plen[buf][row] ? m->plen[buf][row] : STEPS;
         gfx_set_color(gfx, 1);
 
-        const float thr = 1.0f - m->dens[row];
+        const float thr = 1.0f - gb_dens(m, row);
         for (int st = 0; st < len; st++) {
             const int gx = GRID_X0 + st * CELL_PIT;
             float inten, tn;
@@ -992,8 +1191,8 @@ static void gb_redraw(gfx_t* gfx, const os_app_t* app) {
     {
         float nx, ny;
         morph_xy_raw(morph_arc(m, morph_phase(m)), &nx, &ny);
-        const gfx_uint_t mx = (gfx_uint_t)(INF_X + (int)(nx * INF_SX + 0.5f));
-        const gfx_uint_t my = (gfx_uint_t)(INF_Y + (int)(ny * INF_SY + 0.5f));
+        const gfx_coord_t mx = INF_X + (int)(nx * INF_SX + 0.5f);
+        const gfx_coord_t my = INF_Y + (int)(ny * INF_SY + 0.5f);
         gfx_set_color(gfx, 1);
         gfx_draw_disc(gfx, mx, my, INF_DOT_R + 1, 0x0F);
         gfx_set_color(gfx, 0);
@@ -1007,22 +1206,18 @@ static void gb_redraw(gfx_t* gfx, const os_app_t* app) {
 // ----------------------------------------------------------------------------
 // Param panel — metronome and stuff
 // ----------------------------------------------------------------------------
-#define VAL_X     199                           
-#define VAL_W     93
-#define VAL_Y     26
 
 static void draw_tri(gfx_t* g, int x, int y, int h, int w) {
     for (int i = 0; i < h; i++) {
         const int d = (i < h / 2) ? i : (h - 1 - i);
-        gfx_draw_hline(g, (gfx_uint_t)x, (gfx_uint_t)(y + i),
-                       (gfx_uint_t)(1 + (2 * d * (w - 1)) / (h - 1)));
+        gfx_draw_hline(g, x, y + i, 1 + (2 * d * (w - 1)) / (h - 1));
     }
 }
 
 static void draw_tri_up(gfx_t* g, int cx, int y, int h, int w, int wt) {
     for (int i = 0; i < h; i++) {
         const int ww = wt + (i * (w - wt)) / (h - 1);
-        gfx_draw_hline(g, (gfx_uint_t)(cx - ww / 2), (gfx_uint_t)(y + i), (gfx_uint_t)ww);
+        gfx_draw_hline(g, cx - ww / 2, y + i, ww);
     }
 }
 
@@ -1031,7 +1226,7 @@ static void draw_metro(gfx_t* gfx, int cx, int y, bool playing, float bpm) {
     draw_tri_up(gfx, cx, y + 4, 28, 29, 5);
     gfx_set_color(gfx, 0);
     draw_tri_up(gfx, cx, y + 12, 16, 13, 5);
-    gfx_fill_rect_dithered(gfx, (gfx_uint_t)(cx - 16), (gfx_uint_t)y, 33, 33, UI_HALFTONE+2);
+    gfx_fill_rect_dithered(gfx, cx - 16, y, 33, 33, UI_HALFTONE+2);
     gfx_set_color(gfx, 1);
 
     int dx = -6;
@@ -1041,43 +1236,117 @@ static void draw_metro(gfx_t* gfx, int cx, int y, bool playing, float bpm) {
         const uint32_t ph  = ((p << 16) / (per ? per : 1u)) << 16;
         dx = (int)(fsin_i32((int32_t)ph) * 9.0f);
     }
-    gfx_draw_line_thick(gfx, (gfx_uint_t)cx, (gfx_uint_t)(y + 26),
-                             (gfx_uint_t)(cx + dx), (gfx_uint_t)(y + 6), 4);
+    gfx_draw_line_thick(gfx, cx, y + 26, cx + dx, y + 6, 4);
 }
 
 /* Value text, CENTERED under the BTN3 cell. The roll is right-aligned, so the
  * centered right edge comes from the settled string's width. */
-static void gb_val_text(gfx_t* gfx, gb_model_t* m, const char* s) {
-    gfx_set_font(gfx, gfx_nunito_semibold_14);
-    const gfx_uint_t sw = gfx_get_str_width(gfx, s);
-    ui_roll_text_draw(gfx, (gfx_uint_t)(VAL_X + (VAL_W + sw) / 2), VAL_Y + 17, &m->val_roll, s);
+static void gb_val_text(gfx_t* gfx, gb_model_t* m, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w,
+                        const char* s) {
+    const uint16_t sw = gfx_get_str_width(gfx, s);
+    ui_roll_text_draw(gfx, x + (w + sw) / 2, y + 17, &m->val_roll, s);
+}
+
+/* Our own value bar, rather than ui_draw_value_bar(): that one is a shared firmware component
+ * drawn as a full capsule (outline r=11, knob r=8, both clamping to half the height), and the
+ * main menu's own bars use it too — the rounding there is not grooves' to change.
+ *
+ * The two radii differ on purpose. The outline goes through gfx_draw_rect_r's real arc, so 4
+ * is a light round. The knob goes through gfx_draw_rect_fill_r, whose corner table does NOT
+ * match that arc: r=4 there is a 1px notch two rows deep that reads as damage rather than a
+ * curve, so the knob takes 3 — the same single-pixel cut the statusbar pill uses. */
+static void gb_value_bar(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, gfx_coord_t h,
+                         uint32_t pc) {
+    const gfx_coord_t ih = (h > 2) ? h - 2 : 1;
+    const gfx_coord_t span = (w > 2) ? w - 2 : 1;
+    gfx_draw_rect_r(gfx, x, y, w, h, 3);
+    /* A CELL FILLING UP, not a knob sliding along a track: the fill is the outline's interior
+     * inset by 1px on every side, so at full it reaches the border all round.
+     *
+     * No minimum-width floor either — a floor is what a knob needs so it stays a shape at
+     * zero, and a fill wants the opposite: empty means empty. 1px is forced only when the
+     * value is non-zero but rounds below a pixel, so a small setting never reads as none. */
+    gfx_coord_t fill = (gfx_coord_t)(((uint32_t)span * pc) / 1000u);
+    if (!fill && pc) fill = 1;
+    if (fill) gfx_draw_rect_fill_r(gfx, x + 1, y + 1, fill, ih, 3);
+}
+
+/* The selected value as a short string, for the cell LABEL — see val_txt. Key and scale are
+ * already words; everything else is a percentage of its own range, which is what the bar shows
+ * graphically. Morph has no value cell at all (that box is its rec button). */
+static const char* gb_val_label(gb_model_t* m) {
+    const params_t* const p = &gb_prm[m->enc_target];
+    if (m->enc_target == ENC_KEY) {
+        const int mid = (int)p->val;
+        snprintf(m->val_txt, sizeof(m->val_txt), "%s%d", NOTE_NAME[mid % 12], mid / 12 - 1);
+    } else if (m->enc_target == ENC_SCALE) {
+        snprintf(m->val_txt, sizeof(m->val_txt), "%s", p->option_name[(int)p->val & 3]);
+    } else {
+        const float span = p->max - p->min;
+        const unsigned pc = (span > 0.f) ? (unsigned)((p->val - p->min) / span * 100.f + 0.5f) : 0u;
+        snprintf(m->val_txt, sizeof(m->val_txt), "%u%%", pc);
+    }
+    return m->val_txt;
+}
+
+/* BTN3's HOLD cell for every target but MORPH: the selected value, as a bar — or as rolling
+ * text where the value is a word (key, scale).
+ *
+ * A real band cell, not pixels the app paints into the band's rows. Drawing it from redraw()
+ * worked only while the app happened to be the last thing to paint there; open the fx menu
+ * over grooves and the band repaints without us, so this stopped being refreshed along with
+ * everything else the app had put in those rows. x/y/w come from the firmware, so it cannot
+ * drift from the cell above it either.
+ *
+ * MORPH never reaches here — gb_hints() clears the callback there, because that box is the
+ * motion lane's rec button and the figure-8 is morph's value display. */
+static void gb_hint_val(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, void* user) {
+    gb_model_t* m = (gb_model_t*)user;
+    params_t* const p = &gb_prm[m->enc_target];
+    // A painter starts in GFX_COLOR_SET with the default font, clipped to its cell.
+    if (m->enc_target == ENC_KEY) {
+        const int mid = (int)p->val;
+        snprintf(m->key_txt, sizeof(m->key_txt), "%s%d", NOTE_NAME[mid % 12], mid / 12 - 1);
+        gb_val_text(gfx, m, x, y, w, m->key_txt);
+    } else if (m->enc_target == ENC_SCALE) {
+        gb_val_text(gfx, m, x, y, w, p->option_name[(int)p->val & 3]);
+    } else {
+        ui_roll_text_snap(&m->val_roll, "");
+        /* Show what the voices actually GET, not the bare knob. tone and dens are offset by the
+         * morph position, so drawing p->val left the bar frozen while the sound moved — the one
+         * modulation in the tapp you could hear but not see. */
+        float shown = p->val;
+        /* No single number represents a per-voice tone; show the KICK's, the anchor voice. */
+        if      (m->enc_target == ENC_TONE) shown = gb_tone_tr(m, T_KICK);
+        else if (m->enc_target == ENC_DENS) shown = clampf(p->val + (gb_dens(m, 0) - m->dens[0]),
+                                                           p->min, p->max);
+        const float span = p->max - p->min;
+        const uint32_t pc = (span > 0.f) ? (uint32_t)((shown - p->min) / span * 1000.f) : 0u;
+        /* 4px inset each side so the bar does not run into the cell's own edges (unless the
+         * cell is degenerate). */
+        const gfx_coord_t bw = (w > 8) ? w - 8 : w;
+        const gfx_coord_t bx = (w > 8) ? x + 4 : x;
+        gb_value_bar(gfx, bx, y + 5, bw, 12, pc);
+    }
+    gb_val_label(m);   // keep the label a seeding band would inherit in step with the cell
 }
 
 static void gb_params_draw(gfx_t* gfx, gb_model_t* m) {
-    params_t* const p = &gb_prm[m->enc_target];
     gfx_set_color(gfx, 1);
     draw_metro(gfx, 26, 32, m->playing, gb_prm[ENC_TEMPO].val);
     gfx_set_font(gfx, gfx_nunito_semibold_14);
     {
+        /* Centred on a digit PLACEHOLDER, not on the rendered string, so the number does not
+         * shift sideways as the tempo changes within a digit count. */
         const int bpm = (int)(gb_prm[ENC_TEMPO].val + 0.5f);
-        const gfx_uint_t bw = gfx_get_str_width(gfx, bpm > 99 ? "000" : "00");
-        gfx_draw_strf(gfx, (gfx_uint_t)(26 - bw / 2), 85, "%d", bpm); // metro ends y67 + 4px pad
+        const uint16_t bw = gfx_get_str_width(gfx, bpm > 99 ? "000" : "00");
+        gfx_draw_strf(gfx, 26 - bw / 2, 85, "%d", bpm); // metro ends y67 + 4px pad
     }
 
-    if (m->enc_target == ENC_MORPH) {
-        ui_roll_text_snap(&m->val_roll, "");
-    } else if (m->enc_target == ENC_KEY) {
-        const int mid = (int)p->val;
-        snprintf(m->key_txt, sizeof(m->key_txt), "%s%d", NOTE_NAME[mid % 12], mid / 12 - 1);
-        gb_val_text(gfx, m, m->key_txt);
-    } else if (m->enc_target == ENC_SCALE) {
-        gb_val_text(gfx, m, p->option_name[(int)p->val & 3]);
-    } else {
-        ui_roll_text_snap(&m->val_roll, "");
-        const float span = p->max - p->min;
-        const uint32_t pc = (span > 0.f) ? (uint32_t)((p->val - p->min) / span * 1000.f) : 0u;
-        ui_draw_value_bar(gfx, VAL_X, VAL_Y + 4, VAL_W, 14, pc, 0, 1000);
-    }
+    /* The value display itself is a BAND CELL now (gb_hint_val on HintHold3), not something
+     * drawn here into the band's rows — see that callback. Morph keeps the roll snapped empty
+     * so returning to key/scale flips in from blank rather than from a stale word. */
+    if (m->enc_target == ENC_MORPH) ui_roll_text_snap(&m->val_roll, "");
 }
 
 // ----------------------------------------------------------------------------
@@ -1100,40 +1369,51 @@ static void gb_enc_apply(gb_model_t* m, int32_t d) {
 // ----------------------------------------------------------------------------
 // Hints
 // ----------------------------------------------------------------------------
-static void gb_hint_transport(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, void* user) {
+/* The cell's plate is lit while playing (HINT_ACTIVE, see gb_hints), so the glyph and the
+ * word draw in the CLEAR colour on it then. */
+static void gb_hint_transport(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, void* user) {
     (void)w;
     gb_model_t* m = (gb_model_t*)user;
-    if (!m) return;
-    gfx_set_color(gfx, m->playing ? 0 : 1);
-    const int gy = (int)y + 11;
-    if (m->playing) draw_tri(gfx, (int)x + 8, gy - 6, 13, 11);
-    else            gfx_draw_rect_fill(gfx, (gfx_uint_t)(x + 8), (gfx_uint_t)(gy - 5), 10, 10);
-    gfx_set_font(gfx, gfx_nunito_semibold_14); // cb contract: set your own font for text
-    gfx_draw_str(gfx, (gfx_uint_t)(x + 34), (gfx_uint_t)(y + 17), m->playing ? "stop" : "play");
-    gfx_set_color(gfx, 1);
+    gfx_set_color(gfx, m->playing ? GFX_COLOR_CLEAR : GFX_COLOR_SET);
+    const int gy = y + 11;
+    if (m->playing) draw_tri(gfx, x + 8, gy - 6, 13, 11);
+    else            gfx_draw_rect_fill(gfx, x + 8, gy - 5, 10, 10);
+    gfx_draw_str(gfx, x + 34, y + 17, m->playing ? "stop" : "play");
 }
 
 
-static void gb_hint_param(gfx_t* gfx, gfx_uint_t x, gfx_uint_t y, gfx_uint_t w, void* user) {
+static void gb_hint_param(gfx_t* gfx, gfx_coord_t x, gfx_coord_t y, gfx_coord_t w, void* user) {
     gb_model_t* m = (gb_model_t*)user;
-    if (!m) return;
-    gfx_set_color(gfx, 1);
-    gfx_set_font(gfx, gfx_nunito_semibold_14); // cb contract: set your own font for text
     const char* const nm = gb_prm[m->enc_target].name;
-    const gfx_uint_t sw = gfx_get_str_width(gfx, nm);
-    ui_roll_text_draw(gfx, (gfx_uint_t)(x + (w + sw) / 2), (gfx_uint_t)(y + 17), &m->enc_roll, nm);
+    const uint16_t sw = gfx_get_str_width(gfx, nm);
+    ui_roll_text_draw(gfx, x + (w + sw) / 2, y + 17, &m->enc_roll, nm);
 }
 
 static void gb_hints(gb_model_t* m) {
-    static tapp_hint_pair_t hints[5];
-    hints[0] = (tapp_hint_pair_t){ "", 0 };         // custom-drawn (gb_hint_transport)
-    hints[1] = (tapp_hint_pair_t){ "shuffle", 0 };
-    hints[2] = (tapp_hint_pair_t){ "", 0 };         // custom-drawn (gb_hint_param)
-    /* BTN4/5: both rows are SYSTEM-owned for input tapps (fx-menu prev/next +
-     * back/exit icons) — labels here are ignored. */
-    hints[3] = (tapp_hint_pair_t){ 0, 0 };
-    hints[4] = (tapp_hint_pair_t){ 0, 0 };
-    ui_hints_set_labels(hints);
+    /* BTN1 press is custom-drawn (gb_hint_transport) and lit while playing. BTN3's press row is
+     * custom-drawn too (gb_hint_param). BTN3's hold is the one cell that changes job with the
+     * target: under MORPH it is the motion lane's rec button (lit while the lane is live), and
+     * everywhere else it is the VALUE display, custom-drawn by gb_hint_val. The value text is
+     * there so a band seeding from ours has a number to show where it cannot draw our bar.
+     *
+     * BTN4/5: both rows are SYSTEM-owned for input tapps (fx-menu prev/next + back/exit
+     * icons) — anything stated there is ignored. */
+    const bool morph = (m->enc_target == ENC_MORPH);
+    const tapp_hint_cell_t hints[HintsActionsTotal] = {
+        [HintPress1] = {NULL, NULL, NULL, m->playing ? HINT_ACTIVE : 0},
+        [HintPress2] = {"shuffle"},
+        /* One PARAM pill — the name over its value bar — except under morph, where the hold
+         * cell is the rec button and the pill shrinks back to give it its own row. The label
+         * is what a seeding band shows; the painter (gb_hint_param) wins while we own it. */
+        [HintPress3] = {gb_prm[m->enc_target].name, NULL, NULL, morph ? 0 : HINT_PARAM},
+        [HintHold3] = {morph ? "rec" : gb_val_label(m), &asset_mini_app_icon_16_16, NULL,
+                       morph ? (m->auto_state != AUTO_OFF ? HINT_ACTIVE : 0)
+                             : (m->adj_off ? HINT_LOCKED : 0)},
+    };
+    ui_hints_set(hints);
+    /* The value cell paints itself — except under morph, where the cell is the rec button and
+     * has to draw as a normal labelled hint: CLEARED there, or the painter would cover "rec". */
+    ui_hints_set_gfx_cb(HintHold3, morph ? NULL : gb_hint_val, morph ? NULL : m);
 }
 
 // ----------------------------------------------------------------------------
@@ -1141,18 +1421,43 @@ static void gb_hints(gb_model_t* m) {
 // ----------------------------------------------------------------------------
 static bool gb_tick(os_app_t* app) {
     gb_model_t* m = os_app_get_model(app);
+    /* get_delta DRAINS the accumulator, so this stays its only consumer — gb_input must not
+     * read it too, or whoever runs first eats the other's motion. */
     const int32_t d = os_controls_encoder_get_delta();
-    if (d) gb_enc_apply(m, d);
+    if (d && !m->adj_off) {
+        gb_enc_apply(m, d);
+        /* Only MORPH motion during a TAKE counts: the rec cell is offered for no other
+         * target, so turning something else mid-hold must not arm a flat lane. */
+        if (m->auto_state == AUTO_REC && m->enc_target == ENC_MORPH) m->auto_moved = 1;
+    }
     param_update_val(&gb_prm[m->enc_target]);   // menu parity: ease val toward target
+
+    /* Morph lane, stepped AFTER the ease: recording then captures the value actually heard,
+     * and on playback this write is the last word for the tick. */
+    if (m->auto_state == AUTO_REC) {
+        /* val sits just OUTSIDE 0..1 for a tick around a seam crossing (gb_enc_apply) — the
+         * int32 hop is morph_phase's idiom, so the cast wraps instead of saturating. */
+        if (m->auto_len < AUTO_MAX)             // full: stop appending, keep recording
+            m->auto_buf[m->auto_len++] = (uint16_t)(int32_t)(gb_prm[ENC_MORPH].val * 65536.0f);
+    } else if (m->auto_state == AUTO_PLAY && m->playing) {
+        /* Transport-gated, and FROZEN rather than rewound while stopped: gb_set_playing only
+         * silences the voices, it does not reset m->step, so the pattern resumes where it left
+         * off — the lane resumes with it. Stopped, morph is back under the knob. */
+        if (++m->auto_idx >= m->auto_len) m->auto_idx = 0;
+        const float v = (float)m->auto_buf[m->auto_idx] * (1.0f / 65536.0f);
+        gb_prm[ENC_MORPH].val = gb_prm[ENC_MORPH].target = v;   // both: no ease to fight
+    }
 
     /* dens is a MACRO over the per-track array (each track keeps its own
      * default): spread the param's movement as a delta, clamped per track. */
-    static float dens_prev = 0.85f;             // == gb_prm[ENC_DENS].dflt
+/* In the MODEL, not a function static. As a static it initialised once per image load while
+     * m->dens[] is re-seeded from DENS_DFLT[] by gb_init on every launch — so relaunching after
+     * moving the knob left a stale previous-value behind and the first move applied a wrong delta. */
     const float dv = gb_prm[ENC_DENS].val;
-    if (dv != dens_prev) {
-        const float s = dv - dens_prev;
+    if (dv != m->dens_prev) {
+        const float s = dv - m->dens_prev;
         for (int t = 0; t < TRACKS; t++) m->dens[t] = clampf(m->dens[t] + s, 0.f, 1.f);
-        dens_prev = dv;
+        m->dens_prev = dv;
     }
 
     return true;
@@ -1163,25 +1468,59 @@ static bool gb_tick(os_app_t* app) {
 // ----------------------------------------------------------------------------
 static void gb_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
     gb_model_t* m = os_app_get_model(app);
-    if (btn >= 5) return;
+    if (btn == BTN_ENCODER) return;   // the encoder is read in tick()
 
-    if (btn == 1) {
+    if (btn == BTN2) {
         if (st != KEY_STATE_PRESSED) return;
         gb_regen(m, os_tick_get() ^ (uint32_t)(uintptr_t)m);
         ui_statusbar_hint_event(HintPress2);
         return;
     }
 
+    /* BTN3 HOLD = the morph motion lane. A hold arrives as HOLD (once, at 270ms, finger still
+     * down) then RELEASED — with NO PRESSED, while a tap is PRESSED+RELEASED together at the
+     * release edge. So arming on HOLD and firing only on RELEASED-while-armed can never be
+     * confused with a tap — which switches param adjustment on/off, one switch for every
+     * param (the knob is drained but applies nothing, the bar greys). Only BTN4/5 holds are swallowed by
+     * the input-tapp exit gesture; BTN3's reaches us intact. */
+    if (btn == BTN3) {
+        if (st == KEY_STATE_HOLD && m->enc_target == ENC_MORPH) {
+            m->auto_state = AUTO_REC; m->auto_len = 0; m->auto_idx = 0; m->auto_moved = 0;
+        } else if (st == KEY_STATE_RELEASED && m->auto_state == AUTO_REC) {
+            /* A take with no knob movement is the OFF gesture; one with movement replaces
+             * whatever was playing. Both fall out of the same release. */
+            if (m->auto_moved && m->auto_len) {
+                m->auto_state = AUTO_PLAY;
+                /* One BEFORE the start, so the tick's pre-increment lands on 0 and the loop
+                 * begins where the gesture began. auto_len >= 1 is guaranteed by the test. */
+                m->auto_idx = (uint16_t)(m->auto_len - 1);
+            } else {
+                m->auto_state = AUTO_OFF;
+            }
+        } else if (st == KEY_STATE_PRESSED) {
+            m->adj_off = !m->adj_off;
+        } else {
+            return;
+        }
+        gb_hints(m);   // the rec cell lights while the lane is live; the bar greys while off
+        return;
+    }
+
     if (st != KEY_STATE_RELEASED) return;
 
     switch (btn) {
-    case 0:
+    case BTN1:
+        /* engine_set_active() runs gb_eng_active synchronously, so m->playing is current by
+         * the time gb_hints() lights the plate from it. */
         engine_set_active(!m->playing);
-        ui_hints_set_active(HintPress1, m->playing); // lit plate while playing
+        gb_hints(m);
         break;
-    /* BTN2 handled above; BTN3 is a readout cell, not a button. */
-    case 3: m->enc_target = (uint8_t)((m->enc_target + ENC_TOTAL - 1) % ENC_TOTAL); break;
-    case 4: m->enc_target = (uint8_t)((m->enc_target + 1) % ENC_TOTAL); break;
+    /* BTN2 and BTN3 handled above. The target change re-runs gb_hints so the morph-only
+     * "rec" cell appears and disappears with the selection. */
+    case BTN4: m->enc_target = (uint8_t)((m->enc_target + ENC_TOTAL - 1) % ENC_TOTAL);
+            gb_hints(m); break;
+    case BTN5: m->enc_target = (uint8_t)((m->enc_target + 1) % ENC_TOTAL);
+            gb_hints(m); break;
     default: break;
     }
 }
@@ -1190,31 +1529,30 @@ static void gb_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
 // Lifecycle
 // ----------------------------------------------------------------------------
 
-static bool gb_init(os_app_t* app, va_list args) {
-    (void)args;
-    gb_model_t* m = os_app_get_model(app);
-    g_model = m; // audio callbacks reach the model through this
+static bool gb_init(os_app_t* app) {
+    gb_model_t* m = os_app_get_model(app); // zeroed: not playing
 
     m->xs = 0x9e3779b9u;
-    m->playing = false;
 
     for (int t = 0; t < TRACKS; t++) m->dens[t] = DENS_DFLT[t];
+    m->dens_prev = gb_prm[ENC_DENS].val;   /* seed WITH the array above, or the first knob move
+                                            * applies the whole knob value as a delta */
 
     gb_regen(m, os_tick_get() ^ (uint32_t)(uintptr_t)m);
     m->live ^= 1u; m->regen_req = 0;
     m->k_f = m->k_f0 = 42.f;
     m->b_inc = HZ2INC(55.f); m->b_rinc = 1.0f / (float)m->b_inc; m->b_sinc = m->b_inc >> 1;
     m->b_q = 0.55f; m->b_fd = 0.30f;
-    m->l_f = m->l_tgt = 330.f; m->l_ratio = 1.6f; m->l_la = 0.28f;
-    m->l_incs = HZ2INC(m->l_f * m->l_ratio); m->l_rincs = 1.0f / (float)m->l_incs;
-    m->l_incm = HZ2INC(m->l_f); m->l_dec = decay_coef(130.f);
     m->h_dec = decay_coef(32.f); m->h_f = svf_f(6000.f);
     m->s_bpf = svf_f(2500.f); m->s_nmix = 0.7f; m->s_ndec = decay_coef(40.f);
-    m->p_fc = svf_f(1200.f);
+    m->s_q = 0.45f; m->h_q = 0.55f;
     m->b_dec = decay_coef(200.f);
-    trig_pad(m, 0, 0, 33 + 24, 0.f, 0.f);
-    for (int v = 0; v < 3; v++) m->p_f[v] = m->p_tgt[v];
-    m->p_gate = 1.0f;
+    m->cl_bpf = svf_f(2000.f); m->cl_dec = decay_coef(45.f); m->cl_bdec = decay_coef(120.f);
+    m->cl_inc = HZ2INC(150.f); m->cl_mix = 0.5f; m->cl_gap = (uint32_t)(SR * 0.009f);
+    m->mt_f = svf_f(3200.f); m->mt_dec = decay_coef(260.f); m->mt_idec = decay_coef(55.f);
+    m->mt_incc = HZ2INC(330.f); m->mt_incm = HZ2INC(330.f * 2.41f);
+    m->gl_f = svf_f(2600.f); m->gl_q = 0.42f; m->gl_dec = decay_coef(40.f);
+    m->gl_hold = (uint32_t)(SR / 330.f);
     {
         float px, py, L = 0.f;
         morph_xy_raw(0, &px, &py);
@@ -1245,42 +1583,21 @@ static bool gb_init(os_app_t* app, va_list args) {
     m->samp_left = 1; m->sub_len = 0xFFFFFFFFu; m->sub_left = 0xFFFFFFFFu;
     { morph_w_t w; morph_weights(m, morph_phase(m), &w); fire_step(m, &w); }
 
+    /* Land stopped: the model arrives not playing and BTN1 starts the transport. Silence the
+     * voices fire_step() above just armed — the same state a BTN1 stop leaves behind. */
+    gb_set_playing(m, false);
+
     gb_hints(m);
+    /* Painters stay until removed. Registered after the first band so the cells exist. */
     ui_hints_set_gfx_cb(HintPress1, gb_hint_transport, m);
     ui_hints_set_gfx_cb(HintPress3, gb_hint_param, m);
     ui_hints_show(true);
-    engine_set_callbacks(app, m);
-    engine_set_active(true);
-    /* engine_set_active() dispatches our .active callback (gb_eng_active), which
-     * would START the transport. Land stopped instead: the engine slot stays
-     * installed and dispatching, and gb_process renders silence while stopped —
-     * the same state a BTN1 stop leaves behind. */
-    gb_set_playing(m, false);
-    ui_hints_set_active(HintPress1, false);     // plate lights only while playing
     return true;
 }
 
-static bool gb_deinit(os_app_t* app) {
-    gb_model_t* m = os_app_get_model(app);
-    g_model = 0;
-    m->playing = false;
-    engine_set_active(false);
-    engine_clear_callbacks(&gb_engine);
-    return true;
-}
-
-static os_app_data_t gb_data = {
-    .model = NULL, .model_size = sizeof(gb_model_t), .init = gb_init, .deinit = gb_deinit,
-};
-
-static os_app_t gb_app = {
-    .name = "grooves",
-    .type = AppFullscreenType,
-    .data = &gb_data,
-    .redraw = (os_app_redraw)gb_redraw,
-    .tick = gb_tick,
-    .on_input = gb_input,
-    .engine_cb = &gb_engine,
-};
-
-os_app_t* tapp_get_descriptor(void) { return &gb_app; }
+/* No deinit: the firmware stops and unhooks the engine itself, and the model is all we own. */
+TAPP_APP("grooves", gb_model_t, gb_init, NULL,
+         .redraw = gb_redraw,
+         .tick = gb_tick,
+         .on_input = gb_input,
+         .engine_cb = &gb_engine);
