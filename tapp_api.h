@@ -458,9 +458,10 @@ params_t* mixer_get_input_vol(mixer_t* m);
  * from the MIDI bus (midi_bus()).
  *
  *   process      - render one block (see @ref grp_audio for which buffer the app owns)
- *   tape_changed - the tape was mounted, rebuilt or formatted: re-read tape_size() and
- *                  anything derived from it. On a mount the app's memory_if.load runs
- *                  instead, when one is provided.
+ *   tape_changed - the tape was mounted, rebuilt or formatted: re-read tape_size(), the marks
+ *                  and anything derived from them. Runs on the tape task (the main menu can
+ *                  load a tape over the app), so set a flag and do the work in tick(). A load
+ *                  is refused while a take is open.
  *   active       - engine_set_active() was called: start/stop the app's transport
  *   is_active    - per block, see below
  *

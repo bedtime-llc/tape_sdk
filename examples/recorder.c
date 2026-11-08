@@ -71,6 +71,7 @@ typedef struct {
     params_t vol_fx;                 // app-local FX send of the playback
     volatile bool vol_ui;            // hints shown while PLAY is held
     volatile bool erase_req;         // confirm popup said yes; tick performs it
+    volatile bool tape_swapped;      // tape_changed said so; tick re-derives
 
     uint32_t take_idx;               // take (mark) navigation cursor
     uint32_t take_n;                 // takes (MARKS) on the tape, refreshed from tick
@@ -87,6 +88,7 @@ typedef struct {
 } rec_model_t;
 
 static void rec_seek(rec_model_t* m, uint32_t frame);
+static void rec_tape_derive(rec_model_t* m, tape_t* t);
 static void rec_hints(const rec_model_t* m);
 static void rec_erase_take(rec_model_t* m);
 
@@ -186,10 +188,19 @@ static void rec_led_clip(const os_led_t* led, const void* ctx) {
 
 static led_pattern_t rec_led_pattern = { .callback = rec_led_clip, .steps = 255, .loop = 1 };
 
+/* A tape was loaded from the main menu (never mid-take: the firmware refuses that). Runs on the
+ * tape task: stop playing it now, the tick re-derives the rest. */
+static void rec_tape_changed(void* ctx) {
+    rec_model_t* m = (rec_model_t*)ctx;
+    if (m->state == ST_PLAY) m->state = ST_STOP;
+    m->tape_swapped = true;
+}
+
 /* No is_active: process() runs every block, so stopped it meters the live input. Sleep still
  * comes - a stopped recorder writes silence and does not call mixer_rec_active(). */
 static const engine_callbacks_t rec_engine = {
     .process = rec_process,
+    .tape_changed = rec_tape_changed,
 };
 
 static void rec_set_state(rec_model_t* m, uint8_t state) {
@@ -465,6 +476,17 @@ static bool rec_tick(os_app_t* app) {
     rec_model_t* m = os_app_get_model(app);
     tape_t* t = tape_get();
 
+    if (m->tape_swapped && t) {
+        m->tape_swapped = false;
+        rec_stream_invalidate(m);
+        m->play_start = m->play_end = 0;
+        m->tl_start.val = m->tl_start.target = 0.f;
+        m->tl_end.val = m->tl_end.target = 0.f;
+        rec_seek(m, 0);
+        tape_timeline_set_loop(false);
+        rec_tape_derive(m, t);
+    }
+
     if (m->state == ST_REC && t) {
         if (!m->stop_req && m->frame + REC_FADE_FR >= m->rec_limit) m->stop_req = true;
         if ((m->stop_req && m->rec_gain <= 0.001f) || m->frame >= m->rec_limit) {
@@ -539,6 +561,14 @@ static void rec_goto_take(rec_model_t* m, bool back) {
     if (!n) return;
     m->take_n = n;
     rec_select_take(m, back ? (m->take_idx + n - 1u) % n : (m->take_idx + 1u) % n);
+}
+
+// What hangs off the mounted tape: at init, and when it's swapped.
+static void rec_tape_derive(rec_model_t* m, tape_t* t) {
+    m->tape_cap = tape_size(t) * FRAMES_PER_POS;
+    m->take_idx = 0;
+    m->take_n = tape_marks_count(t);
+    if (m->take_n) rec_goto_take(m, true);
 }
 
 static void rec_erase_confirm_cb(void* ctx, bool confirmed) {
@@ -664,7 +694,6 @@ static bool rec_init(os_app_t* app) {
 
     tape_t* t = tape_get();
     if (t) {
-        m->tape_cap = tape_size(t) * FRAMES_PER_POS;
         tape_timeline_setup(1, 8, 188, SCREEN_WIDTH - 16, 46);
         tape_timeline_attach_params(0, &m->tl_pos, &m->tl_start, &m->tl_end);
         tape_timeline_switch_track(0);
@@ -673,8 +702,7 @@ static bool rec_init(os_app_t* app) {
         tape_timeline_show(true);
         tape_timeline_zoom_in();
 
-        m->take_n = tape_marks_count(t);
-        if (m->take_n) { m->take_idx = 0; rec_goto_take(m, true); }
+        rec_tape_derive(m, t);
     }
 
     ui_statusbar_show(false);
